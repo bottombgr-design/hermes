@@ -3811,6 +3811,7 @@ async def _retry_same_provider_async(
     messages: list,
     temperature: Optional[float],
     max_tokens: Optional[int],
+    preserve_max_tokens: bool,
     tools: Optional[list],
     effective_timeout: float,
     effective_extra_body: dict,
@@ -3846,6 +3847,7 @@ async def _retry_same_provider_async(
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        preserve_max_tokens=preserve_max_tokens,
         tools=tools,
         timeout=effective_timeout,
         extra_body=effective_extra_body,
@@ -4108,6 +4110,7 @@ async def _call_fallback_candidate_async(
     messages: list,
     temperature: Optional[float],
     max_tokens: Optional[int],
+    preserve_max_tokens: bool,
     tools: Optional[list],
     effective_timeout: float,
     effective_extra_body: dict,
@@ -4126,6 +4129,7 @@ async def _call_fallback_candidate_async(
     fb_kwargs = _build_call_kwargs(
         fb_label, fb_model, messages,
         temperature=temperature, max_tokens=max_tokens,
+        preserve_max_tokens=preserve_max_tokens,
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=fb_base, task=task)
@@ -4143,6 +4147,7 @@ async def _call_fallback_candidate_async(
                 retry_kwargs = _build_call_kwargs(
                     fb_provider, retry_model or fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
+                    preserve_max_tokens=preserve_max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
@@ -7002,6 +7007,7 @@ def _build_call_kwargs(
     reasoning_config: Optional[dict] = None,
     base_url: Optional[str] = None,
     task: Optional[str] = None,
+    preserve_max_tokens: bool = False,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
     kwargs: Dict[str, Any] = {
@@ -7038,7 +7044,13 @@ def _build_call_kwargs(
         # models reject it entirely with error 1210). Omitting it sidesteps all of
         # those wire-format quirks at once.
         #
-        # The one exception is the Anthropic Messages wire (MiniMax and any
+        # A caller can narrowly opt in with preserve_max_tokens when the cap is
+        # part of that call's contract (for example the gateway's concise vision
+        # pre-process). This keeps the default uncapped behavior intact while
+        # allowing explicit, latency-sensitive budgets to reach compatible
+        # OpenAI-style endpoints.
+        #
+        # The other exception is the Anthropic Messages wire (MiniMax and any
         # ``/anthropic`` endpoint reached through the OpenAI SDK wrapper), where
         # max_tokens is a MANDATORY field — omitting it is a hard 400. Keep it only
         # there.
@@ -7083,6 +7095,7 @@ def _build_call_kwargs(
             or _is_nvidia_nim
             or _is_moa
             or _is_gemini_native
+            or preserve_max_tokens
         ):
             # Use auxiliary_max_tokens_param() so models that require
             # max_completion_tokens (GPT-5 family, Copilot) get the right
@@ -8376,6 +8389,7 @@ async def async_call_llm(
     messages: list,
     temperature: Optional[float] = None,
     max_tokens: int = None,
+    preserve_max_tokens: bool = False,
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
@@ -8384,6 +8398,10 @@ async def async_call_llm(
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
+
+    ``preserve_max_tokens`` is a narrow opt-in for callers whose explicit
+    output cap is part of their request contract. By default, OpenAI-compatible
+    auxiliary calls continue to omit token caps.
     """
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
@@ -8464,6 +8482,7 @@ async def async_call_llm(
     kwargs = _build_call_kwargs(
         resolved_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
+        preserve_max_tokens=preserve_max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_client_base or resolved_base_url, task=task)
@@ -8676,6 +8695,7 @@ async def async_call_llm(
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    preserve_max_tokens=preserve_max_tokens,
                     tools=tools,
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
@@ -8714,6 +8734,7 @@ async def async_call_llm(
                         messages=messages,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        preserve_max_tokens=preserve_max_tokens,
                         tools=tools,
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
@@ -8817,6 +8838,7 @@ async def async_call_llm(
                     async_fb, async_fb_model or fb_model, fb_label,
                     task=task, messages=messages,
                     temperature=temperature, max_tokens=max_tokens,
+                    preserve_max_tokens=preserve_max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config)
@@ -8834,6 +8856,7 @@ async def async_call_llm(
                         async_fb, async_fb_model or fb_model, fb_label,
                         task=task, messages=messages,
                         temperature=temperature, max_tokens=max_tokens,
+                        preserve_max_tokens=preserve_max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config)
