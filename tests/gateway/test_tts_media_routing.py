@@ -177,45 +177,78 @@ async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
     assert adapter.notices == ["⚠️ Couldn't deliver the video attachment."]
 
 
-class _DiscordMediaFailureAdapter(BasePlatformAdapter):
-    """Minimal adapter to exercise non-streaming MEDIA failure notification."""
+@pytest.mark.asyncio
+async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_image():
+    event = _event(thread_id="topic-1")
+    runner = object.__new__(GatewayRunner)
+    runner._thread_metadata_for_source = lambda source, anchor=None: {"thread_id": "topic-1"}
+    runner._reply_anchor_for_event = lambda event: event.message_id
 
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
-        self.notices: list[str] = []
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send=AsyncMock(return_value=SendResult(success=True, message_id="text")),
+        send_multiple_images=AsyncMock(return_value=None),
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
 
-    async def connect(self, *, is_reconnect: bool = False):
-        return True
+    await GatewayRunner._deliver_queued_first_response(
+        runner,
+        "Quote here\nMEDIA:/tmp/pricelist.png",
+        source=event.source,
+        adapter=adapter,
+        metadata={"thread_id": "topic-1"},
+        event_message_id=event.message_id,
+    )
 
-    async def disconnect(self):
-        pass
-
-    async def send(self, chat_id, content=None, **kwargs):
-        self.notices.append(content or "")
-        return SendResult(success=True, message_id="notice")
-
-    async def get_chat_info(self, chat_id):
-        return {"id": chat_id, "type": "dm"}
+    adapter.send.assert_awaited_once_with(
+        "chat-1",
+        "Quote here",
+        metadata={"thread_id": "topic-1"},
+    )
+    adapter.send_multiple_images.assert_awaited_once_with(
+        chat_id="chat-1",
+        images=[("file:///tmp/pricelist.png", "")],
+        metadata={"thread_id": "topic-1"},
+    )
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
-    """Attachmentless send_video results must surface a user-visible notice (#66797)."""
-    adapter = _DiscordMediaFailureAdapter()
-    event = _event()
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "clip.mp4")
-    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
-    adapter.send_video = AsyncMock(
-        return_value=SendResult(
-            success=False,
-            error="Discord accepted the message but attached no files (clip.mp4)",
-        )
+async def test_queued_followup_delivery_keeps_remote_image_url_in_text():
+    event = _event(thread_id="topic-1")
+    runner = object.__new__(GatewayRunner)
+    runner._thread_metadata_for_source = lambda source, anchor=None: {"thread_id": "topic-1"}
+    runner._reply_anchor_for_event = lambda event: event.message_id
+
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send=AsyncMock(return_value=SendResult(success=True, message_id="text")),
+        send_multiple_images=AsyncMock(return_value=None),
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
-    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
-    adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="voice"))
-    adapter.send_multiple_images = AsyncMock()
 
-    await adapter._process_message_background(event, build_session_key(event.source))
+    response = "See this mockup\nhttps://example.com/mockup.png"
+    await GatewayRunner._deliver_queued_first_response(
+        runner,
+        response,
+        source=event.source,
+        adapter=adapter,
+        metadata={"thread_id": "topic-1"},
+        event_message_id=event.message_id,
+    )
 
-    adapter.send_video.assert_awaited_once()
-    assert adapter.notices == ["⚠️ Couldn't deliver the video attachment."]
+    adapter.send.assert_awaited_once_with(
+        "chat-1",
+        response,
+        metadata={"thread_id": "topic-1"},
+    )
+    adapter.send_multiple_images.assert_not_awaited()
