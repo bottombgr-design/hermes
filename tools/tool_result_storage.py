@@ -29,6 +29,10 @@ import re
 import shlex
 import uuid
 
+from agent.persistence_markers import (
+    _DB_CONTENT_UPDATE_PENDING,
+    _STEER_BUDGET_PROTECTED_SUFFIX,
+)
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
@@ -214,9 +218,17 @@ def enforce_turn_budget(
     Mutates the list in-place and returns it.
     """
     candidates = []
+    protected_suffixes = {}
     total_size = 0
     for i, msg in enumerate(tool_messages):
         content = msg.get("content", "")
+        protected_suffix = msg.pop(_STEER_BUDGET_PROTECTED_SUFFIX, "")
+        if (
+            isinstance(protected_suffix, str)
+            and protected_suffix
+            and content.endswith(protected_suffix)
+        ):
+            protected_suffixes[i] = protected_suffix
         size = len(content)
         total_size += size
         if PERSISTED_OUTPUT_TAG not in content:
@@ -232,20 +244,32 @@ def enforce_turn_budget(
             break
         msg = tool_messages[idx]
         content = msg["content"]
+        protected_suffix = protected_suffixes.get(idx, "")
+        budget_content = (
+            content[:-len(protected_suffix)] if protected_suffix else content
+        )
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
 
         replacement = maybe_persist_tool_result(
-            content=content,
+            content=budget_content,
             tool_name=_BUDGET_TOOL_NAME,
             tool_use_id=tool_use_id,
             env=env,
             config=config,
             threshold=0,
         )
-        if replacement != content:
+        if replacement != budget_content:
+            replacement += protected_suffix
             total_size -= size
             total_size += len(replacement)
             tool_messages[idx]["content"] = replacement
+            # The aggregate budget runs AFTER the per-tool incremental flush,
+            # so this in-place rewrite would otherwise leave the durable
+            # state.db row holding the pre-budget content while the model saw
+            # the replacement. Flag it for an in-place durable update (same
+            # contract as the /steer marker append; a no-op for messages the
+            # flush has not written yet).
+            tool_messages[idx][_DB_CONTENT_UPDATE_PENDING] = True
             logger.info(
                 "Budget enforcement: persisted tool result %s (%d chars)",
                 tool_use_id, size,

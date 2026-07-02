@@ -137,7 +137,13 @@ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 # "is_compressed_summary" would reach the wire and trip exactly that.
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
-_DB_PERSISTED_MARKER = "_db_persisted"
+
+from agent.persistence_markers import (  # noqa: E402
+    _DB_PERSISTED_MARKER,
+    _DB_CONTENT_UPDATE_PENDING,
+    _DB_MESSAGE_ROW_ID,
+    _STEER_BUDGET_PROTECTED_SUFFIX,
+)
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (
@@ -167,6 +173,9 @@ def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
     """
     fresh = msg.copy()
     fresh.pop(_DB_PERSISTED_MARKER, None)
+    fresh.pop(_DB_CONTENT_UPDATE_PENDING, None)
+    fresh.pop(_DB_MESSAGE_ROW_ID, None)
+    fresh.pop(_STEER_BUDGET_PROTECTED_SUFFIX, None)
     return fresh
 
 
@@ -187,6 +196,9 @@ def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
     for msg in messages:
         if isinstance(msg, dict):
             msg.pop(_DB_PERSISTED_MARKER, None)
+            msg.pop(_DB_CONTENT_UPDATE_PENDING, None)
+            msg.pop(_DB_MESSAGE_ROW_ID, None)
+            msg.pop(_STEER_BUDGET_PROTECTED_SUFFIX, None)
 
 
 # Appended to every standalone summary message (and to the merged-into-tail

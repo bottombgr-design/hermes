@@ -2572,14 +2572,23 @@ def _(rid, params: dict) -> dict:
                 ),
             )
             for msg in history:
-                db.append_message(
+                row_id = db.append_message(
                     session_id=new_key,
                     role=msg.get("role", "user"),
                     content=msg.get("content"),
+                    # Keep tool-call pairing intact in the copied transcript and
+                    # retain a unique fallback for post-branch content updates.
+                    tool_name=msg.get("tool_name") or msg.get("name"),
+                    tool_calls=msg.get("tool_calls"),
+                    tool_call_id=msg.get("tool_call_id"),
                     # Preserve the parent's original message timestamps —
                     # branch copies are history, not new activity (9d73006ad).
                     timestamp=msg.get("timestamp"),
                 )
+                # The shallow copy still points at the parent's durable row.
+                # Re-stamp tool messages with the exact child row id.
+                if msg.get("role") == "tool":
+                    msg[_DB_MESSAGE_ROW_ID] = row_id
             db.set_session_title(new_key, title)
         except Exception as e:
             if lease is not None:

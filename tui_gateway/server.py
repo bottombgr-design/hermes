@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+from agent.persistence_markers import _DB_MESSAGE_ROW_ID
 from agent.secret_scope import (
     build_profile_secret_scope,
     reset_secret_scope,
