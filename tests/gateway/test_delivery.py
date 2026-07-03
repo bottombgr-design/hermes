@@ -533,6 +533,34 @@ async def test_long_output_preserved_for_chunking_adapter(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_long_output_reaches_email_adapter_without_truncation(tmp_path, monkeypatch):
+    """DeliveryRouter passes a report-sized body unchanged to SMTP email."""
+    from plugins.platforms.email.adapter import EmailAdapter
+
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = EmailAdapter(PlatformConfig(enabled=True))
+    smtp_calls = []
+
+    def capture_smtp(to_addr, body, reply_to_msg_id=None):
+        smtp_calls.append((to_addr, body, reply_to_msg_id))
+        return "<test-message@example.com>"
+
+    # Keep EmailAdapter.send() real so this covers the executor handoff to the
+    # synchronous SMTP/MIME boundary rather than merely replacing the adapter.
+    monkeypatch.setattr(adapter, "_send_email", capture_smtp)
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.EMAIL: adapter})
+    target = DeliveryTarget.parse("email:ops@example.com")
+    long_content = "report-line\n" * 500
+
+    await router._deliver_to_platform(
+        target, long_content, metadata={"job_id": "email-job"}
+    )
+
+    assert smtp_calls == [("ops@example.com", long_content, None)]
+    assert "truncated" not in smtp_calls[0][1].lower()
+
+
+@pytest.mark.asyncio
 async def test_short_output_never_truncated(tmp_path, monkeypatch):
     """Output under the limit passes through untouched for any adapter."""
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
