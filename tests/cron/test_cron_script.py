@@ -209,10 +209,11 @@ class TestRunJobScript:
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
         monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
 
-        success, output = _run_job_script("probe.py")
+        success, output, stderr = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
+        assert stderr == ""
         assert captured["argv"] == [str(base_python), str(script.resolve())]
         assert captured["kwargs"]["creationflags"] == 0x08000000
         env = captured["kwargs"]["env"]
@@ -246,10 +247,11 @@ class TestRunJobScript:
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
         monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
 
-        success, output = _run_job_script("probe.py")
+        success, output, stderr = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
+        assert stderr == ""
         assert captured["argv"] == [str(python), str(script.resolve())]
         assert captured["kwargs"]["encoding"] == "utf-8"
         assert captured["kwargs"]["errors"] == "replace"
@@ -271,10 +273,11 @@ class TestRunJobScript:
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
         monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
 
-        success, output = _run_job_script("probe.py")
+        success, output, stderr = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
+        assert stderr == ""
         assert captured["argv"] == [sys.executable, str(script.resolve())]
         assert captured["kwargs"]["text"] is True
         assert "creationflags" not in captured["kwargs"]

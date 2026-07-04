@@ -2282,7 +2282,7 @@ def _run_job_script(
         if _bash is None:
             return False, (
                 "Shell cron scripts require 'bash' on PATH (or /bin/bash on Unix), "
-                "but none was found. Install Git Bash / WSL bash on Windows, "
+                "but bash not found on this system. Install Git Bash / WSL bash on Windows, "
                 "or rewrite the script as Python (.py)."
             ), ""
         argv = [_bash, str(path)]
@@ -2436,16 +2436,51 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _save_job_output_with_keep(job_id: str, output: str, *, keep: Optional[int] = None):
+    """Call save_job_output with retention, tolerating legacy test doubles.
+
+    Some focused scheduler tests monkeypatch save_job_output with the historical
+    two-argument shape. The production function accepts keep=, but preserving
+    compatibility here lets those tests keep exercising the delivery/teardown
+    ordering contract without coupling to retention plumbing.
+    """
+    try:
+        return save_job_output(job_id, output, keep=keep)
+    except TypeError as exc:
+        if "unexpected keyword argument 'keep'" not in str(exc):
+            raise
+        return save_job_output(job_id, output)
+
+
+def _normalize_script_result(result: Optional[tuple]) -> tuple[bool, str, str]:
+    """Normalize legacy/new script result tuples to ``(success, stdout, stderr)``.
+
+    Older tests and helper call sites may still provide ``(success, stdout)``.
+    Keep accepting that shape so broader scheduler/test compatibility does not
+    depend on every mock being updated in lockstep.
+    """
+    if result is None:
+        return False, "", ""
+    if len(result) == 3:
+        success, stdout, stderr = result
+        return bool(success), str(stdout or ""), str(stderr or "")
+    if len(result) == 2:
+        success, stdout = result
+        return bool(success), str(stdout or ""), ""
+    raise ValueError(f"Expected script result tuple of len 2 or 3, got {len(result)}")
+
+
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
         job: The cron job dict.
-        prerun_script: Optional ``(success, stdout)`` from a script that has
-            already been executed by the caller (e.g. for a wake-gate check).
-            When provided, the script is not re-executed and the cached
-            result is used for prompt injection. When omitted, the script
-            (if any) runs inline as before.
+        prerun_script: Optional cached script result from a caller-side
+            execution (e.g. for a wake-gate check). Accepts both the legacy
+            ``(success, stdout)`` shape and the richer
+            ``(success, stdout, stderr)`` shape. When provided, the script is
+            not re-executed and the cached result is used for prompt injection.
+            When omitted, the script (if any) runs inline as before.
     """
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
@@ -2461,9 +2496,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     script_path = job.get("script")
     if script_path:
         if prerun_script is not None:
-            success, script_output, script_stderr = prerun_script
+            success, script_output, script_stderr = _normalize_script_result(prerun_script)
         else:
-            success, script_output, script_stderr = _run_job_script(script_path)
+            success, script_output, script_stderr = _normalize_script_result(_run_job_script(script_path))
         if success:
             if script_output:
                 prompt = (
@@ -2823,8 +2858,10 @@ def run_job(
             _job_workdir = None
 
         try:
-            ok, output, script_stderr = _run_job_script_with_claim_heartbeat(
-                job, script_path, workdir=_job_workdir,
+            ok, output, script_stderr = _normalize_script_result(
+                _run_job_script_with_claim_heartbeat(
+                    job, script_path, workdir=_job_workdir,
+                )
             )
         except Exception as exc:
             logger.exception(
@@ -2987,8 +3024,10 @@ def run_job(
                 job_id, _script_workdir,
             )
             _script_workdir = None
-        prerun_script = _run_job_script_with_claim_heartbeat(
-            job, script_path, workdir=_script_workdir,
+        prerun_script = _normalize_script_result(
+            _run_job_script_with_claim_heartbeat(
+                job, script_path, workdir=_script_workdir,
+            )
         )
         _ran_ok, _script_output, _script_stderr = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
@@ -4028,7 +4067,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         delivery_error = None
         delivery_targets = None
         try:
-            output_file = save_job_output(
+            output_file = _save_job_output_with_keep(
                 job["id"],
                 output,
                 keep=_cron_output_keep(job, silent=(initial_status == "silent")),
