@@ -2952,6 +2952,13 @@ DEFAULT_CONFIG = {
         # wedges the job's dispatch guard forever. Also overridable via
         # HERMES_CRON_SESSION_DB_TIMEOUT env var. 0 = unlimited (skip the bound).
         "session_db_timeout_seconds": 10,
+        # Silent runs can use a lower retention cap than substantive/error
+        # runs to preserve an audit trail without keeping every quiet heartbeat
+        # forever. Falls back to output_retention when unset. Default 20.
+        "output_retention_silent": 20,
+        # Substantive/error runs can override the global fallback separately.
+        # Falls back to output_retention when unset. Default 50.
+        "output_retention_substantive": 50,
     },
 
     # Kanban multi-agent coordination — controls the dispatcher loop that
