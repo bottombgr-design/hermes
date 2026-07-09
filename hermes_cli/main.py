@@ -4514,6 +4514,13 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_knowledge(args):
+    """Search local review knowledge captures."""
+    from hermes_cli.knowledge_index import knowledge_command
+
+    return knowledge_command(args)
+
+
 def cmd_project(args):
     """Manage projects (named, multi-folder workspaces)."""
     from hermes_cli.projects_cmd import projects_command
@@ -14901,6 +14908,13 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # =========================================================================
+    # knowledge command — deterministic local review-capture retrieval
+    # =========================================================================
+    from hermes_cli.knowledge_index import build_parser as _build_knowledge_parser
+
+    _build_knowledge_parser(subparsers)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
