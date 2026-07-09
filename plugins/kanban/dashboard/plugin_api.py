@@ -835,6 +835,7 @@ class ReviewTaskBody(BaseModel):
     decision: str
     comment: str
     reviewer: Optional[str] = None
+    capture_note: Optional[dict] = None
 
 
 @router.patch("/tasks/{task_id}")
@@ -985,6 +986,27 @@ def review_task(task_id: str, payload: ReviewTaskBody, board: Optional[str] = Qu
     board = _resolve_board(board)
     conn = _conn(board=board)
     reviewer = (payload.reviewer or "dashboard").strip()
+    capture = None
+    capture_warning = None
+    capture_path = None
+    if payload.capture_note is not None:
+        if payload.decision.replace("-", "_") == "request_changes":
+            conn.close()
+            raise HTTPException(
+                status_code=400,
+                detail="knowledge capture is not allowed for request-changes",
+            )
+        try:
+            from hermes_cli.kanban_knowledge import validate_capture_request
+            capture = validate_capture_request(
+                what_changed=payload.capture_note.get("what_changed"),
+                lesson=payload.capture_note.get("lesson"),
+                files=payload.capture_note.get("files") or (),
+                area=payload.capture_note.get("area"),
+            )
+        except ValueError as e:
+            conn.close()
+            raise HTTPException(status_code=400, detail=str(e))
     try:
         try:
             ok = kanban_db.review_required_decision(
@@ -998,8 +1020,29 @@ def review_task(task_id: str, payload: ReviewTaskBody, board: Optional[str] = Qu
             raise HTTPException(status_code=400, detail=str(e))
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        if capture is not None:
+            try:
+                from hermes_cli.kanban_knowledge import write_review_capture_note
+                capture_path = write_review_capture_note(
+                    conn,
+                    task_id,
+                    decision=payload.decision,
+                    reviewer=reviewer,
+                    comment=payload.comment,
+                    capture=capture,
+                )
+            except Exception as e:
+                capture_warning = (
+                    "review decision succeeded but knowledge capture failed: "
+                    f"{e}"
+                )
         updated = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(updated) if updated else None, "decision": payload.decision}
+        response = {"task": _task_dict(updated) if updated else None, "decision": payload.decision}
+        if capture_path:
+            response["knowledge_capture_path"] = capture_path
+        if capture_warning:
+            response["warning"] = capture_warning
+        return response
     finally:
         conn.close()
 

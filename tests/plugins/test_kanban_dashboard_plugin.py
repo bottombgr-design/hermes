@@ -568,6 +568,37 @@ def test_review_endpoint_approve_completes_task(client):
     )
     assert r.status_code == 200
     assert r.json()["task"]["status"] == "done"
+    assert "knowledge_capture_path" not in r.json()
+
+
+def test_review_endpoint_approve_with_capture(client):
+    t = _review_required_task(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={
+            "decision": "approve",
+            "reviewer": "reviewer",
+            "comment": "looks good",
+            "capture_note": {
+                "what_changed": "API changed",
+                "lesson": "token=SECRET123 should redact",
+                "files": ["plugins/kanban/dashboard/plugin_api.py"],
+                "area": "dashboard",
+            },
+        },
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["task"]["status"] == "done"
+    assert data["knowledge_capture_path"].startswith("kanban/knowledge/review-captures/")
+
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        events = [e for e in kb.list_events(conn, t["id"]) if e.kind == "knowledge_captured"]
+        assert len(events) == 1
+        assert events[0].payload is not None
+        note = kb.kanban_home() / events[0].payload["path"]
+        assert "SECRET123" not in note.read_text(encoding="utf-8")
 
 
 def test_review_endpoint_request_changes_returns_ready(client):
@@ -588,6 +619,90 @@ def test_review_endpoint_reject_archives_task(client):
     )
     assert r.status_code == 200
     assert r.json()["task"]["status"] == "archived"
+
+
+def test_review_endpoint_reject_with_capture(client):
+    t = _review_required_task(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={
+            "decision": "reject",
+            "reviewer": "reviewer",
+            "comment": "close it",
+            "capture_note": {
+                "what_changed": "closed",
+                "lesson": "not merging",
+                "files": ["hermes_cli/kanban.py"],
+            },
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "archived"
+    assert r.json()["knowledge_capture_path"].startswith("kanban/knowledge/review-captures/")
+
+
+def test_review_endpoint_rejects_capture_on_request_changes_and_bad_paths(client):
+    t = _review_required_task(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={
+            "decision": "request-changes",
+            "reviewer": "reviewer",
+            "comment": "fix",
+            "capture_note": {"what_changed": "x", "lesson": "y"},
+        },
+    )
+    assert r.status_code == 400
+    assert "not allowed for request-changes" in r.json()["detail"]
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={
+            "decision": "approve",
+            "reviewer": "reviewer",
+            "comment": "ok",
+            "capture_note": {"what_changed": "x", "lesson": "y", "files": ["/abs.py"]},
+        },
+    )
+    assert r.status_code == 400
+    assert "repository-relative" in r.json()["detail"]
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={
+            "decision": "approve",
+            "reviewer": "reviewer",
+            "comment": "ok",
+            "capture_note": {"what_changed": "x", "lesson": "y", "files": ["../x.py"]},
+        },
+    )
+    assert r.status_code == 400
+    assert "traversal" in r.json()["detail"]
+
+
+def test_review_endpoint_capture_write_failure_preserves_decision(client, monkeypatch):
+    t = _review_required_task(client)
+    import hermes_cli.kanban_knowledge as kk
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(kk, "write_review_capture_note", fail_write)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={
+            "decision": "approve",
+            "reviewer": "reviewer",
+            "comment": "ok",
+            "capture_note": {"what_changed": "x", "lesson": "y"},
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "done"
+    assert "knowledge capture failed: disk full" in r.json()["warning"]
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        assert not [e for e in kb.list_events(conn, t["id"]) if e.kind == "knowledge_captured"]
 
 
 def test_review_endpoint_rejects_non_review_required_and_repeated_decision(client):

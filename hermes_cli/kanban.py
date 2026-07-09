@@ -650,6 +650,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Reviewer name (default: active profile author)",
     )
+    p_review.add_argument("--capture-note", action="store_true",
+                          help="Write an explicit knowledge-capture note after approve/reject")
+    p_review.add_argument("--what-changed", default=None,
+                          help="Concise change summary for --capture-note")
+    p_review.add_argument("--lesson", default=None,
+                          help="Key lesson / implementation note for --capture-note")
+    p_review.add_argument("--file", dest="files", action="append", default=[],
+                          help="Repository-relative affected file metadata (repeatable)")
+    p_review.add_argument("--area", default=None,
+                          help="Affected area metadata for --capture-note")
 
     p_promote = sub.add_parser(
         "promote",
@@ -2347,6 +2357,25 @@ def _cmd_review(args: argparse.Namespace) -> int:
     reviewer = (getattr(args, "reviewer", None) or _profile_author()).strip()
     comment = (getattr(args, "comment", None) or "").strip()
     decision = getattr(args, "decision", "")
+    capture_requested = bool(getattr(args, "capture_note", False))
+    capture = None
+    if capture_requested:
+        if decision == "request-changes":
+            print("cannot review with --capture-note: capture is not allowed for request-changes", file=sys.stderr)
+            return 1
+        try:
+            from hermes_cli.kanban_knowledge import validate_capture_request
+            capture = validate_capture_request(
+                what_changed=getattr(args, "what_changed", None),
+                lesson=getattr(args, "lesson", None),
+                files=getattr(args, "files", None),
+                area=getattr(args, "area", None),
+            )
+        except ValueError as exc:
+            print(f"cannot capture review knowledge: {exc}", file=sys.stderr)
+            return 1
+    capture_warning = None
+    capture_path = None
     try:
         with kb.connect_closing() as conn:
             ok = kb.review_required_decision(
@@ -2356,6 +2385,22 @@ def _cmd_review(args: argparse.Namespace) -> int:
                 reviewer=reviewer,
                 comment=comment,
             )
+            if ok and capture_requested and capture is not None:
+                try:
+                    from hermes_cli.kanban_knowledge import write_review_capture_note
+                    capture_path = write_review_capture_note(
+                        conn,
+                        args.task_id,
+                        decision=decision,
+                        reviewer=reviewer,
+                        comment=comment,
+                        capture=capture,
+                    )
+                except Exception as exc:
+                    capture_warning = (
+                        "review decision succeeded but knowledge capture failed: "
+                        f"{exc}"
+                    )
     except ValueError as exc:
         print(f"cannot review {args.task_id}: {exc}", file=sys.stderr)
         return 1
@@ -2368,6 +2413,10 @@ def _cmd_review(args: argparse.Namespace) -> int:
         print(f"Review requested changes for {args.task_id}")
     else:
         print(f"Review rejected {args.task_id}")
+    if capture_path:
+        print(f"Knowledge captured: {capture_path}")
+    if capture_warning:
+        print(f"WARNING: {capture_warning}", file=sys.stderr)
     return 0
 
 
