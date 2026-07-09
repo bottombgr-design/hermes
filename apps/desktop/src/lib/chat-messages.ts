@@ -55,6 +55,7 @@ export type GatewayEventPayload = {
   approval_mode?: string
   yolo?: boolean
   running?: boolean
+  turn_started_at?: number | null
   cwd?: string
   branch?: string
   credential_warning?: string
