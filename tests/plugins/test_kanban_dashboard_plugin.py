@@ -492,6 +492,127 @@ def test_patch_block_then_unblock(client):
     assert r.json()["task"]["status"] == "ready"
 
 
+def test_patch_block_review_required_stays_in_blocked_column(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    reason = (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={
+            "status": "blocked",
+            "block_kind": "review_required",
+            "block_reason": reason,
+        },
+    )
+    assert r.status_code == 200
+    task = r.json()["task"]
+    assert task["status"] == "blocked"
+    assert task["block_kind"] == "review_required"
+    assert task["effective_lifecycle_state"] == "review_required"
+    assert task["review_required"] is True
+
+    columns = client.get("/api/plugins/kanban/board").json()["columns"]
+    blocked = next(c for c in columns if c["name"] == "blocked")
+    review = next(c for c in columns if c["name"] == "review")
+    assert any(x["id"] == t["id"] for x in blocked["tasks"])
+    assert not any(x["id"] == t["id"] for x in review["tasks"])
+
+
+def test_patch_block_review_required_rejects_missing_summary(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={
+            "status": "blocked",
+            "block_kind": "review_required",
+            "block_reason": "What changed: partial",
+        },
+    )
+    assert r.status_code == 400
+    assert "what should be reviewed" in r.json()["detail"]
+
+
+def _review_summary() -> str:
+    return (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+
+
+def _review_required_task(client):
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "x", "assignee": "worker"},
+    ).json()["task"]
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={
+            "status": "blocked",
+            "block_kind": "review_required",
+            "block_reason": _review_summary(),
+        },
+    )
+    assert r.status_code == 200
+    return t
+
+
+def test_review_endpoint_approve_completes_task(client):
+    t = _review_required_task(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={"decision": "approve", "reviewer": "reviewer", "comment": "looks good"},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "done"
+
+
+def test_review_endpoint_request_changes_returns_ready(client):
+    t = _review_required_task(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={"decision": "request-changes", "reviewer": "reviewer", "comment": "fix tests"},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "ready"
+
+
+def test_review_endpoint_reject_archives_task(client):
+    t = _review_required_task(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={"decision": "reject", "reviewer": "reviewer", "comment": "close it"},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "archived"
+
+
+def test_review_endpoint_rejects_non_review_required_and_repeated_decision(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={"decision": "approve", "reviewer": "reviewer", "comment": "ok"},
+    )
+    assert r.status_code == 400
+    assert "review decisions apply only" in r.json()["detail"]
+
+    t = _review_required_task(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={"decision": "approve", "reviewer": "reviewer", "comment": "ok"},
+    )
+    assert r.status_code == 200
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/review",
+        json={"decision": "approve", "reviewer": "reviewer", "comment": "again"},
+    )
+    assert r.status_code == 400
+    assert "review decisions apply only" in r.json()["detail"]
+
+
 def test_patch_schedule_then_unblock(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     r = client.patch(

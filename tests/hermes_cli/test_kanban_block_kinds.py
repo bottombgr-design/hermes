@@ -65,6 +65,196 @@ def test_first_typed_block_lands_in_blocked(kanban_home: Path) -> None:
         assert t.block_recurrences == 1
 
 
+def _review_summary() -> str:
+    return (
+        "What changed: implementation updates are ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks match the report."
+    )
+
+
+def test_review_required_block_lands_in_blocked_with_review_lifecycle(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason=_review_summary(),
+            kind="review_required",
+        )
+        t = kb.get_task(conn, tid)
+        assert t is not None
+        assert t.status == "blocked"
+        assert t.block_kind == "review_required"
+        assert kb.effective_lifecycle_state(t) == "review_required"
+
+
+def test_review_required_block_requires_structured_review_summary(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with pytest.raises(ValueError, match="what should be reviewed"):
+            kb.block_task(
+                conn,
+                tid,
+                reason="What changed: only a partial summary",
+                kind="review_required",
+            )
+        after_reject = kb.get_task(conn, tid)
+        assert after_reject is not None
+        assert after_reject.status == "running"
+
+
+def test_legacy_review_required_prefix_is_still_recognised() -> None:
+    assert kb.is_review_required_reason("review-required: please inspect")
+    assert kb.is_review_required_reason("  REVIEW-REQUIRED: please inspect")
+    assert not kb.is_review_required_reason("needs input: please inspect")
+
+
+def test_request_changes_unblock_resumes_same_task_without_duplicate(kanban_home: Path) -> None:
+    """Review Required → Request Changes → Ready → worker resumes same task."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="implementation needs review")
+        assert kb.block_task(
+            conn,
+            tid,
+            reason=_review_summary(),
+            kind="review_required",
+        )
+        blocked = kb.get_task(conn, tid)
+        assert blocked is not None
+        assert blocked.status == "blocked"
+        before_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+        kb.add_comment(conn, tid, author="reviewer", body="Request changes: update tests")
+        assert kb.unblock_task(conn, tid)
+        ready = kb.get_task(conn, tid)
+        assert ready is not None
+        assert ready.status == "ready"
+
+        resumed = kb.claim_task(conn, tid, claimer="worker")
+        assert resumed is not None
+        assert resumed.id == tid
+        running = kb.get_task(conn, tid)
+        assert running is not None
+        assert running.status == "running"
+        after_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert after_count == before_count
+
+
+def test_review_decision_approve_completes_original_task(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason=_review_summary(), kind="review_required")
+        before_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+        assert kb.review_required_decision(
+            conn,
+            tid,
+            decision="approve",
+            reviewer="reviewer",
+            comment="Looks good",
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+        assert task.block_kind is None
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before_count
+        assert any("REVIEW APPROVED" in c.body for c in kb.list_comments(conn, tid))
+        assert any(
+            e.kind == "review_decision"
+            and e.payload is not None
+            and e.payload["decision"] == "approve"
+            for e in kb.list_events(conn, tid)
+        )
+
+
+def test_review_decision_request_changes_returns_original_task_ready(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason=_review_summary(), kind="review_required")
+        before_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+        assert kb.review_required_decision(
+            conn,
+            tid,
+            decision="request-changes",
+            reviewer="reviewer",
+            comment="Fix tests",
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.block_kind == "review_required"
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before_count
+        assert any("REVIEW REQUEST CHANGES" in c.body for c in kb.list_comments(conn, tid))
+
+
+def test_review_decision_reject_archives_original_task(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason=_review_summary(), kind="review_required")
+        before_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+        assert kb.review_required_decision(
+            conn,
+            tid,
+            decision="reject",
+            reviewer="reviewer",
+            comment="Close without merge",
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "archived"
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before_count
+        assert any("REVIEW REJECTED" in c.body for c in kb.list_comments(conn, tid))
+
+
+def test_review_decision_rejects_non_review_required_and_repeated_decision(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with pytest.raises(ValueError, match="review decisions apply only"):
+            kb.review_required_decision(
+                conn, tid, decision="approve", reviewer="reviewer", comment="ok"
+            )
+        assert kb.block_task(conn, tid, reason=_review_summary(), kind="review_required")
+        assert kb.review_required_decision(
+            conn, tid, decision="approve", reviewer="reviewer", comment="ok"
+        )
+        with pytest.raises(ValueError, match="review decisions apply only"):
+            kb.review_required_decision(
+                conn, tid, decision="approve", reviewer="reviewer", comment="again"
+            )
+
+
+def test_review_decision_rejects_self_approval(kanban_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason=_review_summary(), kind="review_required")
+        with pytest.raises(ValueError, match="assignee cannot review"):
+            kb.review_required_decision(
+                conn, tid, decision="approve", reviewer="worker", comment="ok"
+            )
+        monkeypatch.setattr(kb, "_current_profile_name_for_review", lambda: "worker")
+        with pytest.raises(ValueError, match="active profile cannot review"):
+            kb.review_required_decision(
+                conn, tid, decision="approve", reviewer="reviewer", comment="ok"
+            )
+
+
+def test_review_decision_does_not_apply_to_physical_review_status(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="physical review", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        with pytest.raises(ValueError, match="review decisions apply only"):
+            kb.review_required_decision(
+                conn, tid, decision="approve", reviewer="reviewer", comment="ok"
+            )
+
+
 def test_unblock_does_not_reset_recurrence_counter(kanban_home: Path) -> None:
     """The crux of the fix: unblock must preserve the loop counter."""
     with kb.connect_closing() as conn:

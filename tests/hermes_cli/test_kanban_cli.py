@@ -159,6 +159,94 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_run_slash_review_required_block_shows_lifecycle_and_kind(kanban_home):
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    reason = (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+    blocked = kc.run_slash(f"block {tid} '{reason}' --kind review_required")
+    assert "Blocked" in blocked
+    show = kc.run_slash(f"show {tid}")
+    assert "status:    blocked" in show
+    assert "lifecycle: review_required" in show
+    assert "block kind: review_required" in show
+
+
+def test_run_slash_review_required_block_rejects_missing_summary(kanban_home):
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    blocked = kc.run_slash(f"block {tid} 'What changed: partial' --kind review_required")
+    assert "review_required blocks require" in blocked
+
+
+def test_run_slash_review_approve_completes_task(kanban_home):
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    reason = (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+    kc.run_slash(f"block {tid} '{reason}' --kind review_required")
+
+    out = kc.run_slash(f"review {tid} approve --reviewer reviewer --comment 'looks good'")
+    assert "Review approved" in out
+    assert "status:    done" in kc.run_slash(f"show {tid}")
+
+
+def test_run_slash_review_request_changes_returns_ready(kanban_home):
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    reason = (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+    kc.run_slash(f"block {tid} '{reason}' --kind review_required")
+
+    out = kc.run_slash(f"review {tid} request-changes --reviewer reviewer --comment 'fix tests'")
+    assert "Review requested changes" in out
+    assert "status:    ready" in kc.run_slash(f"show {tid}")
+
+
+def test_run_slash_review_reject_archives_task(kanban_home):
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    reason = (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+    kc.run_slash(f"block {tid} '{reason}' --kind review_required")
+
+    out = kc.run_slash(f"review {tid} reject --reviewer reviewer --comment 'close it'")
+    assert "Review rejected" in out
+    assert "status:    archived" in kc.run_slash(f"show {tid}")
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)
