@@ -14095,10 +14095,10 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "agent-factory", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "egress", "fallback", "gateway", "hooks", "import", "insights", "knowledge",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "profile",
@@ -14915,6 +14915,13 @@ def main():
     from hermes_cli.knowledge_index import build_parser as _build_knowledge_parser
 
     _build_knowledge_parser(subparsers)
+
+    # =========================================================================
+    # agent-factory command — Phase 7 Hermes Agent Factory MVP
+    # =========================================================================
+    from hermes_cli.agent_factory_cmd import build_parser as _build_agent_factory_parser
+
+    _build_agent_factory_parser(subparsers)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
