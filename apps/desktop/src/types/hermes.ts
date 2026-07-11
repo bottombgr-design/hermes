@@ -534,6 +534,11 @@ export interface SessionMessage {
 
 export interface SessionMessagesResponse {
   messages: SessionMessage[]
+  pagination?: {
+    limit: null | number
+    offset: number
+    returned: number
+  }
   session_id: string
 }
 
@@ -545,6 +550,7 @@ export interface SessionResumeResponse {
     attempt: number
     interrupted_at: number
   }
+  hydrating?: boolean
   inflight?: null | {
     assistant?: string
     /** Mid-turn redirect corrections, oldest first. The turn's original prompt
