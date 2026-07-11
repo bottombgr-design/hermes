@@ -1713,7 +1713,11 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         _rid, method, _params = normalized
         from tui_gateway.mobile_contract import mobile_method_denial
 
-        denial = mobile_method_denial(method, getattr(t, "authorization", None))
+        denial = mobile_method_denial(
+            method,
+            getattr(t, "authorization", None),
+            _params,
+        )
         if denial is not None:
             return _err(
                 _rid,
@@ -6929,7 +6933,14 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    queued: bool = False,
+    allow_control: bool = True,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -6950,6 +6961,14 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
+    # A scoped writer may enqueue the next user turn, but must not inherit the
+    # dashboard's interrupt/steer preference unless its connection also holds
+    # conversation.control.
+    if not allow_control:
+        _enqueue_prompt(session, text, transport)
+        session["last_active"] = time.time()
+        return _ok(rid, {"status": "queued"})
+
     mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
@@ -10729,9 +10748,8 @@ def _(rid, params: dict) -> dict:
         except Exception:
             pass
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
-    session, err = _sess(params, rid)
-    if err:
-        return err
+    # Interrupting a deferred/lazy session must not build the very agent the
+    # caller is trying to stop. The live state fetched above is authoritative.
     # Safety net: if the turn's run thread is already gone but `running` stayed
     # stuck (a crash/desync that skipped the run loop's `finally`), force-clear it
     # so the session can't be permanently bricked at 4009 "session busy" — every
@@ -11155,9 +11173,22 @@ def _(rid, params: dict) -> dict:
                 busy_transport = t or session.get("transport")
             else:
                 break
+        from tui_gateway.mobile_contract import (
+            CONVERSATION_CONTROL_SCOPE,
+            authorization_allows_scope,
+        )
+
         busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport,
+            rid,
+            sid,
+            session,
+            text,
+            busy_transport,
             queued=bool(params.get("queued")),
+            allow_control=authorization_allows_scope(
+                getattr(busy_transport, "authorization", None),
+                CONVERSATION_CONTROL_SCOPE,
+            ),
         )
         if busy_response is not None:
             return busy_response
