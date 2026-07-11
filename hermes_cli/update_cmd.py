@@ -3049,6 +3049,38 @@ def _discard_lockfile_churn(git_cmd, repo_root):
         # Never let lockfile cleanup block an update.
         pass
 
+def _migrate_profile_config(profile) -> None:
+    """Run non-interactive config migration for a single profile.
+
+    Called from ``_cmd_update_impl`` to catch up named profiles whose
+    config.yaml is still at an older version after the active profile was
+    migrated. Only version-bump-only migrations are applied silently; if new
+    required settings are needed, the user is told to run
+    ``hermes config migrate`` with that profile active.
+    """
+    saved_home = os.environ.get("HERMES_HOME")
+    try:
+        os.environ["HERMES_HOME"] = str(profile.path)
+        from hermes_cli.config import (
+            get_missing_env_vars,
+            get_missing_config_fields,
+            check_config_version,
+            migrate_config,
+        )
+        current_ver, latest_ver = check_config_version()
+        if current_ver < latest_ver:
+            missing_env = get_missing_env_vars(required_only=True)
+            missing_config = get_missing_config_fields()
+            if not (missing_env or missing_config):
+                migrate_config(interactive=False, quiet=True)
+    finally:
+        if saved_home is not None:
+            os.environ["HERMES_HOME"] = saved_home
+        else:
+            os.environ.pop("HERMES_HOME", None)
+
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -4013,6 +4045,26 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("Skipped. Run 'hermes config migrate' later to configure.")
         else:
             print("  ✓ Configuration is up to date")
+
+        # Migrate config for ALL profiles, not just the active one.
+        # `hermes update` runs with the default profile active, so named
+        # profiles (e.g. orchestrator) keep their stale config version and
+        # break when the desktop app spawns `hermes serve --profile <name>`
+        # against the updated code. This loop catches them up with the same
+        # non-interactive migration used above.
+        try:
+            from hermes_cli.profiles import list_profiles
+            all_profiles = list_profiles()
+            for p in all_profiles:
+                try:
+                    _migrate_profile_config(p)
+                except Exception as pe:
+                    logger.debug(
+                        "Config migration for profile %s failed: %s",
+                        p.name, pe,
+                    )
+        except Exception:
+            pass  # profiles module not available or no profiles
 
         # Safety net: config-version migrations have been observed to leave
         # cron/jobs.json valid-but-empty, silently dropping every scheduled

@@ -10254,6 +10254,36 @@ def cmd_dashboard(args):
         logger.debug("terminal config → env bridge failed for dashboard/serve",
                      exc_info=True)
 
+    # Auto-migrate config if the version is stale.  `hermes update` only
+    # migrates the active profile's config; when the desktop app spawns
+    # `hermes serve --profile <name>`, that profile's config may still be
+    # at an older version, causing agent init failures ("No LLM provider
+    # configured") because the stale config structure doesn't match the
+    # current code's expectations.  Run the same non-interactive migration
+    # the CLI uses for version-bump-only bumps.
+    try:
+        from hermes_cli.config import (
+            get_missing_env_vars,
+            get_missing_config_fields,
+            check_config_version,
+            migrate_config,
+        )
+        current_ver, latest_ver = check_config_version()
+        if current_ver < latest_ver:
+            missing_env = get_missing_env_vars(required_only=True)
+            missing_config = get_missing_config_fields()
+            has_new_options = bool(missing_env or missing_config)
+            if not has_new_options:
+                # Version-bump-only: safe to auto-migrate silently.
+                migrate_config(interactive=False, quiet=True)
+            else:
+                print(
+                    f"⚠️  Config v{current_ver} is outdated (current: v{latest_ver}). "
+                    f"Run `hermes config migrate` to update."
+                )
+    except Exception:
+        pass  # non-fatal — let start_server surface real config errors
+
     if _headless_backend:
         # Don't build the SPA, and tell mount_spa() (read at web_server import
         # below) to disable it even if a stray dist exists. Set it first.
