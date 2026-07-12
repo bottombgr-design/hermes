@@ -1,0 +1,77 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const getHermesConfigRecord = vi.fn()
+const saveHermesConfig = vi.fn()
+
+vi.mock('@/hermes', () => ({
+  getHermesConfigRecord: () => getHermesConfigRecord(),
+  saveHermesConfig: (config: unknown) => saveHermesConfig(config)
+}))
+
+import {
+  $desktopStatusbarMode,
+  applyDesktopStatusbarFromConfig,
+  normalizeDesktopStatusbarMode,
+  persistDesktopStatusbarMode,
+  toggleDesktopStatusbarVisible
+} from './desktop-statusbar'
+
+describe('desktop status bar preference', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    applyDesktopStatusbarFromConfig({ display: { desktop_statusbar: 'on' } })
+  })
+
+  it('normalizes unknown and missing values to the backward-compatible default', () => {
+    expect(normalizeDesktopStatusbarMode(undefined)).toBe('on')
+    expect(normalizeDesktopStatusbarMode('sometimes')).toBe('on')
+    expect(normalizeDesktopStatusbarMode('auto-hide')).toBe('auto-hide')
+  })
+
+  it('applies a saved profile preference', () => {
+    applyDesktopStatusbarFromConfig({ display: { desktop_statusbar: 'off' } })
+
+    expect($desktopStatusbarMode.get()).toBe('off')
+  })
+
+  it('preserves sibling config fields while persisting', async () => {
+    getHermesConfigRecord.mockResolvedValue({ display: { language: 'zh', skin: 'slate' }, terminal: { cwd: '/work' } })
+    saveHermesConfig.mockResolvedValue({ ok: true })
+
+    const saved = await persistDesktopStatusbarMode('auto-hide')
+
+    expect($desktopStatusbarMode.get()).toBe('auto-hide')
+    expect(saved).toEqual({
+      display: { desktop_statusbar: 'auto-hide', language: 'zh', skin: 'slate' },
+      terminal: { cwd: '/work' }
+    })
+    expect(saveHermesConfig).toHaveBeenCalledWith(saved)
+  })
+
+  it('rolls back the optimistic preference when persistence fails', async () => {
+    getHermesConfigRecord.mockRejectedValue(new Error('offline'))
+
+    await expect(persistDesktopStatusbarMode('off')).rejects.toThrow('offline')
+    expect($desktopStatusbarMode.get()).toBe('on')
+  })
+
+  it('toggles off and restores the last visible mode', async () => {
+    getHermesConfigRecord.mockResolvedValue({ display: { language: 'zh' } })
+    saveHermesConfig.mockResolvedValue({ ok: true })
+    applyDesktopStatusbarFromConfig({ display: { desktop_statusbar: 'auto-hide' } })
+
+    await toggleDesktopStatusbarVisible()
+
+    expect($desktopStatusbarMode.get()).toBe('off')
+    expect(saveHermesConfig).toHaveBeenLastCalledWith({
+      display: { desktop_statusbar: 'off', language: 'zh' }
+    })
+
+    await toggleDesktopStatusbarVisible()
+
+    expect($desktopStatusbarMode.get()).toBe('auto-hide')
+    expect(saveHermesConfig).toHaveBeenLastCalledWith({
+      display: { desktop_statusbar: 'auto-hide', language: 'zh' }
+    })
+  })
+})

@@ -290,7 +290,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
 
         <OverlayMain className="px-0 pb-0">
           {activeView === 'config:appearance' ? (
-            <AppearanceSettings />
+            <AppearanceSettings onConfigSaved={onConfigSaved} />
           ) : activeView === 'about' ? (
             <AboutSettings />
           ) : activeView === 'gateway' ? (
