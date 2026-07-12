@@ -1375,6 +1375,49 @@ def _session_event_stream(session: dict) -> SessionEventStream:
     return stream
 
 
+def _session_sync_enabled(session: dict) -> bool:
+    """Return whether this live session negotiated revisioned mobile sync.
+
+    Legacy stdio and Desktop clients retain the original response/event shape
+    and avoid replay copies.  Once a mobile transport attaches, keep retention
+    enabled for the rest of the live stream so a later reconnect can replay
+    events emitted while the socket was detached.
+    """
+    if session.get("mobile_sync_enabled"):
+        return True
+    transport = session.get("transport") or current_transport()
+    authorization = getattr(transport, "authorization", None)
+    if not isinstance(authorization, dict):
+        return False
+    from tui_gateway.mobile_contract import MOBILE_AUDIENCE, effective_authorization
+
+    if effective_authorization(authorization)["audience"] != MOBILE_AUDIENCE:
+        return False
+    session["mobile_sync_enabled"] = True
+    return True
+
+
+def _emit(
+    event: str,
+    sid: str,
+    payload: dict | None = None,
+):
+    session = _sessions.get(sid)
+    if session is not None and _session_sync_enabled(session):
+        return _session_event_stream(session).publish(
+            event,
+            sid,
+            payload,
+            write_json,
+        )
+    params = {"type": event, "session_id": sid}
+    if payload is not None:
+        params["payload"] = payload
+    frame = {"jsonrpc": "2.0", "method": "event", "params": params}
+    write_json(frame)
+    return frame
+
+
 def _emit_with_sync_update(event: str, sid: str, payload: dict, update):
     session = _sessions.get(sid)
     if session is None:
@@ -1603,6 +1646,15 @@ def _send_compute_host_control(
         wait=wait,
         timeout=timeout,
     )
+
+
+def _mark_snapshot_mutation(session: dict) -> None:
+    """Advance the snapshot revision for a state change with no wire event.
+
+    Callers hold ``history_lock`` first, preserving the same history -> stream
+    lock order used by snapshot capture and event publication.
+    """
+    _session_event_stream(session).mutate(lambda _stream: None)
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
@@ -3541,6 +3593,7 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
         with lock:
             session.setdefault("history", []).append(entry)
             session["history_version"] = int(session.get("history_version", 0)) + 1
+            _mark_snapshot_mutation(session)
     else:
         session.setdefault("history", []).append(entry)
         session["history_version"] = int(session.get("history_version", 0)) + 1
@@ -4372,6 +4425,7 @@ def _compress_session_history(
             return 0, usage
         session["history"] = compressed
         session["history_version"] = history_version + 1
+        _mark_snapshot_mutation(session)
     usage = _get_usage(agent)
     return len(history) - len(compressed), usage
 
@@ -5211,12 +5265,36 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
         with _child_mirrors_lock:
             _child_mirrors.pop(child_key, None)
         return
-    csid = live[0]
+    csid, child_session = live
+    history_lock = child_session.setdefault("history_lock", threading.RLock())
+    child_session.setdefault("history", [])
+    child_session.setdefault("history_version", 0)
+    child_session.setdefault("inflight_turn", None)
+    child_session.setdefault("running", False)
+
+    def finish_open_tool(tool: dict | None) -> None:
+        if not tool:
+            return
+        tool_id = str(tool.get("tool_id") or "")
+        _emit_with_sync_update(
+            "tool.complete",
+            csid,
+            tool,
+            lambda stream: stream.finish_tool(tool_id),
+        )
+
     with _child_mirrors_lock:
         st = _child_mirrors.setdefault(child_key, {"seq": 0, "open_tool": None, "started": False})
         if not st["started"]:
             st["started"] = True
-            _emit("message.start", csid)
+            with history_lock:
+                child_session["running"] = True
+                if not isinstance(child_session.get("inflight_turn"), dict):
+                    _start_inflight_turn(child_session, "")
+                turn_id = str(
+                    (child_session.get("inflight_turn") or {}).get("turn_id") or ""
+                )
+                _emit("message.start", csid, {"turn_id": turn_id})
         if event_type == "subagent.thinking":
             if text := str(payload.get("text") or ""):
                 _emit("reasoning.delta", csid, {"text": text})
@@ -5225,15 +5303,14 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             # Relayed token-by-token from the child's run_conversation
             # stream_callback, so the watch window streams the reply live.
             if text := str(payload.get("text") or ""):
-                _emit("message.delta", csid, {"text": text})
+                _emit_inflight_delta(csid, child_session, text)
         elif event_type == "subagent.start":
             # One-time header line (the child's goal) so a freshly opened window
             # shows immediate context before the first reply token streams.
             if text := str(payload.get("text") or ""):
-                _emit("message.delta", csid, {"text": f"{text}\n"})
+                _emit_inflight_delta(csid, child_session, f"{text}\n")
         elif event_type == "subagent.tool":
-            if st["open_tool"]:
-                _emit("tool.complete", csid, st["open_tool"])
+            finish_open_tool(st["open_tool"])
             st["seq"] += 1
             tool = {
                 "name": str(payload.get("tool_name") or "tool"),
@@ -5243,12 +5320,43 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             if preview := str(payload.get("tool_preview") or payload.get("text") or ""):
                 tool["preview"] = preview
             st["open_tool"] = tool
-            _emit("tool.start", csid, tool)
+            descriptor = {
+                "tool_id": tool["tool_id"],
+                "name": tool["name"],
+                "started_at": time.time(),
+            }
+            _emit_with_sync_update(
+                "tool.start",
+                csid,
+                tool,
+                lambda stream: stream.track_tool(descriptor),
+            )
         elif event_type == "subagent.complete":
-            if st["open_tool"]:
-                _emit("tool.complete", csid, st["open_tool"])
+            finish_open_tool(st["open_tool"])
+            st["open_tool"] = None
             summary = str(payload.get("summary") or payload.get("text") or "")
-            _emit("message.complete", csid, {"text": summary})
+            with history_lock:
+                turn = child_session.get("inflight_turn") or {}
+                turn_id = str(turn.get("turn_id") or "")
+                assistant = str(turn.get("assistant") or "")
+                final_text = assistant or summary
+                history = child_session.setdefault("history", [])
+                if final_text and not (
+                    history
+                    and history[-1].get("role") == "assistant"
+                    and history[-1].get("content") == final_text
+                ):
+                    history.append({"role": "assistant", "content": final_text})
+                    child_session["history_version"] = int(
+                        child_session.get("history_version", 0)
+                    ) + 1
+                child_session["running"] = False
+                _clear_inflight_turn(child_session)
+                _emit(
+                    "message.complete",
+                    csid,
+                    {"text": summary or final_text, "turn_id": turn_id},
+                )
             _child_mirrors.pop(child_key, None)
 
 
@@ -5525,6 +5633,7 @@ def _apply_personality_to_session(
         with session["history_lock"]:
             session["history"].append({"role": "user", "content": marker})
             session["history_version"] = int(session.get("history_version", 0)) + 1
+            _mark_snapshot_mutation(session)
         info = _session_info(agent)
         _emit("session.info", sid, info)
         return False, info
@@ -5776,6 +5885,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     with session["history_lock"]:
         session["history"] = []
         session["history_version"] = int(session.get("history_version", 0)) + 1
+        _mark_snapshot_mutation(session)
     info = _session_info(new_agent, session)
     _emit("session.info", sid, info)
     _restart_slash_worker(sid, session)
@@ -6126,7 +6236,6 @@ def _init_session(
             "history_version": 0,
             "inflight_turn": None,
             "conversation_id": key,
-            "mobile_sync": _new_session_event_stream(),
             "created_at": now,
             "last_active": now,
             "running": False,
@@ -7256,11 +7365,22 @@ def _new_session_event_stream() -> SessionEventStream:
     return SessionEventStream(SERVER_INSTANCE_ID)
 
 
+
 def _conversation_root(db, session_id: str) -> str:
     try:
         lineage = db.get_compression_lineage(session_id)
-    except Exception:
+    except AttributeError:
+        # Compatibility with old/embedded SessionDB stubs that predate
+        # compression lineage. Unexpected database failures must not silently
+        # change a conversation's supposedly stable identity to its current tip.
         lineage = []
+    except Exception:
+        logger.warning(
+            "failed to resolve stable conversation lineage for %s",
+            session_id,
+            exc_info=True,
+        )
+        raise
     return str(
         lineage[0]
         if isinstance(lineage, (list, tuple)) and lineage
@@ -7310,6 +7430,8 @@ def _attach_synchronization(
     session: dict,
     cursor: object = None,
 ) -> dict:
+    if not _session_sync_enabled(session):
+        return payload
     payload["synchronization"] = _session_synchronization(sid, session, cursor)
     return payload
 
@@ -7401,7 +7523,6 @@ def _(rid, params: dict) -> dict:
             "inflight_turn": None,
             "last_active": now,
             "model_override": session_model_override,
-            "mobile_sync": _new_session_event_stream(),
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
             "parent_session_id": parent_session_id,
@@ -7706,7 +7827,6 @@ def _deferred_session_record(
         "last_active": now,
         "lazy": lazy,
         "model_override": model_override,
-        "mobile_sync": _new_session_event_stream(),
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
         "resume_runtime_overrides": resume_runtime_overrides,
@@ -8160,7 +8280,6 @@ def _(rid, params: dict) -> dict:
                 "history": history,
                 "history_lock": threading.Lock(),
                 "inflight_turn": None,
-                "mobile_sync": _new_session_event_stream(),
                 "running": False,
                 "session_key": target,
             }
@@ -8169,7 +8288,6 @@ def _(rid, params: dict) -> dict:
             session.setdefault("history", history)
             session.setdefault("history_lock", threading.Lock())
             session.setdefault("inflight_turn", None)
-            session.setdefault("mobile_sync", _new_session_event_stream())
             session.setdefault("running", False)
         session["conversation_id"] = conversation_id
     assert session is not None
@@ -10588,6 +10706,7 @@ def _(rid, params: dict) -> dict:
             removed = len(history) - last_user_idx
             del history[last_user_idx:]
             session["history_version"] = int(session.get("history_version", 0)) + 1
+            _mark_snapshot_mutation(session)
     return _ok(rid, {"removed": removed})
 
 
@@ -11027,6 +11146,7 @@ def _(rid, params: dict) -> dict:
             if session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
+                _mark_snapshot_mutation(session)
 
     # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
     # foreground subprocess). Background processes the agent started (dev servers,
@@ -11519,6 +11639,7 @@ def _(rid, params: dict) -> dict:
             )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
+            _mark_snapshot_mutation(session)
             if (db := _get_db()) is not None:
                 try:
                     db.replace_messages(session["session_key"], truncated)
@@ -11565,6 +11686,8 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+                _clear_inflight_turn(session)
+                _mark_snapshot_mutation(session)
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
@@ -11586,6 +11709,7 @@ def _(rid, params: dict) -> dict:
                         else "Session no longer running before the agent was ready"
                     },
                 )
+                _mark_snapshot_mutation(session)
                 return
         _run_prompt_submit(rid, sid, session, text)
 
@@ -12269,6 +12393,49 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+def _commit_prompt_completion(
+    sid: str,
+    session: dict,
+    *,
+    expected_history_version: int,
+    result_messages: list | None,
+    payload: dict[str, Any],
+) -> str | None:
+    """Publish final history and completion at one snapshot/event barrier."""
+    status_note = None
+    with session["history_lock"]:
+        if result_messages is not None:
+            current_version = int(session.get("history_version", 0))
+            if current_version == expected_history_version:
+                session["history"] = result_messages
+                session["history_version"] = expected_history_version + 1
+            else:
+                # History mutated externally during the turn
+                # (undo/compress/retry/rollback guard on session.running, but
+                # this is the defensive backstop for any path that slips past).
+                # Surface the desync rather than silently dropping output.
+                print(
+                    f"[tui_gateway] prompt.submit: history_version mismatch "
+                    f"(expected={expected_history_version} current={current_version}) — "
+                    f"agent output NOT written to session history",
+                    file=sys.stderr,
+                )
+                status_note = (
+                    "History changed during this turn — the response above is visible "
+                    "but was not saved to session history."
+                )
+                payload["warning"] = status_note
+
+        turn_id = str((session.get("inflight_turn") or {}).get("turn_id") or "")
+        payload["turn_id"] = turn_id
+        _clear_inflight_turn(session)
+        # _emit allocates the stream sequence while history_lock is still held.
+        # Snapshot capture takes the same locks in this order, so it can observe
+        # either the streaming turn or the completed history, never a mixture.
+        _emit("message.complete", sid, payload)
+    return status_note
+
+
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
@@ -12603,33 +12770,10 @@ def _run_prompt_submit(
                     session["model_override"] = _restore
 
             last_reasoning = None
-            status_note = None
+            result_messages = None
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
-                    with session["history_lock"]:
-                        current_version = int(session.get("history_version", 0))
-                        if current_version == history_version:
-                            session["history"] = result["messages"]
-                            session["history_version"] = history_version + 1
-                        else:
-                            # History mutated externally during the turn
-                            # (undo/compress/retry/rollback now guard on
-                            # session.running, but this is the defensive
-                            # backstop for any path that slips past).
-                            # Surface the desync rather than silently
-                            # dropping the agent's output — the UI can
-                            # show the response and warn that it was
-                            # not persisted.
-                            print(
-                                f"[tui_gateway] prompt.submit: history_version mismatch "
-                                f"(expected={history_version} current={current_version}) — "
-                                f"agent output NOT written to session history",
-                                file=sys.stderr,
-                            )
-                            status_note = (
-                                "History changed during this turn — the response above is visible "
-                                "but was not saved to session history."
-                            )
+                    result_messages = result["messages"]
 
                 # If auto-compression fired inside run_conversation(), agent.session_id
                 # may have rotated. Sync session_key before downstream title/goal/finalize
@@ -12926,6 +13070,7 @@ def _run_prompt_submit(
                 session["last_active"] = time.time()
                 if not turn_error_retained:
                     _clear_inflight_turn(session)
+                _mark_snapshot_mutation(session)
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
             _retire_turn_marker(session, marker_key)
@@ -16345,6 +16490,7 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             session["history"] = history[:last_user_idx]
             session["history_version"] = int(session.get("history_version", 0)) + 1
+            _mark_snapshot_mutation(session)
         return _ok(rid, {"type": "send", "message": content})
 
     if name == "steer":
@@ -16495,6 +16641,7 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             session["history"] = list(active)
             session["history_version"] = int(session.get("history_version", 0)) + 1
+            _mark_snapshot_mutation(session)
         # Notify memory providers — same hook /branch fires, plus the
         # rewound flag so providers caching per-turn document state
         # know to invalidate. See #6672 + #21910.
@@ -19009,6 +19156,7 @@ def _(rid, params: dict) -> dict:
                         session["history_version"] = (
                             int(session.get("history_version", 0)) + 1
                         )
+                        _mark_snapshot_mutation(session)
                 result["history_removed"] = removed
             return result
 
