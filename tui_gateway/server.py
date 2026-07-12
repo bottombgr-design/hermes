@@ -41,6 +41,7 @@ from tui_gateway.turn_marker import (
     read_turn_marker,
     record_turn_start,
 )
+from tui_gateway.mobile_sync import SessionEventStream
 from tui_gateway.transport import (
     StdioTransport,
     Transport,
@@ -1352,7 +1353,34 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    session = _sessions.get(sid)
+    if session is not None:
+        return _session_event_stream(session).publish(
+            event,
+            sid,
+            payload,
+            write_json,
+        )
     write_json(_event_frame(event, sid, payload))
+
+
+def _session_event_stream(session: dict) -> SessionEventStream:
+    stream = session.get("mobile_sync")
+    if isinstance(stream, SessionEventStream):
+        return stream
+    from tui_gateway.mobile_contract import SERVER_INSTANCE_ID
+
+    stream = SessionEventStream(SERVER_INSTANCE_ID)
+    session["mobile_sync"] = stream
+    return stream
+
+
+def _emit_with_sync_update(event: str, sid: str, payload: dict, update):
+    session = _sessions.get(sid)
+    if session is None:
+        return _emit(event, sid, payload)
+    with _session_event_stream(session).transition(update):
+        return _emit(event, sid, payload)
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
@@ -2838,7 +2866,17 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
     answer = ""
     answer_present = False
     try:
-        _emit(event, sid, payload)
+        descriptor = {
+            "request_id": rid,
+            "kind": event.removesuffix(".request"),
+            "payload": dict(payload),
+        }
+        _emit_with_sync_update(
+            event,
+            sid,
+            payload,
+            lambda stream: stream.track_pending_interaction(descriptor),
+        )
         # Natural Event semantics: None → wait forever (clarify configured with
         # clarify_timeout <= 0, released only by a real answer or
         # session.interrupt), 0 → return immediately, > 0 → bounded wait.
@@ -2849,6 +2887,9 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
             _pending_prompt_payloads.pop(rid, None)
             answer_present = rid in _answers
             answer = _answers.pop(rid, "")
+        session = _sessions.get(sid)
+        if session is not None:
+            _session_event_stream(session).finish_pending_interaction(rid)
 
     # Emit an `.expire` notification on timeout for every blocking request type
     # whose `*.respond` handler tolerates a late reply (allow_expired=True).
@@ -4884,6 +4925,11 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         except Exception:
             pass
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
+    descriptor = {
+        "tool_id": tool_call_id,
+        "name": name,
+        "started_at": time.time(),
+    }
     if _tool_progress_enabled(sid) or _tool_lifecycle_required_for_ui(name):
         payload = {
             "tool_id": tool_call_id,
@@ -4896,7 +4942,16 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
                 payload["args_text"] = args_text
         # tool.complete is the source of truth for todos (full list from the
         # tool result). args.todos here may be a partial merge update.
-        _emit("tool.start", sid, payload)
+        _emit_with_sync_update(
+            "tool.start",
+            sid,
+            payload,
+            lambda stream: stream.track_tool(descriptor),
+        )
+    elif session is not None:
+        _session_event_stream(session).mutate(
+            lambda stream: stream.track_tool(descriptor)
+        )
 
 
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
@@ -4943,7 +4998,16 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     except Exception:
         pass
     if _tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name):
-        _emit("tool.complete", sid, payload)
+        _emit_with_sync_update(
+            "tool.complete",
+            sid,
+            payload,
+            lambda stream: stream.finish_tool(tool_call_id),
+        )
+    elif session is not None:
+        _session_event_stream(session).mutate(
+            lambda stream: stream.finish_tool(tool_call_id)
+        )
 
 
 def _on_tool_progress(
@@ -6061,6 +6125,8 @@ def _init_session(
             "history_lock": threading.Lock(),
             "history_version": 0,
             "inflight_turn": None,
+            "conversation_id": key,
+            "mobile_sync": _new_session_event_stream(),
             "created_at": now,
             "last_active": now,
             "running": False,
@@ -6649,22 +6715,57 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
         "assistant": "",
         "started_at": now,
         "streaming": True,
+        "turn_id": str(uuid.uuid4()),
         "updated_at": now,
         "user": _inflight_text(text),
     }
 
 
-def _append_inflight_delta(session: dict, delta: Any) -> None:
+def _append_inflight_delta(session: dict, delta: Any) -> int:
     text = "" if delta is None else str(delta)
-    if not text:
-        return
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
-        turn = {"assistant": "", "streaming": True, "user": ""}
+        turn = {
+            "assistant": "",
+            "streaming": True,
+            "turn_id": str(uuid.uuid4()),
+            "user": "",
+        }
+    offset = len(str(turn.get("assistant") or "").encode("utf-8"))
+    if not text:
+        return offset
     turn["assistant"] = f"{turn.get('assistant') or ''}{text}"
     turn["streaming"] = True
     turn["updated_at"] = time.time()
     session["inflight_turn"] = turn
+    return offset
+
+
+def _emit_inflight_delta(
+    sid: str,
+    session: dict,
+    delta: Any,
+    *,
+    rendered: Any = None,
+) -> None:
+    """Append and publish a delta with its absolute UTF-8 byte offset.
+
+    UTF-8 bytes give clients a language-neutral overlap key even when one
+    streamed chunk contains extended grapheme clusters.
+    """
+    with session["history_lock"]:
+        offset = _append_inflight_delta(session, delta)
+        turn_id = str(
+            (session.get("inflight_turn") or {}).get("turn_id") or ""
+        )
+        payload = {
+            "text": delta,
+            "turn_id": turn_id,
+            "offset": offset,
+        }
+        if rendered is not None:
+            payload["rendered"] = rendered
+        _emit("message.delta", sid, payload)
 
 
 def _record_inflight_correction(session: dict, text: Any) -> None:
@@ -7062,7 +7163,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     return True
 
 
-def _inflight_snapshot(session: dict) -> dict | None:
+def _inflight_snapshot(
+    session: dict,
+    *,
+    include_turn_id: bool = False,
+) -> dict | None:
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
         return None
@@ -7089,6 +7194,8 @@ def _inflight_snapshot(session: dict) -> dict | None:
         snapshot["error"] = error
         snapshot["status"] = str(turn.get("status") or "error")
         snapshot["recoverable"] = bool(turn.get("recoverable"))
+    if include_turn_id:
+        snapshot["turn_id"] = str(turn.get("turn_id") or "")
     return snapshot
 
 
@@ -7141,6 +7248,70 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
         return None
     user = _inflight_text(queued.get("text"))
     return {"user": user} if user else None
+
+
+def _new_session_event_stream() -> SessionEventStream:
+    from tui_gateway.mobile_contract import SERVER_INSTANCE_ID
+
+    return SessionEventStream(SERVER_INSTANCE_ID)
+
+
+def _conversation_root(db, session_id: str) -> str:
+    try:
+        lineage = db.get_compression_lineage(session_id)
+    except Exception:
+        lineage = []
+    return str(
+        lineage[0]
+        if isinstance(lineage, (list, tuple)) and lineage
+        else session_id
+    )
+
+
+def _session_synchronization(
+    sid: str,
+    session: dict,
+    cursor: object = None,
+) -> dict:
+    """Capture history then the stream watermark using the documented lock order."""
+    with session["history_lock"]:
+        history = list(session.get("display_history_prefix") or []) + list(
+            session.get("history") or []
+        )
+        messages = _history_to_messages(history)
+        inflight = _inflight_snapshot(session, include_turn_id=True)
+        stored_session_id = _session_lookup_key(session, fallback=sid)
+        conversation_id = str(
+            session.get("conversation_id") or stored_session_id or sid
+        )
+        running = bool(session.get("running"))
+
+        def snapshot(state: dict) -> dict:
+            status = "waiting" if state["pending_interactions"] else (
+                "working" if running else "idle"
+            )
+            return {
+                "conversation_id": conversation_id,
+                "stored_session_id": stored_session_id,
+                "live_session_id": sid,
+                "messages": messages,
+                "inflight_turn": inflight,
+                "active_tools": state["active_tools"],
+                "pending_interactions": state["pending_interactions"],
+                "status": status,
+            }
+
+        return _session_event_stream(session).synchronization(snapshot, cursor)
+
+
+def _attach_synchronization(
+    payload: dict,
+    sid: str,
+    session: dict,
+    cursor: object = None,
+) -> dict:
+    payload["synchronization"] = _session_synchronization(sid, session, cursor)
+    return payload
 
 
 # ── Methods: session ─────────────────────────────────────────────────
@@ -7218,6 +7389,7 @@ def _(rid, params: dict) -> dict:
             "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
             "active_session_lease": lease,
             "cols": cols,
+            "conversation_id": key,
             "created_at": now,
             "edit_snapshots": {},
             "explicit_cwd": explicit_cwd,
@@ -7229,6 +7401,7 @@ def _(rid, params: dict) -> dict:
             "inflight_turn": None,
             "last_active": now,
             "model_override": session_model_override,
+            "mobile_sync": _new_session_event_stream(),
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
             "parent_session_id": parent_session_id,
@@ -7259,38 +7432,68 @@ def _(rid, params: dict) -> dict:
     _schedule_agent_build(sid)
     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
+    payload = {
+        "session_id": sid,
+        "stored_session_id": key,
+        "message_count": len(history),
+        "messages": _history_to_messages(history),
+        "info": {
+            # Reflect the per-session model override (desktop composer pick)
+            # in the immediate response so the client doesn't briefly clobber
+            # its sticky pick with the global default before the deferred
+            # build's session.info lands.
+            "model": (
+                session_model_override.get("model")
+                if session_model_override
+                else _resolve_model()
+            ),
+            **(
+                {"provider": session_model_override["provider"]}
+                if session_model_override and session_model_override.get("provider")
+                else {}
+            ),
+            "tools": {},
+            "skills": {},
+            "cwd": _sessions[sid]["cwd"],
+            "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
+            "lazy": True,
+            "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+            "profile_name": _current_profile_name(),
+        },
+    }
+    response = {
+        "session_id": sid,
+        "stored_session_id": key,
+        "message_count": len(history),
+        "messages": _history_to_messages(history),
+        "info": {
+            # Reflect the per-session model override (desktop composer pick)
+            # in the immediate response so the client doesn't briefly clobber
+            # its sticky pick with the global default before the deferred
+            # build's session.info lands.
+            "model": (
+                session_model_override.get("model")
+                if session_model_override
+                else _resolve_model()
+            ),
+            **(
+                {"provider": session_model_override["provider"]}
+                if session_model_override and session_model_override.get("provider")
+                else {}
+            ),
+            "tools": {},
+            "skills": {},
+            "cwd": _sessions[sid]["cwd"],
+            "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
+            "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
+            "lazy": True,
+            "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+            "profile_name": _response_profile_name(profile),
+        },
+    }
     return _ok(
         rid,
-        {
-            "session_id": sid,
-            "stored_session_id": key,
-            "message_count": len(history),
-            "messages": _history_to_messages(history),
-            "info": {
-                # Reflect the per-session model override (desktop composer pick)
-                # in the immediate response so the client doesn't briefly clobber
-                # its sticky pick with the global default before the deferred
-                # build's session.info lands.
-                "model": (
-                    session_model_override.get("model")
-                    if session_model_override
-                    else _resolve_model()
-                ),
-                **(
-                    {"provider": session_model_override["provider"]}
-                    if session_model_override and session_model_override.get("provider")
-                    else {}
-                ),
-                "tools": {},
-                "skills": {},
-                "cwd": _sessions[sid]["cwd"],
-                "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
-                "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
-                "lazy": True,
-                "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-                "profile_name": _response_profile_name(profile),
-            },
-        },
+        _attach_synchronization(response, sid, _sessions[sid]),
     )
 
 
@@ -7476,6 +7679,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    conversation_id: str | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -7488,6 +7692,7 @@ def _deferred_session_record(
         "close_on_disconnect": close_on_disconnect,
         "active_session_lease": lease,
         "cols": cols,
+        "conversation_id": conversation_id or session_key,
         "created_at": now,
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
@@ -7501,6 +7706,7 @@ def _deferred_session_record(
         "last_active": now,
         "lazy": lazy,
         "model_override": model_override,
+        "mobile_sync": _new_session_event_stream(),
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
         "resume_runtime_overrides": resume_runtime_overrides,
@@ -7617,6 +7823,7 @@ def _(rid, params: dict) -> dict:
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
     )
+    conversation_id = _conversation_root(db, target)
 
     def _reuse_live_payload(sid: str, session: dict) -> dict:
         payload = _live_session_payload(
@@ -7625,6 +7832,7 @@ def _(rid, params: dict) -> dict:
             cols=cols,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            cursor=params.get("cursor"),
         )
         payload["resumed"] = target
         # A lazy watch session never owns a run loop, so its payload's running
@@ -7676,6 +7884,7 @@ def _(rid, params: dict) -> dict:
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             profile_home=profile_home,
             lazy=True,
+            conversation_id=conversation_id,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
@@ -7696,21 +7905,28 @@ def _(rid, params: dict) -> dict:
             logger.debug("child-watch display projection read failed", exc_info=True)
             display_history = history
         messages = _history_to_messages(display_history)
+        payload = {
+            "session_id": sid,
+            "resumed": target,
+            "message_count": len(messages),
+            "messages": messages,
+            "info": _lazy_resume_info(cwd, profile=profile),
+            "inflight": None,
+            "running": child_running,
+            "session_key": target,
+            "started_at": record["created_at"],
+            "status": "streaming" if child_running else "idle",
+        }
         return _ok(
             rid,
-            {
-                "session_id": sid,
-                "resumed": target,
-                "message_count": len(messages),
-                "messages": messages,
-                "info": _lazy_resume_info(cwd, profile=profile),
-                "inflight": None,
-                "running": child_running,
-                "session_key": target,
-                "started_at": record["created_at"],
-                "status": "streaming" if child_running else "idle",
-            },
+            _attach_synchronization(
+                payload,
+                sid,
+                record,
+                params.get("cursor"),
+            ),
         )
+
 
     # Cold resume default: register the live session and read its stored
     # transcript, but build the agent OFF the response path. _make_agent can
@@ -7767,6 +7983,7 @@ def _(rid, params: dict) -> dict:
             profile_home=profile_home,
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
+            conversation_id=conversation_id,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
@@ -7795,7 +8012,15 @@ def _(rid, params: dict) -> dict:
         }
         if auto_continue is not None:
             payload["auto_continue"] = auto_continue
-        return _ok(rid, payload)
+        return _ok(
+            rid,
+            _attach_synchronization(
+                payload,
+                sid,
+                record,
+                params.get("cursor"),
+            ),
+        )
 
     # Build the agent OUTSIDE the lock — _make_agent can block for seconds
     # (MCP discovery, prompt/skill build, AIAgent construction). Holding
@@ -7877,6 +8102,7 @@ def _(rid, params: dict) -> dict:
                 cols=cols,
                 touch=True,
                 transport=current_transport() or _stdio_transport,
+                cursor=params.get("cursor"),
             )
             payload["resumed"] = target
             return _ok(rid, payload)
@@ -7923,10 +8149,31 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
-        session = _sessions.get(sid) or {}
-    auto_continue = (
-        _maybe_schedule_auto_continue(sid, session, target) if session else None
-    )
+        session = _sessions.get(sid)
+        if session is None:
+            # Keep the response contract robust for embedders/tests that
+            # replace _init_session with an external session owner.
+            session = {
+                "agent": agent,
+                "conversation_id": conversation_id,
+                "display_history_prefix": display_history_prefix,
+                "history": history,
+                "history_lock": threading.Lock(),
+                "inflight_turn": None,
+                "mobile_sync": _new_session_event_stream(),
+                "running": False,
+                "session_key": target,
+            }
+        else:
+            session.setdefault("display_history_prefix", display_history_prefix)
+            session.setdefault("history", history)
+            session.setdefault("history_lock", threading.Lock())
+            session.setdefault("inflight_turn", None)
+            session.setdefault("mobile_sync", _new_session_event_stream())
+            session.setdefault("running", False)
+        session["conversation_id"] = conversation_id
+    assert session is not None
+    auto_continue = _maybe_schedule_auto_continue(sid, session, target)
     payload = {
         "session_id": sid,
         "resumed": target,
@@ -7941,7 +8188,10 @@ def _(rid, params: dict) -> dict:
     }
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
-    return _ok(rid, payload)
+    return _ok(
+        rid,
+        _attach_synchronization(payload, sid, session, params.get("cursor")),
+    )
 
 
 @method("session.cwd.set")
@@ -8151,6 +8401,7 @@ def _live_session_payload(
     cols: int | None = None,
     touch: bool = False,
     transport: Transport | None = None,
+    cursor: object = None,
 ) -> dict:
     with session["history_lock"]:
         if cols is not None:
@@ -8183,7 +8434,7 @@ def _live_session_payload(
         payload["inflight"] = inflight
     if queued:
         payload["queued"] = queued
-    return payload
+    return _attach_synchronization(payload, sid, session, cursor)
 
 
 @method("session.active_list")
@@ -12032,14 +12283,14 @@ def _run_prompt_submit(
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
+        turn_id = str((session.get("inflight_turn") or {}).get("turn_id") or "")
+        _emit("message.start", sid, {"turn_id": turn_id})
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
         try:
             agent.clear_interrupt()
         except Exception:
             pass
-    _emit("message.start", sid)
-
     def run():
         approval_token = None
         session_tokens = []
@@ -12239,14 +12490,15 @@ def _run_prompt_submit(
                     run_message = [{"type": "text", "text": SPEECH_INTERRUPTED_NOTE}, *run_message]
 
             def _stream(delta):
-                with session["history_lock"]:
-                    _append_inflight_delta(session, delta)
-                payload = {"text": delta}
-                if streamer and (r := streamer.feed(delta)) is not None:
-                    payload["rendered"] = r
+                rendered_delta = streamer.feed(delta) if streamer else None
                 if tts_queue is not None and isinstance(delta, str):
                     tts_queue.put(delta)
-                _emit("message.delta", sid, payload)
+                _emit_inflight_delta(
+                    sid,
+                    session,
+                    delta,
+                    rendered=rendered_delta,
+                )
 
             # Surface interim assistant text (commentary emitted alongside
             # tool calls, or the attempted final answer before a verify-on-stop
@@ -12441,6 +12693,8 @@ def _run_prompt_submit(
             if rendered:
                 payload["rendered"] = rendered
             with session["history_lock"]:
+                turn_id = str((session.get("inflight_turn") or {}).get("turn_id") or "")
+                payload["turn_id"] = turn_id
                 if status == "error":
                     # Returned-error result (provider 4xx, budget, etc.): retain
                     # the failed turn for resume replay instead of clearing it.
