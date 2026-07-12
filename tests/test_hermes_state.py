@@ -179,6 +179,30 @@ class TestSessionLifecycle:
 
 
 
+    def test_list_open_cron_sessions_returns_only_open_cron(self, db):
+        """list_open_cron_sessions returns open (ended_at IS NULL) cron
+        sessions only, with id and started_at for reaper inspection."""
+        db.create_session("cron_open1", source="cron")
+        db.create_session("cron_open2", source="cron")
+        db.create_session("cron_done", source="cron")
+        db.end_session("cron_done", "cron_complete")
+        db.create_session("cli_open", source="cli")
+        db.create_session("cli_done", source="cli")
+        db.end_session("cli_done", "user_exit")
+
+        rows = db.list_open_cron_sessions()
+        ids = {r["id"] for r in rows}
+        assert ids == {"cron_open1", "cron_open2"}
+        for r in rows:
+            assert "started_at" in r
+
+    def test_list_open_cron_sessions_empty_when_none(self, db):
+        """Returns an empty list when no open cron sessions exist."""
+        db.create_session("cli1", source="cli")
+        db.create_session("cron1", source="cron")
+        db.end_session("cron1", "cron_complete")
+
+        assert db.list_open_cron_sessions() == []
 
 
 
