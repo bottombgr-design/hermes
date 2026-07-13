@@ -11837,6 +11837,7 @@ def _run_prompt_submit(
         if isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         claimed_notifications_consumed = False
+        history_adopted = False
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -12095,6 +12096,7 @@ def _run_prompt_submit(
                             _clean_returned_user_message(result["messages"], len(history), persist_user_message) if persist_user_message is not None else None
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            history_adopted = True
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
@@ -12195,7 +12197,7 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
-            claimed_notifications_consumed = status == "complete"
+            claimed_notifications_consumed = status == "complete" and history_adopted
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
