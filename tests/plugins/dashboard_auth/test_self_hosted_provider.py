@@ -973,6 +973,60 @@ class TestRefreshAndRevoke:
         assert kwargs["data"]["grant_type"] == "refresh_token"
         assert kwargs["data"]["refresh_token"] == "rt_old"
         assert kwargs["data"]["client_id"] == _CLIENT_ID
+        # A provider that accepts the scoped refresh must only be asked once,
+        # and must still be sent the scope (some IDPs narrow it otherwise).
+        assert kwargs["data"]["scope"] == provider._scopes
+        assert mock_post.call_count == 1
+
+    def test_refresh_retries_without_scope_when_idp_rejects_it(
+        self, provider, rsa_keypair
+    ):
+        # WSO2 IS (and others) issue a valid refresh token but reject a refresh
+        # grant that repeats the scope string. That 400 used to surface as an
+        # expired refresh token, forcing a full interactive re-login on every
+        # access-token expiry. Retry once without scope instead.
+        id_token = _mint_id_token(rsa_keypair)
+        rejected = _mock_post(400, {"error": "invalid_scope"})
+        accepted = _mock_post(
+            200,
+            {
+                "id_token": id_token,
+                "token_type": "Bearer",
+                "refresh_token": "rt_rotated",
+            },
+        )
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post",
+            side_effect=[rejected, accepted],
+        ) as mock_post:
+            session = provider.refresh_session(refresh_token="rt_old")
+
+        assert isinstance(session, Session)
+        assert session.access_token == id_token
+        assert session.refresh_token == "rt_rotated"
+        assert mock_post.call_count == 2
+
+        first_kwargs = mock_post.call_args_list[0].kwargs
+        second_kwargs = mock_post.call_args_list[1].kwargs
+        # First attempt keeps upstream behaviour; the retry drops only `scope`.
+        assert first_kwargs["data"]["scope"] == provider._scopes
+        assert "scope" not in second_kwargs["data"]
+        assert second_kwargs["data"]["grant_type"] == "refresh_token"
+        assert second_kwargs["data"]["refresh_token"] == "rt_old"
+        assert second_kwargs["data"]["client_id"] == _CLIENT_ID
+
+    def test_refresh_raises_when_both_attempts_rejected(self, provider):
+        # A genuinely expired refresh token fails with and without scope; the
+        # fallback must not mask that as anything other than expiry.
+        rejected = _mock_post(400, {"error": "invalid_grant"})
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post",
+            side_effect=[rejected, rejected],
+        ) as mock_post:
+            with pytest.raises(RefreshExpiredError):
+                provider.refresh_session(refresh_token="rt_old")
+
+        assert mock_post.call_count == 2
 
     def test_refresh_keeps_previous_rt_when_idp_omits(self, provider, rsa_keypair):
         # Some IDPs don't rotate; keep the caller's existing RT alive.
