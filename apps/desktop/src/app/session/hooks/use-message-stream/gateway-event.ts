@@ -133,7 +133,8 @@ interface GatewayEventDeps {
     sessionId: string,
     text: string,
     responsePreviewed?: boolean,
-    failure?: { error: string; partial: boolean }
+    failure?: { error: string; partial: boolean },
+    disposition?: { suppressFeedback?: boolean }
   ) => void
   failAssistantMessage: (sessionId: string, errorMessage: string) => void
   flushQueuedDeltas: (sessionId?: string) => void
@@ -470,6 +471,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             sawAssistantPayload: false,
             interrupted: false,
             interimBoundaryPending: false,
+            turnOrigin:
+              payload?.turn_origin === 'notification' ||
+              payload?.turn_origin === 'goal' ||
+              payload?.turn_origin === 'user'
+                ? payload.turn_origin
+                : 'user',
             turnStartedAt: Date.now()
           }
         })
@@ -614,8 +621,21 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         flushQueuedDeltas(sessionId)
 
+        const completedOrigin =
+          payload?.turn_origin === 'notification' || payload?.turn_origin === 'goal' || payload?.turn_origin === 'user'
+            ? payload.turn_origin
+            : null
+
+        if (completedOrigin) {
+          updateSessionState(sessionId, state => ({ ...state, turnOrigin: completedOrigin }))
+        }
+
+        const suppressFeedback = sessionInterrupted(sessionId) && completedOrigin === 'notification'
+
         // Keyed by session so only one window beeps when several are open.
-        playCompletionSound(sessionId)
+        if (!suppressFeedback) {
+          playCompletionSound(sessionId)
+        }
 
         const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
 
@@ -630,7 +650,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
               }
             : undefined
 
-        completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure)
+        completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure, { suppressFeedback })
 
         // Structured billing wall forwarded by the gateway (out of credits /
         // payment required) — cache it + raise a billing-specific toast.
@@ -646,12 +666,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           // toolRunning/reasoning AND sets celebrate together) so no stray "run"
           // frame leaks to the sprite — including the popped-out overlay, which
           // mirrors each activity change. The jump runs ~2 loops, then settles.
-          flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+          if (!suppressFeedback) {
+            flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+          }
 
           // Light up the pet's mail icon if the user wasn't looking when the turn
           // finished — a glanceable "new message" hint on the popped-out overlay.
           // Cleared when they open the app via the mail icon or refocus the window.
-          if (typeof document !== 'undefined' && !document.hasFocus()) {
+          if (!suppressFeedback && typeof document !== 'undefined' && !document.hasFocus()) {
             markPetUnread()
           }
         }
