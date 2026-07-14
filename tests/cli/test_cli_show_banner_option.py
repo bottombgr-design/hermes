@@ -14,6 +14,13 @@ from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 
+def test_shared_config_default_enables_show_banner():
+    """Setup and reset flows preserve the classic banner by default."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["display"]["show_banner"] is True
+
+
 def _make_real_cli(show_banner_value, **kwargs):
     """Build a HermesCLI instance and also return its bound cli module.
 
