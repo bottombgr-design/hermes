@@ -65,6 +65,10 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
 _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
 _VOICE_EXTS = {".ogg", ".opus"}
+<<<<<<< HEAD
+=======
+
+>>>>>>> ddabf23822 (refactor(qqbot): route media through live adapter / standalone sender)
 # Telegram's Bot API sendAudio only accepts MP3 / M4A. Other audio
 # formats either route through sendVoice (Opus/OGG) or fall back to
 # document delivery.
@@ -979,6 +983,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+<<<<<<< HEAD
     # --- Slack: native media via files_upload_v2 in the plugin's
     # standalone_sender_fn (plugins/platforms/slack/adapter.py::_standalone_send).
     # Gateway in-channel MEDIA: delivery already worked; send_message previously
@@ -1083,6 +1088,16 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = i == len(chunks) - 1
+=======
+    # --- QQBot: route through live adapter or standalone sender ---
+    # Both text and media are delivered via _send_via_adapter so that
+    # a single QQ outbound/upload implementation is used regardless of
+    # whether the gateway is in-process (live adapter) or standalone.
+    if platform == Platform.QQBOT:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+>>>>>>> ddabf23822 (refactor(qqbot): route media through live adapter / standalone sender)
             result = await _send_via_adapter(
                 platform,
                 pconfig,
@@ -1130,8 +1145,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _registry_standalone_send("wecom", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.BLUEBUBBLES:
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
-        elif platform == Platform.QQBOT:
-            result = await _send_qqbot(pconfig, chat_id, chunk)
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
         else:
@@ -1988,6 +2001,7 @@ def _check_send_message():
         return False
 
 
+<<<<<<< HEAD
 async def _send_qqbot(pconfig, chat_id, message):
     """Send via QQBot using the REST API directly (no WebSocket needed).
 
@@ -2060,6 +2074,8 @@ async def _send_qqbot(pconfig, chat_id, message):
         return _error(f"QQBot send failed: {e}")
 
 
+=======
+>>>>>>> ddabf23822 (refactor(qqbot): route media through live adapter / standalone sender)
 async def _send_yuanbao(chat_id, message, media_files=None):
     """Send via Yuanbao using the running gateway adapter's WebSocket connection.
 
