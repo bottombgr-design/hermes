@@ -2,10 +2,16 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
+import { reconcileClientTurnState } from '@/app/session/turn-state'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import {
+  type ChatMessage,
+  type GatewayEventPayload,
+  preserveLocalAssistantErrors,
+  toChatMessages
+} from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
@@ -962,26 +968,49 @@ export function useSessionActions({
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
-        updateSessionState(
+        const turnSnapshot: GatewayEventPayload = { ...(resumed.info ?? {}) }
+
+        if (Object.hasOwn(resumed, 'running')) {
+          turnSnapshot.running = resumed.running
+        }
+
+        if (Object.hasOwn(resumed, 'turn_generation')) {
+          turnSnapshot.turn_generation = resumed.turn_generation
+        }
+
+        if (Object.hasOwn(resumed, 'turn_origin')) {
+          turnSnapshot.turn_origin = resumed.turn_origin
+        }
+
+        if (Object.hasOwn(resumed, 'turn_state_revision')) {
+          turnSnapshot.turn_state_revision = resumed.turn_state_revision
+        }
+
+        const resumedState = updateSessionState(
           resumed.session_id,
-          state => ({
-            ...state,
-            ...(runtimeInfo ?? {}),
-            messages: messagesForView,
-            busy: resumedRunning,
-            awaitingResponse: resumedRunning && !recoveredInFlightTail,
-            ...(inFlightRecovery.applied
-              ? {
-                  sawAssistantPayload: true,
-                  // Point live deltas at the recovered row when the backend is
-                  // still mid-turn; a settled recovery keeps the stream idle.
-                  streamId: resumedRunning ? inFlightRecovery.streamId : null,
-                  turnStartedAt: resumedRunning
-                    ? (inFlightRecovery.turnStartedAt ?? state.turnStartedAt ?? Date.now())
-                    : state.turnStartedAt
-                }
-              : {})
-          }),
+          state => {
+            const reconciled = reconcileClientTurnState(state, turnSnapshot, 'snapshot')
+            const turnState = reconciled.accepted ? reconciled.state : state
+
+            return {
+              ...turnState,
+              ...(runtimeInfo ?? {}),
+              messages: messagesForView,
+              busy: resumedRunning,
+              awaitingResponse: resumedRunning && !recoveredInFlightTail,
+              ...(inFlightRecovery.applied
+                ? {
+                    sawAssistantPayload: true,
+                    // Point live deltas at the recovered row when the backend is
+                    // still mid-turn; a settled recovery keeps the stream idle.
+                    streamId: resumedRunning ? inFlightRecovery.streamId : null,
+                    turnStartedAt: resumedRunning
+                      ? (inFlightRecovery.turnStartedAt ?? state.turnStartedAt ?? Date.now())
+                      : state.turnStartedAt
+                  }
+                : {})
+            }
+          },
           storedSessionId
         )
 
@@ -992,6 +1021,7 @@ export function useSessionActions({
         if (!chatMessageArraysEquivalent($messages.get(), messagesForView)) {
           setMessages(messagesForView)
         }
+        resumedRunning = Boolean(resumedState.busy)
       } catch (err) {
         if (!isCurrentResume()) {
           return

@@ -542,6 +542,10 @@ export interface SessionResumeResponse {
   info?: SessionRuntimeInfo
   message_count: number
   messages: SessionMessage[]
+  running?: boolean
+  turn_generation?: number
+  turn_origin?: TurnOrigin | null
+  turn_state_revision?: number
   resumed: string
   session_id: string
   session_key?: string
@@ -571,6 +575,7 @@ export interface SessionRuntimeInfo {
   yolo?: boolean
   turn_origin?: TurnOrigin | null
   turn_generation?: number
+  turn_state_revision?: number
 }
 
 export interface UsageStats {

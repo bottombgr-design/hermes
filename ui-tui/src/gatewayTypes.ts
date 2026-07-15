@@ -175,6 +175,9 @@ export interface SessionResumeResponse {
   messages: GatewayTranscriptMessage[]
   resumed?: string
   running?: boolean
+  turn_generation?: number
+  turn_origin?: TurnOrigin | null
+  turn_state_revision?: number
   session_id: string
   started_at?: number
   status?: LiveSessionStatus
@@ -211,6 +214,9 @@ export interface SessionActivateResponse {
   message_count?: number
   messages: GatewayTranscriptMessage[]
   running?: boolean
+  turn_generation?: number
+  turn_origin?: TurnOrigin | null
+  turn_state_revision?: number
   session_id: string
   session_key?: string
   started_at?: number
@@ -568,7 +574,7 @@ export type GatewayEvent =
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }
   | {
-      payload?: { turn_generation?: number; turn_origin?: TurnOrigin }
+      payload?: { turn_generation?: number; turn_origin?: TurnOrigin; turn_state_revision?: number }
       session_id?: string
       type: 'message.start'
     }
@@ -691,6 +697,7 @@ export type GatewayEvent =
         text?: string
         turn_generation?: number
         turn_origin?: TurnOrigin
+        turn_state_revision?: number
         usage?: Usage
       }
       session_id?: string

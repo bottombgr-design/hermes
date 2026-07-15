@@ -4489,6 +4489,7 @@ def _session_info(
     }
     info["turn_origin"] = turn_state["turn_origin"]
     info["turn_generation"] = int(turn_state["turn_generation"])
+    info["turn_state_revision"] = int(turn_state["turn_state_revision"])
     try:
         from hermes_cli import __version__, __release_date__
 
@@ -5873,7 +5874,7 @@ def _init_session(
     cwd: str | None = None,
     session_db=None,
     source: str | None = None,
-    profile_home: str | None = None,
+    profile_home: Path | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -5887,9 +5888,14 @@ def _init_session(
             "created_at": now,
             "last_active": now,
             "running": False,
+            "turn_generation": 0,
+            "turn_origin": None,
+            "turn_state_revision": 0,
+            "turn_state_running": False,
             "attached_images": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
+            "profile_home": str(profile_home) if profile_home is not None else None,
             "cols": cols,
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
@@ -5909,6 +5915,7 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+    _hydrate_deferred_notification_state(_sessions[sid])
     _init_owns_db = False
     if session_db is not None:
         db = session_db
@@ -6431,31 +6438,45 @@ def _record_inflight_correction(session: dict, text: Any) -> None:
 
 
 def _set_turn_origin_locked(session: dict, origin: TurnOrigin) -> int:
-    """Set the active turn origin while ``history_lock`` is held."""
+    """Start a public turn-state revision while ``history_lock`` is held."""
     if origin not in _TURN_ORIGINS:
         raise ValueError(f"invalid turn origin: {origin!r}")
     token = int(session.get("turn_generation", 0)) + 1
     session["turn_generation"] = token
+    session["turn_state_revision"] = int(session.get("turn_state_revision", 0)) + 1
+    session["turn_state_running"] = True
     session["turn_origin"] = origin
     session["turn_token"] = token
+    # Public state settles before post-turn cleanup releases the concurrency
+    # reservation. Keep a separate token so a stale turn cannot release a newer
+    # one after message.complete has already advanced the public revision.
+    session["turn_reservation_token"] = token
     return token
 
 
 def _clear_turn_origin_locked(session: dict, token: int) -> bool:
-    """Clear only the turn that still owns ``token``."""
+    """Settle only the public turn that still owns ``token``."""
     if session.get("turn_token") != token:
         return False
+    session["turn_state_revision"] = int(session.get("turn_state_revision", 0)) + 1
+    session["turn_state_running"] = False
     session["turn_origin"] = None
     session["turn_token"] = None
     return True
 
 
 def _turn_state_snapshot_locked(session: dict) -> dict:
-    """Capture generation, origin, and running while ``history_lock`` is held."""
+    """Capture monotonic public turn state while ``history_lock`` is held."""
+    public_running = session.get("turn_state_running")
     return {
-        "running": bool(session.get("running")),
+        "running": (
+            bool(session.get("running"))
+            if public_running is None
+            else bool(public_running)
+        ),
         "turn_generation": int(session.get("turn_generation", 0)),
         "turn_origin": session.get("turn_origin"),
+        "turn_state_revision": int(session.get("turn_state_revision", 0)),
     }
 
 
@@ -7020,6 +7041,10 @@ def _(rid, params: dict) -> dict:
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
+            "turn_generation": 0,
+            "turn_origin": None,
+            "turn_state_revision": 0,
+            "turn_state_running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
             "source": source,
@@ -7074,6 +7099,10 @@ def _(rid, params: dict) -> dict:
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _response_profile_name(profile),
+                "running": False,
+                "turn_generation": 0,
+                "turn_origin": None,
+                "turn_state_revision": 0,
             },
         },
     )
@@ -7241,6 +7270,10 @@ def _lazy_resume_info(
         "lazy": True,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
         "profile_name": _response_profile_name(profile),
+        "running": False,
+        "turn_generation": 0,
+        "turn_origin": None,
+        "turn_state_revision": 0,
     }
     if provider:
         info["provider"] = provider
@@ -7265,7 +7298,7 @@ def _deferred_session_record(
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
     now = time.time()
-    return {
+    record = {
         "agent": None,
         "agent_error": None,
         "agent_ready": threading.Event(),
@@ -7291,6 +7324,10 @@ def _deferred_session_record(
         "resume_runtime_overrides": resume_runtime_overrides,
         "resume_session_id": session_key,
         "running": False,
+        "turn_generation": 0,
+        "turn_origin": None,
+        "turn_state_revision": 0,
+        "turn_state_running": False,
         "session_key": session_key,
         "show_reasoning": _load_show_reasoning(),
         "slash_worker": None,
@@ -7299,6 +7336,8 @@ def _deferred_session_record(
         "tool_started_at": {},
         "transport": current_transport() or _stdio_transport,
     }
+    _hydrate_deferred_notification_state(record)
+    return record
 
 
 def _claim_or_reuse_live(
@@ -7698,6 +7737,7 @@ def _(rid, params: dict) -> dict:
                     cwd=profile_resume_cwd,
                     session_db=db,
                     source=source,
+                    profile_home=profile_home,
                 )
             finally:
                 if init_home_token is not None:
@@ -7783,7 +7823,7 @@ def _session_live_status(sid: str, session: dict) -> str:
     # session stuck mid-construction.
     if ready is not None and not ready.is_set() and session.get("agent_build_started"):
         return "starting"
-    if session.get("running"):
+    if session.get("turn_state_running", session.get("running")):
         return "working"
     return "idle"
 
@@ -7856,11 +7896,11 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
 
 
 def _fallback_session_info(session: dict, *, turn_snapshot: Optional[dict] = None) -> dict:
+    turn_state = turn_snapshot or _turn_state_snapshot_locked(session)
     agent = session.get("agent")
     if agent is not None:
         return _session_info(agent, session, turn_snapshot=turn_snapshot)
     cwd = _default_session_cwd()
-    turn_state = turn_snapshot or _turn_state_snapshot_locked(session)
     return {
         "cwd": cwd,
         "project": _project_info_for_cwd(cwd),
@@ -7871,6 +7911,7 @@ def _fallback_session_info(session: dict, *, turn_snapshot: Optional[dict] = Non
         "tools": {},
         "turn_generation": int(turn_state["turn_generation"]),
         "turn_origin": turn_state["turn_origin"],
+        "turn_state_revision": int(turn_state["turn_state_revision"]),
     }
 
 
@@ -7965,8 +8006,8 @@ def _live_session_payload(
         )
         inflight = _inflight_snapshot(session)
         queued = _queued_prompt_snapshot(session)
-        running = bool(session.get("running"))
         turn_snapshot = _turn_state_snapshot_locked(session)
+        running = bool(turn_snapshot["running"])
     # Prefer the persisted display lineage (candidate-inclusive) so this payload
     # matches the eager session.resume + REST transcript; the DB has its own
     # lock, so read it outside the session history lock.
@@ -7980,6 +8021,9 @@ def _live_session_payload(
         "session_key": _session_lookup_key(session, fallback=sid),
         "started_at": float(session.get("created_at") or time.time()),
         "status": _session_live_status(sid, session),
+        "turn_generation": int(turn_snapshot["turn_generation"]),
+        "turn_origin": turn_snapshot["turn_origin"],
+        "turn_state_revision": int(turn_snapshot["turn_state_revision"]),
     }
     if inflight:
         payload["inflight"] = inflight
@@ -11390,6 +11434,119 @@ def _durable_notification_event_id(event: Optional[dict]) -> Optional[str]:
     return f"async_delegation:{delegation_id}" if delegation_id else None
 
 
+def _deferred_notification_db_path(session: dict) -> Path:
+    profile_home = str(session.get("profile_home") or "").strip()
+    return (Path(profile_home) if profile_home else Path(get_hermes_home())) / "state.db"
+
+
+def _hydrate_deferred_notification_state(session: dict) -> None:
+    """Rebuild the deferred batch for a durable session after recreation."""
+    from tools.async_delegation import load_deferred_notifications
+
+    rows = load_deferred_notifications(
+        str(session.get("session_key") or ""),
+        db_path=_deferred_notification_db_path(session),
+    )
+    texts = list(session.get("deferred_notification_texts") or [])
+    ids = set(session.get("deferred_notification_event_ids") or ())
+    for row in rows:
+        event_id = str(row.get("event_id") or "")
+        if event_id and event_id not in ids:
+            texts.append(str(row.get("payload") or ""))
+            ids.add(event_id)
+    session["deferred_notification_texts"] = texts
+    session["deferred_notification_event_ids"] = ids
+    session["defer_notifications_until_user"] = bool(texts)
+
+
+def _persist_deferred_notification(
+    session: dict,
+    event_id: str,
+    text: str,
+    event: dict,
+) -> bool:
+    from tools.async_delegation import persist_deferred_notification
+
+    return persist_deferred_notification(
+        str(session.get("session_key") or event.get("session_key") or ""),
+        event_id,
+        text,
+        event,
+        db_path=_deferred_notification_db_path(session),
+    )
+
+
+def _retry_consumed_deferred_ack(
+    session_key: str,
+    event_ids: set[str],
+    db_path: Path,
+) -> None:
+    from tools.async_delegation import complete_deferred_notifications
+
+    attempt = 0
+    while True:
+        delay = _NOTIFICATION_ACK_RETRY_DELAYS[
+            min(attempt, len(_NOTIFICATION_ACK_RETRY_DELAYS) - 1)
+        ]
+        if delay:
+            time.sleep(delay)
+        try:
+            if complete_deferred_notifications(
+                session_key, event_ids, db_path=db_path
+            ):
+                logger.info(
+                    "deferred notification consumption ack retry succeeded: "
+                    "session=%s events=%s",
+                    session_key,
+                    sorted(event_ids),
+                )
+                return
+        except Exception:
+            pass
+        attempt += 1
+
+
+def _ack_consumed_deferred_notifications(session: dict, event_ids: set[str]) -> None:
+    if not event_ids:
+        return
+    from tools.async_delegation import complete_deferred_notifications
+
+    session_key = str(session.get("session_key") or "")
+    db_path = _deferred_notification_db_path(session)
+    try:
+        if complete_deferred_notifications(
+            session_key, event_ids, db_path=db_path
+        ):
+            return
+        error: BaseException = RuntimeError("deferred delivery rows remain pending")
+    except Exception as exc:
+        error = exc
+    logger.warning(
+        "deferred notification reached history; retrying ack without reinjection: "
+        "session=%s events=%s error=%s",
+        session_key,
+        sorted(event_ids),
+        error,
+    )
+    try:
+        threading.Thread(
+            target=_retry_consumed_deferred_ack,
+            args=(session_key, set(event_ids), db_path),
+            daemon=True,
+            name=f"tui-deferred-ack-{session_key[:24]}",
+        ).start()
+    except Exception:
+        # The payload is already in conversation history. Never restore it to
+        # the in-memory batch solely because the durable delivered-bit write
+        # failed; that would duplicate the context on the next explicit turn.
+        logger.exception(
+            "deferred notification consumption ack thread failed to start: "
+            "session=%s events=%s",
+            session_key,
+            sorted(event_ids),
+        )
+
+
 def _retry_accepted_notification_ack(
     event: dict,
     claim_id: str,
@@ -11484,11 +11641,19 @@ def _dispatch_notification_turn(
                     if not isinstance(deferred_ids, set):
                         deferred_ids = set(deferred_ids or ())
                         session["deferred_notification_event_ids"] = deferred_ids
-                    if event_id is None or event_id not in deferred_ids:
+                    pending = True
+                    if event_id is not None and event is not None:
+                        # Acceptance is durable before the terminal event is
+                        # acknowledged. A persistence failure falls through the
+                        # outer exception path and releases the pre-accept claim.
+                        pending = _persist_deferred_notification(
+                            session, event_id, text, event
+                        )
+                    if pending and (event_id is None or event_id not in deferred_ids):
                         session.setdefault("deferred_notification_texts", []).append(text)
                         if event_id is not None:
                             deferred_ids.add(event_id)
-                    outcome = "deferred"
+                    outcome = "deferred" if pending else "accepted"
                 else:
                     session["running"] = True
                     outcome = "dispatched"
@@ -11496,6 +11661,10 @@ def _dispatch_notification_turn(
         if event is not None and claim_id:
             release_event_delivery(event, claim_id)
         raise
+
+    if outcome == "accepted":
+        _ack_accepted_notification(event, claim_id or "", consumer)
+        return "claimed"
 
     if outcome == "claimed":
         return outcome
@@ -11923,6 +12092,7 @@ def _run_prompt_submit(
                 persist_user_message = text if isinstance(text, str) else str(text)
                 text = _compose_deferred_notification_prompt(text, claimed_notifications)
         turn_token = _set_turn_origin_locked(session, origin)
+        turn_start_revision = int(session["turn_state_revision"])
         inflight = session.get("inflight_turn")
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
@@ -11932,7 +12102,11 @@ def _run_prompt_submit(
     _emit(
         "message.start",
         sid,
-        {"turn_generation": turn_token, "turn_origin": origin},
+        {
+            "turn_generation": turn_token,
+            "turn_origin": origin,
+            "turn_state_revision": turn_start_revision,
+        },
     )
     if hasattr(agent, "clear_interrupt"):
         try:
@@ -12283,12 +12457,22 @@ def _run_prompt_submit(
                 raw = str(result)
                 status = "complete"
 
+            claimed_notifications_consumed = status == "complete" and history_adopted
+            if claimed_notifications_consumed:
+                _ack_consumed_deferred_notifications(
+                    session, claimed_notification_ids
+                )
+            with session["history_lock"]:
+                _clear_inflight_turn(session)
+                _clear_turn_origin_locked(session, turn_token)
+                turn_settle_revision = int(session.get("turn_state_revision", 0))
             payload = {
                 "text": raw,
                 "usage": _get_usage(agent),
                 "status": status,
                 "turn_origin": origin,
                 "turn_generation": turn_token,
+                "turn_state_revision": turn_settle_revision,
             }
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
@@ -12326,7 +12510,6 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
-            claimed_notifications_consumed = status == "complete" and history_adopted
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -12540,12 +12723,13 @@ def _run_prompt_submit(
                         *concurrent_notification_ids,
                     }
                     session["defer_notifications_until_user"] = True
-                if session.get("turn_token") == turn_token:
+                if session.get("turn_reservation_token") == turn_token:
                     session["running"] = False
                     session["last_active"] = time.time()
                     if not turn_error_retained:
                         _clear_inflight_turn(session)
                     _clear_turn_origin_locked(session, turn_token)
+                    session["turn_reservation_token"] = None
                 turn_snapshot = _turn_state_snapshot_locked(session)
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).

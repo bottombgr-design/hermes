@@ -654,17 +654,7 @@ export async function resolveSessionProfile(storedSessionId: null | string): Pro
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    | 'branch'
-    | 'cwd'
-    | 'fast'
-    | 'model'
-    | 'personality'
-    | 'provider'
-    | 'reasoningEffort'
-    | 'serviceTier'
-    | 'yolo'
-    | 'turnOrigin'
-    | 'turnGeneration'
+    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
   >
 >
 
@@ -733,17 +723,6 @@ export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionR
 
   if (info.usage) {
     setCurrentUsage(current => ({ ...current, ...info.usage }))
-  }
-
-  if (Object.hasOwn(info, 'turn_origin')) {
-    sessionState.turnOrigin =
-      info.turn_origin === 'user' || info.turn_origin === 'notification' || info.turn_origin === 'goal'
-        ? info.turn_origin
-        : null
-  }
-
-  if (typeof info.turn_generation === 'number' && Number.isSafeInteger(info.turn_generation) && info.turn_generation >= 0) {
-    sessionState.turnGeneration = info.turn_generation
   }
 
   return sessionState
