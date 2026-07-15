@@ -83,22 +83,31 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
     switch (event.key) {
       case 'ArrowLeft':
         nextIndex = index === 0 ? tabs.length - 1 : index - 1
+
         break
+
       case 'ArrowRight':
         nextIndex = index === tabs.length - 1 ? 0 : index + 1
+
         break
+
       case 'Home':
         nextIndex = 0
+
         break
+
       case 'End':
         nextIndex = tabs.length - 1
+
         break
+
       default:
         return
     }
 
     event.preventDefault()
     const nextTab = tabs[nextIndex]
+
     if (nextTab) {
       selectAndFocusTab(nextTab.id)
     }
