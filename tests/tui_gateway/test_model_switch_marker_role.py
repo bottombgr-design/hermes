@@ -1,10 +1,9 @@
 """Tests for _append_model_switch_marker role semantics (issue #48338).
 
-The model switch marker uses role="system" for correct transcript semantics.
-The pre-call sanitizer (sanitize_api_messages) demotes mid-conversation system
-messages to role="user" for provider compatibility, so strict providers
-(vLLM, Qwen) never see a mid-conversation system message on the wire — but
-the stored transcript and Desktop rendering show the correct role.
+The model switch marker is tagged and uses role="system" for correct transcript
+semantics. The pre-call sanitizer demotes only tagged Hermes system markers to
+role="user" for strict-provider compatibility; persisted transcript and Desktop
+rendering keep the system role.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ class TestAppendModelSwitchMarkerRole:
             f"Expected role='system' but got role='{entry['role']}'. "
             "The sanitizer demotes to 'user' at API call time (#48338)."
         )
+        assert entry["_hermes_internal_system_marker"] is True
 
 
 
@@ -38,3 +38,28 @@ class TestAppendModelSwitchMarkerRole:
 
 
 
+    def test_marker_role_after_turns(self) -> None:
+        """Persist tagged model-switch markers with the system role."""
+        db = MagicMock()
+        session: dict = {
+            "session_key": "sess-1",
+            "history": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+            "history_version": 7,
+            "agent": SimpleNamespace(_session_db=db),
+        }
+        _append_model_switch_marker(
+            session, model="qwen3.6-35b", provider="vllm"
+        )
+        marker = session["history"][-1]
+        assert marker["role"] == "system"
+        assert marker["_hermes_internal_system_marker"] is True
+        assert session["history_version"] == 8
+        db.append_message.assert_called_once_with(
+            session_id="sess-1",
+            role="system",
+            content=marker["content"],
+            internal_system_marker=True,
+        )
