@@ -5927,9 +5927,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         if isinstance(result, dict):
                             result["runtime"] = runtime
                         usage["runtime"] = runtime
-                    # Auto-generate session title after first successful exchange
+                    # Auto-generate session title after first successful exchange.
+                    # Soft-partial / interrupted runs can still return text
+                    # (see soft-partial path above) — do not permanently title those.
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    if final_response and isinstance(result, dict) and not result.get("failed"):
+                    if (
+                        final_response
+                        and isinstance(result, dict)
+                        and not result.get("failed")
+                        and not result.get("partial")
+                        and not result.get("interrupted")
+                    ):
                         try:
                             from agent.title_generator import maybe_auto_title
                             maybe_auto_title(
@@ -5937,7 +5945,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _eff_sid or session_id,
                                 user_message,
                                 final_response,
-                                result.get("messages", conversation_history) if isinstance(result, dict) else conversation_history,
+                                result.get("messages", conversation_history),
                             )
                         except Exception:
                             logger.debug("API _run_agent auto-title failed", exc_info=True)
@@ -6393,8 +6401,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         usage=usage,
                         last_event="run.completed",
                     )
-                    # Auto-generate session title after first successful exchange
-                    if final_response and isinstance(result, dict) and not result.get("failed"):
+                    # Auto-generate session title after first successful exchange.
+                    # Mirror _run_agent: skip text-bearing partial/interrupted results.
+                    if (
+                        final_response
+                        and isinstance(result, dict)
+                        and not result.get("failed")
+                        and not result.get("partial")
+                        and not result.get("interrupted")
+                    ):
                         try:
                             from agent.title_generator import maybe_auto_title
                             # Prefer agent.session_id in case compression rotated
