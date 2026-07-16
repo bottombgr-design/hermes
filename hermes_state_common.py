@@ -116,6 +116,13 @@ SCHEMA_VERSION = 23
 FTS_STORAGE_VERSION = 1
 
 
+def _fts_object_missing(exc: BaseException) -> bool:
+    """True when an FTS probe failure means the table/module is ABSENT
+    (disable search) rather than transiently unavailable (keep it on)."""
+    msg = str(exc).lower()
+    return "no such table" in msg or "no such module" in msg
+
+
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
 # sanitizer/runtime behavior predictable under adversarial input.
@@ -151,6 +158,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
+    claude_sdk_session_id TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,

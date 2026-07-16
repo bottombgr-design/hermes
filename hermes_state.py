@@ -47,6 +47,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _COMPRESSION_CHILD_SQL,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
+    _fts_object_missing,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
     _ephemeral_child_sql,
@@ -1855,6 +1856,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                # Probe FTS availability with SELECTs (read-only-safe).
+                # Without this, search_messages() sees _fts_enabled=False and
+                # silently returns [] on every read-only handle — a false
+                # empty, not a degrade. Only a MISSING fts object disables
+                # search: a transient error (e.g. "database is locked"
+                # during a checkpoint) must not latch a silent false-empty
+                # for the handle's lifetime — leave enabled and let the
+                # query surface the error visibly.
+                try:
+                    self._conn.execute("SELECT 1 FROM messages_fts LIMIT 1")
+                    self._fts_enabled = True
+                except sqlite3.Error as exc:
+                    self._fts_enabled = not _fts_object_missing(exc)
+                try:
+                    self._conn.execute(
+                        "SELECT 1 FROM messages_fts_trigram LIMIT 1"
+                    )
+                    self._trigram_available = True
+                except sqlite3.Error:
+                    self._trigram_available = False
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3730,6 +3751,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
                 (model_config_json, model, session_id),
+            )
+        self._execute_write(_do)
+
+    def update_claude_sdk_session_id(
+        self, session_id: str, sdk_session_id: Optional[str]
+    ) -> None:
+        """Persist (or clear, with None) the claude-agent-sdk session id used
+        to resume the SDK conversation across gateway restarts and
+        agent-cache eviction (#25267 continuity)."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET claude_sdk_session_id = ? WHERE id = ?",
+                (sdk_session_id, session_id),
             )
         self._execute_write(_do)
 
