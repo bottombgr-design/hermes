@@ -136,10 +136,12 @@ def test_current_user_turn_is_persisted_before_provider_call(agent):
     assert observed[0][0] == "persist"
     assert observed[1][0] == "provider"
     persisted_messages = observed[0][1]
-    assert persisted_messages[-1] == {
-        "role": "user",
-        "content": "new message that must survive a crash",
-    }
+    # Compared field-wise: the live message also carries the per-turn glue
+    # marker, which is internal bookkeeping stripped from the outgoing API copy
+    # and never written to the transcript row (the flush persists named columns).
+    _last = persisted_messages[-1]
+    assert _last["role"] == "user"
+    assert _last["content"] == "new message that must survive a crash"
 
 
 class TestHTTP413Compression:
@@ -500,11 +502,17 @@ class TestHTTP413Compression:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            # Compression returns same number of messages → can't compress further
-            mock_compress.return_value = (
-                [{"role": "user", "content": "hello"}],
-                "same prompt",
-            )
+            # Compression returns same number of messages → can't compress
+            # further. The surviving message is carried over from the input
+            # rather than hand-built: real compaction ``.copy()``s the
+            # protected tail, so per-turn bookkeeping keys on the current user
+            # message survive. A hand-built dict would silently DROP them,
+            # shrinking the rough token estimate and reading as compression
+            # progress — which would retry instead of returning partial.
+            def _no_reduction(messages, *_args, **_kwargs):
+                return ([dict(messages[-1])], "same prompt")
+
+            mock_compress.side_effect = _no_reduction
             result = agent.run_conversation("hello")
 
         assert result["completed"] is False
