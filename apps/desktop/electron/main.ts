@@ -9501,7 +9501,12 @@ function registerDeepLinkProtocol() {
 // Single-instance lock: deep links on a running app (Win/Linux) arrive as a
 // second-instance argv. Without the lock a second `hermes://` launch spawns a
 // whole new app instead of routing into the running one.
-const _gotSingleInstanceLock = app.requestSingleInstanceLock()
+//
+// Dev/testing escape hatch: HERMES_DESKTOP_ALLOW_MULTI_INSTANCE=1 lets a
+// second dev instance run alongside a production install (e.g. when
+// dogfooding a feature branch without quitting the daily driver).
+const _allowMultiInstance = process.env.HERMES_DESKTOP_ALLOW_MULTI_INSTANCE === '1'
+const _gotSingleInstanceLock = _allowMultiInstance || app.requestSingleInstanceLock()
 
 if (!_gotSingleInstanceLock) {
   app.quit()
