@@ -19852,6 +19852,10 @@ async def post_agent_plugin_enable(request: Request, name: str):
     result = dashboard_set_agent_plugin_enabled(name, enabled=True)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Enable failed.")
+    # Config-only change: running gateway/TUI processes scan plugins once at
+    # start and won't pick this up, so tell the UI a restart is needed —
+    # mirrors the CLI's "Takes effect on next session." (#54941).
+    result["restart_required"] = not result.get("unchanged", False)
     return result
 
 
@@ -19864,6 +19868,7 @@ async def post_agent_plugin_disable(request: Request, name: str):
     result = dashboard_set_agent_plugin_enabled(name, enabled=False)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Disable failed.")
+    result["restart_required"] = not result.get("unchanged", False)
     return result
 
 
