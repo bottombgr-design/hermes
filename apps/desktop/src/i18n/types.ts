@@ -1956,6 +1956,21 @@ export interface Translations {
       unreachableDescription: string
       openTarget: (url: string) => string
       fallbackTitle: string
+      annotation: {
+        start: string
+        stop: string
+        banner: string
+        elementTitle: string
+        regionTitle: string
+        placeholder: string
+        hint: string
+        cancel: string
+        submit: string
+        screenshotAlt: string
+        iframeBlocked: string
+        pickerFailed: string
+        sentToComposer: string
+      }
     }
   }
 

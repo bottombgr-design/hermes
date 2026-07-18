@@ -2186,7 +2186,22 @@ export const zhHant = defineLocale({
       loadFailedConsole: (code, message) => `載入失敗${code ? ` (${code})` : ''}：${message}`,
       unreachableDescription: '無法連線至預覽頁面。',
       openTarget: url => `開啟 ${url}`,
-      fallbackTitle: '預覽'
+      fallbackTitle: '預覽',
+      annotation: {
+        start: '標註',
+        stop: '結束標註',
+        banner: '標註模式：點擊元素或拖曳框選，Esc 結束',
+        elementTitle: '元素標註',
+        regionTitle: '區域標註',
+        placeholder: '寫下這裡的問題或建議…',
+        hint: 'Ctrl+Enter 傳送 · Esc 取消',
+        cancel: '取消',
+        submit: '傳送標註',
+        screenshotAlt: '標註區域截圖',
+        iframeBlocked: '無法標註嵌入的跨來源內容',
+        pickerFailed: '無法在此頁面啟動標註',
+        sentToComposer: '標註已填入輸入框'
+      }
     }
   },
 

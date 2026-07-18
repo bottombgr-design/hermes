@@ -2254,7 +2254,22 @@ export const ja = defineLocale({
       loadFailedConsole: (code, message) => `読み込みに失敗しました${code ? ` (${code})` : ''}: ${message}`,
       unreachableDescription: 'プレビューページに到達できませんでした。',
       openTarget: url => `${url} を開く`,
-      fallbackTitle: 'プレビュー'
+      fallbackTitle: 'プレビュー',
+      annotation: {
+        start: '注釈',
+        stop: '注釈を終了',
+        banner: '注釈モード：要素をクリックまたは範囲をドラッグ、Esc で終了',
+        elementTitle: '要素の注釈',
+        regionTitle: '範囲の注釈',
+        placeholder: '問題点や提案を書いてください…',
+        hint: 'Ctrl+Enter で送信 · Esc でキャンセル',
+        cancel: 'キャンセル',
+        submit: '注釈を送信',
+        screenshotAlt: '注釈範囲のスクリーンショット',
+        iframeBlocked: 'クロスオリジンの埋め込みコンテンツは注釈できません',
+        pickerFailed: 'このページで注釈を開始できませんでした',
+        sentToComposer: '注釈を入力欄に追加しました'
+      }
     }
   },
 

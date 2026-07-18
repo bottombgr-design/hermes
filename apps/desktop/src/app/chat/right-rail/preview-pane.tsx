@@ -6,10 +6,12 @@ import type { SetTitlebarToolGroup, TitlebarTool } from '@/app/shell/titlebar-co
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
-import { Bug } from '@/lib/icons'
+import { Bug, Pin } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import { $previewServerRestart, failPreviewServerRestart, type PreviewTarget } from '@/store/preview'
+
+import { AnnotationLayer } from './annotation/annotation-layer'
 
 import {
   clampConsoleHeight,
@@ -23,7 +25,9 @@ import { type ConsoleEntry, createPreviewConsoleState } from './preview-console-
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 
 type PreviewWebview = HTMLElement & {
+  capturePage?: (rect?: { height: number; width: number; x: number; y: number }) => Promise<{ toDataURL: () => string }>
   closeDevTools?: () => void
+  executeJavaScript?: (code: string) => Promise<unknown>
   getURL?: () => string
   isDevToolsOpened?: () => boolean
   openDevTools?: () => void
@@ -142,6 +146,7 @@ export function PreviewPane({
   const consoleOpen = useStore(consoleState.$open)
   const [currentUrl, setCurrentUrl] = useState(target.url)
   const [devtoolsOpen, setDevtoolsOpen] = useState(false)
+  const [annotating, setAnnotating] = useState(false)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<PreviewLoadErrorState | null>(null)
   const [localReloadKey, setLocalReloadKey] = useState(0)
@@ -291,6 +296,13 @@ export function PreviewPane({
       ...(isWebPreview
         ? [
             {
+              active: annotating,
+              icon: <Pin />,
+              id: `${TITLEBAR_GROUP_ID}-annotate`,
+              label: annotating ? copy.annotation.stop : copy.annotation.start,
+              onSelect: () => setAnnotating(open => !open)
+            },
+            {
               active: consoleOpen,
               icon: <PreviewConsoleTitlebarIcon consoleState={consoleState} />,
               id: `${TITLEBAR_GROUP_ID}-console`,
@@ -311,7 +323,7 @@ export function PreviewPane({
     setTitlebarToolGroup(TITLEBAR_GROUP_ID, tools)
 
     return () => setTitlebarToolGroup(TITLEBAR_GROUP_ID, [])
-  }, [consoleOpen, consoleState, copy, devtoolsOpen, isWebPreview, setTitlebarToolGroup, toggleDevTools])
+  }, [annotating, consoleOpen, consoleState, copy, devtoolsOpen, isWebPreview, setTitlebarToolGroup, toggleDevTools])
 
   useEffect(() => {
     if (!consoleOpen) {
@@ -651,6 +663,10 @@ export function PreviewPane({
               consoleState={consoleState}
               startConsoleResize={startConsoleResize}
             />
+          )}
+
+          {isWebPreview && annotating && (
+            <AnnotationLayer onExit={() => setAnnotating(false)} webview={webviewRef.current} />
           )}
         </div>
       </div>

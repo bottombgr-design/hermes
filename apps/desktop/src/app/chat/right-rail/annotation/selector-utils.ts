@@ -133,9 +133,10 @@ function fullyQualifiedPath(el: Element): string {
       break
     }
 
-    const parent = current.parentElement
+    const parent: Element | null = current.parentElement
     if (parent) {
-      const sameTagSiblings = Array.from(parent.children).filter(sib => sib.tagName === current!.tagName)
+      const tagName = current.tagName
+      const sameTagSiblings = Array.from(parent.children).filter((sib: Element) => sib.tagName === tagName)
       if (sameTagSiblings.length > 1) {
         steps.unshift(`${tag}:nth-of-type(${sameTagSiblings.indexOf(current) + 1})`)
       } else {
