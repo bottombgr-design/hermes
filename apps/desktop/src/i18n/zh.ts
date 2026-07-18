@@ -2497,7 +2497,22 @@ export const zh: Translations = {
       loadFailedConsole: (code, message) => `加载失败${code ? ` (${code})` : ''}: ${message}`,
       unreachableDescription: '无法访问预览页面。',
       openTarget: url => `打开 ${url}`,
-      fallbackTitle: '预览'
+      fallbackTitle: '预览',
+      annotation: {
+        start: '标注',
+        stop: '退出标注',
+        banner: '标注模式：点击元素或拖拽框选，Esc 退出',
+        elementTitle: '元素标注',
+        regionTitle: '区域标注',
+        placeholder: '写下这里的问题或建议…',
+        hint: 'Ctrl+Enter 发送 · Esc 取消',
+        cancel: '取消',
+        submit: '发送标注',
+        screenshotAlt: '标注区域截图',
+        iframeBlocked: '无法标注嵌入的跨域内容',
+        pickerFailed: '无法在此页面上启动标注',
+        sentToComposer: '标注已填入输入框'
+      }
     }
   },
 

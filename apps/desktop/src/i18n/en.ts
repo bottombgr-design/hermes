@@ -2329,7 +2329,22 @@ export const en: Translations = {
       loadFailedConsole: (code, message) => `Load failed${code ? ` (${code})` : ''}: ${message}`,
       unreachableDescription: 'The preview page could not be reached.',
       openTarget: url => `Open ${url}`,
-      fallbackTitle: 'Preview'
+      fallbackTitle: 'Preview',
+      annotation: {
+        start: 'Annotate',
+        stop: 'Exit annotation',
+        banner: 'Annotation mode: click an element or drag a region, Esc to exit',
+        elementTitle: 'Element annotation',
+        regionTitle: 'Region annotation',
+        placeholder: 'Describe the issue or suggestion…',
+        hint: 'Ctrl+Enter to send · Esc to cancel',
+        cancel: 'Cancel',
+        submit: 'Send annotation',
+        screenshotAlt: 'Annotated region screenshot',
+        iframeBlocked: 'Cannot annotate embedded cross-origin content',
+        pickerFailed: 'Could not start annotation on this page',
+        sentToComposer: 'Annotation added to the composer'
+      }
     }
   },
 
