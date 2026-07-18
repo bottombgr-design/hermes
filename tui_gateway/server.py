@@ -16085,7 +16085,7 @@ def _model_picker_context(agent, *, runtime_snapshot: dict | None = None):
 @method("model.options")
 def _(rid, params: dict) -> dict:
     try:
-        from hermes_cli.inventory import build_models_payload
+        from hermes_cli.inventory import build_model_options_payload
 
         if _MODEL_OPTIONS_RUNTIME_SNAPSHOT in params:
             runtime_snapshot = params.get(_MODEL_OPTIONS_RUNTIME_SNAPSHOT)
@@ -16106,7 +16106,7 @@ def _(rid, params: dict) -> dict:
         # Curated model lists are preserved — list_authenticated_providers
         # populates `models` from the curated catalog, not provider_model_ids
         # (which would pull non-agentic models like TTS/embeddings/etc.).
-        payload = build_models_payload(
+        payload = build_model_options_payload(
             ctx,
             explicit_only=bool(params.get("explicit_only")),
             include_unconfigured=bool(params.get("include_unconfigured")),
