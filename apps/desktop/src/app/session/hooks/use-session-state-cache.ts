@@ -17,8 +17,6 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
-  setSessionAttention,
-  setSessionWorking,
   setTurnOrigin,
   setTurnStartedAt,
   setYoloActive
