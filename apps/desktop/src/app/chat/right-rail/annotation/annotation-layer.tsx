@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { requestComposerFocus, requestComposerInsert } from '@/app/chat/composer/focus'
 import { useI18n } from '@/i18n'
-import { appendComposerDraft } from '@/store/composer'
 import { notify, notifyError } from '@/store/notifications'
 
 import { AnnotationPopover, type AnnotationDraft } from './annotation-popover'
@@ -113,15 +113,15 @@ export function AnnotationLayer({ onExit, webview }: AnnotationLayerProps) {
         target: draft.target as PickedElement & PickedRegion
       })
 
-      appendComposerDraft(message)
+      // The composer's external-insert bus is the only supported write path
+      // (see focus.ts — "preview console, etc."). $composerDraft has no UI
+      // subscriber; writing there drops the message silently.
+      const screenshotBlock = draft.screenshotDataUrl
+        ? `\n\n<details><summary>📎 标注截图</summary>\n\n![annotation](${draft.screenshotDataUrl})\n\n</details>`
+        : ''
 
-      // Screenshots ride along as plain composer text for now — the data URL
-      // is embedded in a collapsed details block so the model can fetch it
-      // when the user sends. Keeping the message self-contained avoids a new
-      // attachment pipeline for the first iteration.
-      if (draft.screenshotDataUrl) {
-        appendComposerDraft(`\n\n<details><summary>📎 标注截图</summary>\n\n![annotation](${draft.screenshotDataUrl})\n\n</details>`)
-      }
+      requestComposerInsert(message + screenshotBlock, { mode: 'block', target: 'main' })
+      requestComposerFocus('main')
 
       notify({ message: copy.sentToComposer, kind: 'success' })
       finish()
