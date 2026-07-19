@@ -2301,6 +2301,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        interim_assistant_callback=None,
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
@@ -2597,6 +2598,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
+            "interim_assistant_callback": interim_assistant_callback,
             "session_db": self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
@@ -3501,6 +3503,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        def _commentary(text: str, *, already_streamed: bool = False) -> None:
+            # Codex ``phase="commentary"`` preambles are user-facing progress
+            # narration (#67580). Surface them as a distinct, typed interim
+            # event so clients can show them without them ever being
+            # concatenated into the final answer. ``already_streamed`` means
+            # the text already went out through the assistant.delta channel —
+            # skip it to avoid a duplicate. Analysis / reasoning never reaches
+            # this callback (it stays on the reasoning path), so no CoT leaks.
+            if already_streamed:
+                return
+            if isinstance(text, str) and text.strip():
+                _enqueue("assistant.commentary", {"message_id": message_id, "content": text})
+
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {
@@ -3516,6 +3531,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
+                    interim_assistant_callback=_commentary,
                     gateway_session_key=gateway_session_key,
                     route=route,
                     session_model=session_model,
@@ -5710,6 +5726,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        interim_assistant_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
@@ -5769,6 +5786,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,
+                        interim_assistant_callback=interim_assistant_callback,
                         gateway_session_key=gateway_session_key,
                         requested_model=requested_model,
                         requested_provider=requested_provider,
