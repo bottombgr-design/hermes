@@ -1621,13 +1621,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._fts_enabled = True
                 except sqlite3.Error as exc:
                     self._fts_enabled = not _fts_object_missing(exc)
+                # Same transient-vs-absent rule for the trigram probe. Absence
+                # here has one extra spelling: a build with FTS5 but without
+                # the trigram tokenizer raises "no such tokenizer: trigram"
+                # (see _is_trigram_unavailable_error), which _fts_object_missing
+                # does not cover. A wrongly-kept True costs nothing at query
+                # time — search_messages catches the per-query error and falls
+                # through to LIKE — while a wrongly-latched False pins the LIKE
+                # fallback (ORs tokens, drops NOT/rank) for the handle's life.
                 try:
                     self._conn.execute(
                         "SELECT 1 FROM messages_fts_trigram LIMIT 1"
                     )
                     self._trigram_available = True
-                except sqlite3.Error:
-                    self._trigram_available = False
+                except sqlite3.Error as exc:
+                    self._trigram_available = not (
+                        _fts_object_missing(exc)
+                        or self._is_trigram_unavailable_error(exc)
+                    )
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
