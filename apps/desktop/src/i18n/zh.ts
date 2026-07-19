@@ -2511,7 +2511,14 @@ export const zh: Translations = {
         screenshotAlt: '标注区域截图',
         iframeBlocked: '无法标注嵌入的跨域内容',
         pickerFailed: '无法在此页面上启动标注',
-        sentToComposer: '标注已填入输入框'
+        sentToComposer: '标注已填入输入框',
+        sessionTitle: (count: number) => `标注模式 · 已标 ${count} 处`,
+        finishSession: '完成',
+        cancelSession: '取消',
+        add: '添加',
+        discard: '丢弃',
+        navigatedAway: '页面已跳转，标注模式已结束',
+        navigatedAwaySubmitted: '页面已跳转，已收集的标注已填入输入框'
       }
     }
   },

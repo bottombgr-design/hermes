@@ -2200,7 +2200,14 @@ export const zhHant = defineLocale({
         screenshotAlt: '標註區域截圖',
         iframeBlocked: '無法標註嵌入的跨來源內容',
         pickerFailed: '無法在此頁面啟動標註',
-        sentToComposer: '標註已填入輸入框'
+        sentToComposer: '標註已填入輸入框',
+        sessionTitle: (count: number) => `標註模式 · 已標 ${count} 處`,
+        finishSession: '完成',
+        cancelSession: '取消',
+        add: '新增',
+        discard: '捨棄',
+        navigatedAway: '頁面已跳轉，標註模式已結束',
+        navigatedAwaySubmitted: '頁面已跳轉，已收集的標註已填入輸入框'
       }
     }
   },

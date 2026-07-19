@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { PickedElement, PickedRegion } from './element-picker'
-import { formatAnnotationMessage } from './message-format'
+import { formatAnnotationMessage, formatAnnotationSessionMessage } from './message-format'
 
 const baseElement: PickedElement = {
   classes: ['submit', 'primary'],
@@ -85,5 +85,40 @@ describe('formatAnnotationMessage', () => {
 
     expect(msg).toContain('[预览标注]')
     expect(msg.trim().length).toBeGreaterThan(20)
+  })
+})
+
+
+describe('formatAnnotationSessionMessage', () => {
+  it('formats multiple items with numbered markers and shared page header', () => {
+    const msg = formatAnnotationSessionMessage([
+      { comment: '按钮颜色不对', kind: 'element', number: 1, target: baseElement },
+      { comment: '这块布局乱了', kind: 'region', number: 2, target: baseRegion }
+    ])
+
+    expect(msg).toContain('[预览标注] 页面反馈（共 2 处）')
+    expect(msg).toContain('① 元素标注')
+    expect(msg).toContain('② 区域标注')
+    expect(msg).toContain('`#app > button.submit.primary`')
+    expect(msg).toContain('按钮颜色不对')
+    expect(msg).toContain('这块布局乱了')
+    // Element block carries the selector; region block does not.
+    const regionBlock = msg.split('② 区域标注')[1]
+    expect(regionBlock).not.toContain('选择器')
+    expect(regionBlock).toContain('400×200px')
+  })
+
+  it('falls back to (n) markers beyond ⑩ and returns empty for no items', () => {
+    expect(formatAnnotationSessionMessage([])).toBe('')
+
+    const items = Array.from({ length: 11 }, (_, i) => ({
+      comment: `c${i + 1}`,
+      kind: 'region' as const,
+      number: i + 1,
+      target: baseRegion
+    }))
+    const msg = formatAnnotationSessionMessage(items)
+    expect(msg).toContain('⑩')
+    expect(msg).toContain('(11)')
   })
 })

@@ -2268,7 +2268,14 @@ export const ja = defineLocale({
         screenshotAlt: '注釈範囲のスクリーンショット',
         iframeBlocked: 'クロスオリジンの埋め込みコンテンツは注釈できません',
         pickerFailed: 'このページで注釈を開始できませんでした',
-        sentToComposer: '注釈を入力欄に追加しました'
+        sentToComposer: '注釈を入力欄に追加しました',
+        sessionTitle: (count: number) => `注釈モード · ${count} 件マーク済み`,
+        finishSession: '完了',
+        cancelSession: 'キャンセル',
+        add: '追加',
+        discard: '破棄',
+        navigatedAway: 'ページが遷移したため注釈モードを終了しました',
+        navigatedAwaySubmitted: 'ページが遷移しました — 収集済みの注釈を入力欄に追加しました'
       }
     }
   },

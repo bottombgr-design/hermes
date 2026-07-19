@@ -1,8 +1,5 @@
-import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 
-import { Button } from '@/components/ui/button'
-import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 
@@ -16,8 +13,10 @@ export interface AnnotationDraft {
 }
 
 interface AnnotationPopoverProps {
-  onCancel: () => void
-  onSubmit: (draft: AnnotationDraft) => void
+  /** 1-based badge number this annotation will get when added. */
+  number: number
+  onAdd: (draft: AnnotationDraft) => void
+  onDiscard: () => void
   screenshotDataUrl?: string
   target: PickedElement | PickedRegion
   kind: 'element' | 'region'
@@ -36,7 +35,14 @@ function targetSummary(target: PickedElement | PickedRegion): string {
   return `${Math.round(target.rect.width)}×${Math.round(target.rect.height)}px`
 }
 
-export function AnnotationPopover({ kind, onCancel, onSubmit, screenshotDataUrl, target }: AnnotationPopoverProps) {
+const CIRCLED = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩']
+
+/**
+ * Comment card for one pending annotation in session mode. Dark Linear-style
+ * glass card anchored at the bottom of the preview: number badge, target
+ * summary, screenshot thumb, and add/discard actions.
+ */
+export function AnnotationPopover({ kind, number, onAdd, onDiscard, screenshotDataUrl, target }: AnnotationPopoverProps) {
   const { t } = useI18n()
   const copy = t.preview.web.annotation
   const [comment, setComment] = useState('')
@@ -50,61 +56,79 @@ export function AnnotationPopover({ kind, onCancel, onSubmit, screenshotDataUrl,
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.stopPropagation()
-        onCancel()
+        onDiscard()
       }
 
       if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
         event.stopPropagation()
-        onSubmit({ comment, kind, screenshotDataUrl, target })
+        onAdd({ comment, kind, screenshotDataUrl, target })
       }
     }
 
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [comment, kind, onCancel, onSubmit, screenshotDataUrl, target])
+  }, [comment, kind, onAdd, onDiscard, screenshotDataUrl, target])
+
+  const marker = CIRCLED[number - 1] || `(${number})`
 
   return (
     <div
-      className="pointer-events-auto absolute bottom-4 left-1/2 z-50 w-[22rem] -translate-x-1/2 rounded-lg border border-border bg-popover shadow-xl"
+      className={cn(
+        'pointer-events-auto absolute bottom-4 left-1/2 z-50 w-[24rem] -translate-x-1/2',
+        'rounded-2xl border border-white/10 bg-neutral-900/90 shadow-2xl shadow-black/40',
+        'backdrop-blur-xl backdrop-saturate-150',
+        'animate-in fade-in slide-in-from-bottom-3 zoom-in-95 duration-200'
+      )}
       data-testid="annotation-popover"
     >
-      <div className="flex items-center justify-between border-b border-border px-3 py-2">
-        <div className="min-w-0">
-          <div className="text-xs font-medium text-foreground">
+      <div className="flex items-center gap-2.5 px-4 pb-2 pt-3">
+        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-red-500 text-xs font-semibold text-white">
+          {marker}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="text-xs font-medium text-neutral-100">
             {kind === 'element' ? copy.elementTitle : copy.regionTitle}
           </div>
-          <div className="truncate font-mono text-[0.6875rem] text-muted-foreground">{targetSummary(target)}</div>
+          <div className="truncate font-mono text-[0.6875rem] text-neutral-400">{targetSummary(target)}</div>
         </div>
         {screenshotDataUrl && (
           <img
             alt={copy.screenshotAlt}
-            className="ml-2 h-10 w-16 shrink-0 rounded border border-border object-cover"
+            className="h-10 w-16 shrink-0 rounded-md border border-white/10 object-cover"
             src={screenshotDataUrl}
           />
         )}
       </div>
 
-      <div className="p-3">
-        <Textarea
+      <div className="px-4 pb-3">
+        <textarea
           ref={textareaRef}
-          className="min-h-20 resize-none text-sm"
+          className={cn(
+            'min-h-20 w-full resize-none rounded-xl border border-white/10 bg-white/5 px-3 py-2',
+            'text-sm text-neutral-100 placeholder:text-neutral-500',
+            'outline-none transition-colors focus:border-red-500/50 focus:bg-white/[0.07]'
+          )}
           onChange={event => setComment(event.target.value)}
           placeholder={copy.placeholder}
           value={comment}
         />
-        <div className="mt-2 flex items-center justify-between">
-          <span className="text-[0.6875rem] text-muted-foreground">{copy.hint}</span>
+        <div className="mt-2.5 flex items-center justify-between">
+          <span className="text-[0.6875rem] text-neutral-500">{copy.hint}</span>
           <div className="flex gap-2">
-            <Button onClick={onCancel} size="sm" variant="ghost">
-              {copy.cancel}
-            </Button>
-            <Button
-              className={cn(!comment.trim() && 'opacity-60')}
-              onClick={() => onSubmit({ comment, kind, screenshotDataUrl, target })}
-              size="sm"
+            <button
+              className="rounded-full px-3 py-1.5 text-xs text-neutral-400 transition-colors hover:bg-white/10 hover:text-neutral-200"
+              onClick={onDiscard}
+              type="button"
             >
-              {copy.submit}
-            </Button>
+              {copy.discard}
+            </button>
+            <button
+              className="rounded-full bg-red-500 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition-colors hover:bg-red-400"
+              onClick={() => onAdd({ comment, kind, screenshotDataUrl, target })}
+              type="button"
+            >
+              {copy.add}
+            </button>
           </div>
         </div>
       </div>

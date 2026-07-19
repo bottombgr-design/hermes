@@ -2343,7 +2343,14 @@ export const en: Translations = {
         screenshotAlt: 'Annotated region screenshot',
         iframeBlocked: 'Cannot annotate embedded cross-origin content',
         pickerFailed: 'Could not start annotation on this page',
-        sentToComposer: 'Annotation added to the composer'
+        sentToComposer: 'Annotation added to the composer',
+        sessionTitle: (count: number) => `Annotating · ${count} marked`,
+        finishSession: 'Done',
+        cancelSession: 'Cancel',
+        add: 'Add',
+        discard: 'Discard',
+        navigatedAway: 'Page navigated — annotation mode ended',
+        navigatedAwaySubmitted: 'Page navigated — collected annotations added to the composer'
       }
     }
   },

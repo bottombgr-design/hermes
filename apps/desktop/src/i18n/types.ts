@@ -1970,6 +1970,13 @@ export interface Translations {
         iframeBlocked: string
         pickerFailed: string
         sentToComposer: string
+        sessionTitle: (count: number) => string
+        finishSession: string
+        cancelSession: string
+        add: string
+        discard: string
+        navigatedAway: string
+        navigatedAwaySubmitted: string
       }
     }
   }

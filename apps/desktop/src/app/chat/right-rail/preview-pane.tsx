@@ -296,13 +296,6 @@ export function PreviewPane({
       ...(isWebPreview
         ? [
             {
-              active: annotating,
-              icon: <Pin />,
-              id: `${TITLEBAR_GROUP_ID}-annotate`,
-              label: annotating ? copy.annotation.stop : copy.annotation.start,
-              onSelect: () => setAnnotating(open => !open)
-            },
-            {
               active: consoleOpen,
               icon: <PreviewConsoleTitlebarIcon consoleState={consoleState} />,
               id: `${TITLEBAR_GROUP_ID}-console`,
@@ -323,7 +316,7 @@ export function PreviewPane({
     setTitlebarToolGroup(TITLEBAR_GROUP_ID, tools)
 
     return () => setTitlebarToolGroup(TITLEBAR_GROUP_ID, [])
-  }, [annotating, consoleOpen, consoleState, copy, devtoolsOpen, isWebPreview, setTitlebarToolGroup, toggleDevTools])
+  }, [consoleOpen, consoleState, copy, devtoolsOpen, isWebPreview, setTitlebarToolGroup, toggleDevTools])
 
   useEffect(() => {
     if (!consoleOpen) {
@@ -631,6 +624,16 @@ export function PreviewPane({
                 </a>
               </Tip>
             </div>
+            {isWebPreview && !annotating && (
+              <button
+                className="pointer-events-auto flex shrink-0 items-center gap-1.5 rounded-full bg-red-500/10 px-3 py-1 text-xs font-medium text-red-600 transition-colors hover:bg-red-500/20 dark:text-red-400"
+                onClick={() => setAnnotating(true)}
+                type="button"
+              >
+                <Pin className="h-3 w-3" />
+                {copy.annotation.start}
+              </button>
+            )}
           </div>
         )}
 
