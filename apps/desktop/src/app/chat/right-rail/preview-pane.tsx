@@ -625,16 +625,6 @@ export function PreviewPane({
                 </a>
               </Tip>
             </div>
-            {(isWebPreview || isImagePreview) && !annotating && (
-              <button
-                className="pointer-events-auto flex shrink-0 items-center gap-1.5 rounded-full bg-red-500/10 px-3 py-1 text-xs font-medium text-red-600 transition-colors hover:bg-red-500/20 dark:text-red-400"
-                onClick={() => setAnnotating(true)}
-                type="button"
-              >
-                <Pin className="h-3 w-3" />
-                {copy.annotation.start}
-              </button>
-            )}
           </div>
         )}
 
@@ -674,6 +664,17 @@ export function PreviewPane({
               consoleState={consoleState}
               startConsoleResize={startConsoleResize}
             />
+          )}
+
+          {(isWebPreview || isImagePreview) && !annotating && !loadError && (
+            <button
+              className="absolute bottom-4 right-4 z-20 flex items-center gap-1.5 rounded-full border border-red-500/30 bg-red-500/90 px-3.5 py-1.5 text-xs font-medium text-white shadow-lg shadow-red-500/25 backdrop-blur-sm transition-colors hover:bg-red-400"
+              onClick={() => setAnnotating(true)}
+              type="button"
+            >
+              <Pin className="h-3 w-3" />
+              {copy.annotation.start}
+            </button>
           )}
 
           {isWebPreview && annotating && (
