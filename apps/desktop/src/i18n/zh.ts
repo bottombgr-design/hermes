@@ -2518,7 +2518,15 @@ export const zh: Translations = {
         add: '添加',
         discard: '丢弃',
         navigatedAway: '页面已跳转，标注模式已结束',
-        navigatedAwaySubmitted: '页面已跳转，已收集的标注已填入输入框'
+        navigatedAwaySubmitted: '页面已跳转，已收集的标注已填入输入框',
+        brushTitle: (count: number) => `画笔标注 · 已画 ${count} 笔`,
+        brushCommentTitle: '图片标注',
+        undo: '撤销',
+        clear: '清空',
+        back: '返回',
+        noComment: '（未填写说明）',
+        composeFailed: '无法合成标注图片',
+        imageSaveFailed: '标注图片保存失败'
       }
     }
   },

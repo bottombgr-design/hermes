@@ -1977,6 +1977,14 @@ export interface Translations {
         discard: string
         navigatedAway: string
         navigatedAwaySubmitted: string
+        brushTitle: (count: number) => string
+        brushCommentTitle: string
+        undo: string
+        clear: string
+        back: string
+        noComment: string
+        composeFailed: string
+        imageSaveFailed: string
       }
     }
   }

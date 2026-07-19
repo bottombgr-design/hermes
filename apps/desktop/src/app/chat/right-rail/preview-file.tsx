@@ -11,6 +11,8 @@ import ShikiHighlighter from 'react-shiki'
 import { Streamdown } from 'streamdown'
 
 import { requestComposerFocus, requestComposerInsertRefs } from '@/app/chat/composer/focus'
+
+import { ImageAnnotationLayer } from './annotation/image-annotation-layer'
 import { droppedFileInlineRef } from '@/app/chat/composer/inline-refs'
 import { HERMES_PATHS_MIME } from '@/app/chat/hooks/use-composer-actions'
 import { isAddSelectionShortcut } from '@/app/right-sidebar/terminal/selection'
@@ -563,7 +565,17 @@ function SourceView({ filePath, language, text }: { filePath: string; language: 
 
 type PreviewViewMode = 'diff' | 'rendered' | 'source'
 
-export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; target: PreviewTarget }) {
+export function LocalFilePreview({
+  annotating = false,
+  onExitAnnotation,
+  reloadKey,
+  target
+}: {
+  annotating?: boolean
+  onExitAnnotation?: () => void
+  reloadKey: number
+  target: PreviewTarget
+}) {
   const { t } = useI18n()
   const [state, setState] = useState<LocalPreviewState>({ loading: true })
   const [forcePreview, setForcePreview] = useState(false)
@@ -895,6 +907,10 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
   }
 
   if (isImage && state.dataUrl) {
+    if (annotating && onExitAnnotation) {
+      return <ImageAnnotationLayer imageDataUrl={state.dataUrl} label={target.label} onExit={onExitAnnotation} />
+    }
+
     return (
       <div className="flex h-full w-full items-center justify-center overflow-auto bg-transparent p-4">
         <img

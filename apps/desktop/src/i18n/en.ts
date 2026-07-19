@@ -2350,7 +2350,15 @@ export const en: Translations = {
         add: 'Add',
         discard: 'Discard',
         navigatedAway: 'Page navigated — annotation mode ended',
-        navigatedAwaySubmitted: 'Page navigated — collected annotations added to the composer'
+        navigatedAwaySubmitted: 'Page navigated — collected annotations added to the composer',
+        brushTitle: (count: number) => `Brush annotation · ${count} strokes`,
+        brushCommentTitle: 'Image annotation',
+        undo: 'Undo',
+        clear: 'Clear',
+        back: 'Back',
+        noComment: '(no comment)',
+        composeFailed: 'Could not compose the annotated image',
+        imageSaveFailed: 'Failed to save the annotated image'
       }
     }
   },

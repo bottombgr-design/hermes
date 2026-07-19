@@ -2275,7 +2275,15 @@ export const ja = defineLocale({
         add: '追加',
         discard: '破棄',
         navigatedAway: 'ページが遷移したため注釈モードを終了しました',
-        navigatedAwaySubmitted: 'ページが遷移しました — 収集済みの注釈を入力欄に追加しました'
+        navigatedAwaySubmitted: 'ページが遷移しました — 収集済みの注釈を入力欄に追加しました',
+        brushTitle: (count: number) => `ブラシ注釈 · ${count} ストローク`,
+        brushCommentTitle: '画像注釈',
+        undo: '取り消し',
+        clear: 'クリア',
+        back: '戻る',
+        noComment: '（コメントなし）',
+        composeFailed: '注釈画像を合成できませんでした',
+        imageSaveFailed: '注釈画像の保存に失敗しました'
       }
     }
   },

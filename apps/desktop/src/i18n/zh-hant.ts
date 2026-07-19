@@ -2207,7 +2207,15 @@ export const zhHant = defineLocale({
         add: '新增',
         discard: '捨棄',
         navigatedAway: '頁面已跳轉，標註模式已結束',
-        navigatedAwaySubmitted: '頁面已跳轉，已收集的標註已填入輸入框'
+        navigatedAwaySubmitted: '頁面已跳轉，已收集的標註已填入輸入框',
+        brushTitle: (count: number) => `畫筆標註 · 已畫 ${count} 筆`,
+        brushCommentTitle: '圖片標註',
+        undo: '復原',
+        clear: '清空',
+        back: '返回',
+        noComment: '（未填寫說明）',
+        composeFailed: '無法合成標註圖片',
+        imageSaveFailed: '標註圖片儲存失敗'
       }
     }
   },

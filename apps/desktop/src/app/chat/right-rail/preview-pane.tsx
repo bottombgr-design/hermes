@@ -151,6 +151,7 @@ export function PreviewPane({
   const [loadError, setLoadError] = useState<PreviewLoadErrorState | null>(null)
   const [localReloadKey, setLocalReloadKey] = useState(0)
   const isWebPreview = target.kind === 'url' || (target.previewKind === 'html' && target.renderMode !== 'source')
+  const isImagePreview = !isWebPreview && target.previewKind === 'image'
   const currentLabel = compactUrl(currentUrl)
 
   const previewLabel =
@@ -624,7 +625,7 @@ export function PreviewPane({
                 </a>
               </Tip>
             </div>
-            {isWebPreview && !annotating && (
+            {(isWebPreview || isImagePreview) && !annotating && (
               <button
                 className="pointer-events-auto flex shrink-0 items-center gap-1.5 rounded-full bg-red-500/10 px-3 py-1 text-xs font-medium text-red-600 transition-colors hover:bg-red-500/20 dark:text-red-400"
                 onClick={() => setAnnotating(true)}
@@ -648,7 +649,14 @@ export function PreviewPane({
             )}
             ref={hostRef}
           />
-          {!isWebPreview && <LocalFilePreview reloadKey={localReloadKey} target={target} />}
+          {!isWebPreview && (
+            <LocalFilePreview
+              annotating={annotating && isImagePreview}
+              onExitAnnotation={() => setAnnotating(false)}
+              reloadKey={localReloadKey}
+              target={target}
+            />
+          )}
           {loadError && (
             <PreviewLoadError
               consoleHeight={consoleOpen ? consoleHeight : 0}
