@@ -1,5 +1,7 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import pytest
+
 import tools.terminal_tool as terminal_tool
 
 
@@ -232,27 +234,29 @@ def test_get_env_config_ignores_bad_docker_json_for_ssh_backend(monkeypatch):
     assert config["docker_env"] == {}
 
 
-def test_get_env_config_preserves_ssh_tilde_cwd(monkeypatch):
+@pytest.mark.parametrize("backend", ("ssh", "ssh_pwsh"))
+def test_get_env_config_preserves_ssh_tilde_cwd(monkeypatch, backend):
     """SSH cwd '~' is expanded by the remote shell, not the Hermes host."""
-    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_ENV", backend)
     monkeypatch.setenv("TERMINAL_CWD", "~")
     monkeypatch.setenv("HOME", "/opt/data")
 
     config = terminal_tool._get_env_config()
 
-    assert config["env_type"] == "ssh"
+    assert config["env_type"] == backend
     assert config["cwd"] == "~"
 
 
-def test_get_env_config_preserves_ssh_tilde_child_cwd(monkeypatch):
+@pytest.mark.parametrize("backend", ("ssh", "ssh_pwsh"))
+def test_get_env_config_preserves_ssh_tilde_child_cwd(monkeypatch, backend):
     """SSH cwd '~/x' must not become the local/container HOME path."""
-    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_ENV", backend)
     monkeypatch.setenv("TERMINAL_CWD", "~/project")
     monkeypatch.setenv("HOME", "/opt/data")
 
     config = terminal_tool._get_env_config()
 
-    assert config["env_type"] == "ssh"
+    assert config["env_type"] == backend
     assert config["cwd"] == "~/project"
 
 
