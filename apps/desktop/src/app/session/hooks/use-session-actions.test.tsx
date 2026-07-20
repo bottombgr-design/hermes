@@ -1571,7 +1571,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
         parts: [{ type: 'text', text: 'current prompt' }]
       },
       {
-        id: 'assistant-stream-rt-A',
+        id: 'assistant-stream-live-123',
         role: 'assistant',
         parts: [{ type: 'text', text: 'partial A' }],
         pending: true
@@ -1633,7 +1633,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     const liveState = sessionStateByRuntimeIdRef.current.get('rt-A')!
 
     const liveMessages = liveState.messages.map(message =>
-      message.id === 'assistant-stream-rt-A'
+      message.id === 'assistant-stream-live-123'
         ? { ...message, parts: [{ type: 'text' as const, text: 'partial A + delta B' }] }
         : message
     )
@@ -1667,6 +1667,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(renderedText).toContain('older prompt')
     expect(renderedText).toContain('partial A + delta B')
     expect(renderedText).toContain('racing prompt')
+
+    const streamingAssistantRows = resumedState?.messages.filter(message => message.id.startsWith('assistant-stream-'))
+
+    expect(streamingAssistantRows).toHaveLength(1)
+    expect(streamingAssistantRows?.[0].id).toBe('assistant-stream-live-123')
   })
 
   it('does not duplicate an in-flight user prompt already present in the persisted suffix', async () => {
