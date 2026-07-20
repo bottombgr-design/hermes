@@ -873,6 +873,7 @@ export function useSessionActions({
 
         let prefetchApplied = false
         let prefetchedStoredSessionId: string | null = null
+        let prefetchedTranscriptMessages: ChatMessage[] | null = null
 
         // REST transcript prefetch and the gateway resume RPC are independent
         // — run them concurrently so a big session's wall time is
@@ -922,7 +923,8 @@ export function useSessionActions({
             ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
             : $messages.get()
 
-          localSnapshot = reconcileAuthoritativeMessages(prefetchedResult.messages, previousMessages)
+          prefetchedTranscriptMessages = toChatMessages(prefetchedResult.messages)
+          localSnapshot = reconcileAuthoritativeChatMessages(prefetchedTranscriptMessages, previousMessages)
           prefetchApplied = true
           prefetchedStoredSessionId = prefetchedResult.session_id || storedSessionId
         }
@@ -941,18 +943,48 @@ export function useSessionActions({
 
         const hasLiveProjection = Boolean(resumed.inflight || resumed.queued)
 
-        const preferredMessages =
-          prefetchApplied && prefetchMatchesResumedSession && !hasLiveProjection
-            ? localSnapshot
-            : (() => {
-                const previousMessages = resumedSameSelectedSession
-                  ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
-                  : currentMessages
+        const preferredMessages = (() => {
+          if (prefetchApplied && prefetchMatchesResumedSession) {
+            if (hasLiveProjection && prefetchedTranscriptMessages) {
+              const runtimeMessages = toChatMessages(resumed.messages)
+              const previousMessages = removeRepresentedLocalLiveProjection(currentMessages, resumed)
 
-                const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
+              const liveProjection = dedupeInflightUserAgainstTranscript(
+                prefetchedTranscriptMessages,
+                runtimeMessages,
+                resumed
+              )
 
-                return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
-              })()
+              const resumedMessages = reconcileAuthoritativeChatMessages(
+                prefetchedTranscriptMessages,
+                previousMessages,
+                liveProjection
+              )
+
+              const withConcurrentChanges = overlayConcurrentMessageChanges(
+                resumedMessages,
+                localSnapshot,
+                currentMessages
+              )
+
+              return chatMessageArraysEquivalent(currentMessages, withConcurrentChanges)
+                ? currentMessages
+                : withConcurrentChanges
+            }
+
+            if (!hasLiveProjection) {
+              return localSnapshot
+            }
+          }
+
+          const previousMessages = resumedSameSelectedSession
+            ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
+            : currentMessages
+
+          const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
+
+          return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
+        })()
 
         resumedRunning = Boolean((resumed as { running?: boolean }).running)
 
