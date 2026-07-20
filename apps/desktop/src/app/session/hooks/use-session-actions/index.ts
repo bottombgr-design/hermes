@@ -882,6 +882,8 @@ export function useSessionActions({
         // Watch windows skip the prefetch — lazy resume attaches the live mirror.
         const prefetchPromise = watchWindow ? null : getSessionMessages(storedSessionId, sessionProfile)
 
+        let resumeRuntimeBaselineMessages: ChatMessage[] = []
+
         const resumePromise = requestGateway<SessionResumeResponse>('session.resume', {
           session_id: storedSessionId,
           cols: 96,
@@ -893,6 +895,11 @@ export function useSessionActions({
           // background while the prefetch above paints the transcript.
           ...(watchWindow ? { lazy: true } : {}),
           ...(sessionProfile ? { profile: sessionProfile } : {})
+        }).then(resumed => {
+          resumeRuntimeBaselineMessages =
+            sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages ?? resumeRuntimeBaselineMessages
+
+          return resumed
         })
 
         // The rejection is consumed by the `await` below; this guard only
@@ -986,26 +993,31 @@ export function useSessionActions({
           return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
         })()
 
+        const currentRuntimeMessages =
+          sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages ?? resumeRuntimeBaselineMessages
+
+        const preferredWithRuntimeChanges = overlayConcurrentMessageChanges(
+          preferredMessages,
+          resumeRuntimeBaselineMessages,
+          currentRuntimeMessages
+        )
+
         resumedRunning = Boolean((resumed as { running?: boolean }).running)
 
         // Crash-survivable turn progress: fold a journaled in-flight tail
         // (persisted by use-session-state-cache while the turn streamed;
         // survives renderer/app death) back onto the restored transcript. The
         // backend's own inflight projection is already inside
-        // `preferredMessages` (appendLiveSessionProjection), so this merge only
-        // adds the locally recorded structure — tool calls, sealed interim
-        // rows — that the backend's text-only snapshot cannot carry. A no-op
-        // returns `preferredMessages` by reference, keeping the fast path
-        // below intact.
-        const inFlightRecovery = recoverInFlightTurnJournal(storedSessionId, preferredMessages, {
+        // `preferredWithRuntimeChanges`, so this merge only adds the locally
+        // recorded structure that the backend's text-only snapshot cannot carry.
+        const inFlightRecovery = recoverInFlightTurnJournal(storedSessionId, preferredWithRuntimeChanges, {
           keepPending: resumedRunning
         })
 
         recoveredInFlightTail = inFlightRecovery.applied
 
-        // Prefetch-hit fast path: `preferredMessages` IS the live `$messages`
-        // array (already error-merged when `localSnapshot` was built), so reuse
-        // the ref instead of rebuilding a throwaway transcript+Map every switch.
+        // Prefetch-hit fast path: reuse the live array when neither runtime
+        // changes nor in-flight recovery changed the reconciled transcript.
         const messagesForView =
           inFlightRecovery.messages === currentMessages
             ? currentMessages
