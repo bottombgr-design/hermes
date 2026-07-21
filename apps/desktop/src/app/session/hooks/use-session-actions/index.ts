@@ -1008,13 +1008,11 @@ export function useSessionActions({
                   // still mid-turn; a settled recovery keeps the stream idle.
                   streamId: resumedRunning ? inFlightRecovery.streamId : null,
                   turnStartedAt: resumedRunning
-                    ? (inFlightRecovery.turnStartedAt ?? resumedTurnStartedAt ?? state.turnStartedAt ?? Date.now())
-                    : state.turnStartedAt
+                    ? (inFlightRecovery.turnStartedAt ?? resumedTurnStartedAt)
+                    : null
                 }
               : {
-                  turnStartedAt: resumedRunning
-                    ? (resumedTurnStartedAt ?? state.turnStartedAt ?? Date.now())
-                    : null
+                  turnStartedAt: resumedRunning && resumedTurnStartedAt !== null ? resumedTurnStartedAt : null
                 })
           }),
           storedSessionId
