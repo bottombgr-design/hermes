@@ -1962,6 +1962,7 @@ DEFAULT_CONFIG = {
             "last_lines": 2,
         },
         "interim_assistant_messages": True,  # Gateway: send natural mid-turn assistant status messages. Desktop: keep mid-turn narration between tool calls instead of collapsing to the final message.
+        "composer_suggestions": True,  # Desktop/TUI: ghost-text reply suggestions in the empty composer after an agent turn (Tab accepts). Deterministic only; served by complete.suggest.
         # Codex Responses models narrate progress in a dedicated commentary
         # channel. When true (default), completed commentary messages are
         # delivered as visible mid-turn updates via the interim message path.
