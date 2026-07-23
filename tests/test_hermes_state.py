@@ -468,6 +468,63 @@ class TestSessionLifecycle:
         assert session["api_call_count"] == 5
         assert session["input_tokens"] == 300
 
+    def test_update_token_counts_preserves_null_cost_for_unpriced_model(self, db):
+        """An unpriced turn (estimated_cost_usd=None) must leave the column
+        NULL, not coerce it to 0.0.
+
+        The pricing layer returns amount_usd=None ("unknown") for a model it
+        has no rate for; the persisted row must stay NULL so a client can tell
+        "cost unknown" from a genuine measured zero. Regression guard for the
+        COALESCE(?, 0) coercion.
+        """
+        db.create_session(session_id="s1", source="cli")
+        db.update_token_counts(
+            "s1", input_tokens=1000, output_tokens=200,
+            estimated_cost_usd=None, cost_status="unknown", cost_source="none",
+            api_call_count=1,
+        )
+
+        session = db.get_session("s1")
+        assert session["estimated_cost_usd"] is None
+        assert session["cost_status"] == "unknown"
+        assert session["cost_source"] == "none"
+
+    def test_update_token_counts_records_explicit_zero_for_included_route(self, db):
+        """A genuine zero (subscription_included) must persist as 0.0, not NULL.
+
+        Guards against "fixing" the unpriced case by dropping zeros wholesale,
+        which would erase the distinction between "included" and "unknown".
+        """
+        db.create_session(session_id="s1", source="cli")
+        db.update_token_counts(
+            "s1", input_tokens=1000, output_tokens=200,
+            estimated_cost_usd=0.0, cost_status="included",
+            cost_source="subscription", api_call_count=1,
+        )
+
+        session = db.get_session("s1")
+        assert session["estimated_cost_usd"] == 0.0
+        assert session["cost_status"] == "included"
+
+    def test_update_token_counts_null_delta_does_not_reset_accumulated_cost(self, db):
+        """A later unpriced turn must not zero out an already-accumulated cost.
+
+        A priced call establishes a positive total; a subsequent unpriced call
+        (None delta) must leave that total intact rather than resetting it.
+        """
+        db.create_session(session_id="s1", source="cli")
+        db.update_token_counts(
+            "s1", input_tokens=1000, output_tokens=200,
+            estimated_cost_usd=0.25, cost_status="metered", api_call_count=1,
+        )
+        db.update_token_counts(
+            "s1", input_tokens=500, output_tokens=100,
+            estimated_cost_usd=None, cost_status="unknown", api_call_count=1,
+        )
+
+        session = db.get_session("s1")
+        assert session["estimated_cost_usd"] == 0.25
+
     def test_update_token_counts_backfills_model_when_null(self, db):
         db.create_session(session_id="s1", source="telegram")
         db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")
