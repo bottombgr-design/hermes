@@ -279,6 +279,15 @@ export interface Translations {
 
   settings: {
     closeSettings: string
+    customEndpoints: {
+      apiMode: string
+      apiModes: {
+        auto: string
+        chat: string
+        messages: string
+        responses: string
+      }
+    }
     exportConfig: string
     importConfig: string
     resetToDefaults: string
