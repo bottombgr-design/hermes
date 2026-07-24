@@ -347,6 +347,34 @@ class TestDoctorMemoryProviderSection:
         assert "Memory Provider" in out
         assert "Built-in memory active" not in out
 
+    def test_mem0_sdk_missing_and_lazy_disabled_shows_fail(self, monkeypatch, tmp_path):
+        """When mem0 config is present but the SDK is not installed and lazy
+        installs are disabled, doctor must report the SDK failure — not
+        'API key configured' (#70979 sibling path in doctor.py)."""
+        monkeypatch.setenv("MEM0_API_KEY", "test-key")
+        monkeypatch.delenv("MEM0_HOST", raising=False)
+        # Stub the lazy-install check and SDK probe at the source module
+        # so doctor's imports of the helpers see the stubbed values.
+        import plugins.memory.mem0 as _mem0_mod
+        monkeypatch.setattr(_mem0_mod, "_lazy_installs_enabled", lambda: False)
+        monkeypatch.setattr(_mem0_mod, "_mem0_sdk_installed", lambda: False)
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
+        assert "Mem0 SDK not installed" in out
+        assert "Mem0 API key configured" not in out
+
+    def test_mem0_sdk_missing_but_lazy_enabled_shows_ok(self, monkeypatch, tmp_path):
+        """When lazy installs are enabled, doctor should report config OK
+        even if the SDK is not yet installed — it will be installed on
+        demand. This is the chicken-and-egg guard."""
+        monkeypatch.setenv("MEM0_API_KEY", "test-key")
+        monkeypatch.delenv("MEM0_HOST", raising=False)
+        import plugins.memory.mem0 as _mem0_mod
+        monkeypatch.setattr(_mem0_mod, "_lazy_installs_enabled", lambda: True)
+        monkeypatch.setattr(_mem0_mod, "_mem0_sdk_installed", lambda: False)
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
+        assert "Mem0 API key configured" in out
+        assert "Mem0 SDK not installed" not in out
+
 
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):
     helper = TestDoctorMemoryProviderSection()
