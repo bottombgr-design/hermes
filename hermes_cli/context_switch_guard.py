@@ -12,6 +12,8 @@ so Herm TUI, CLI, and gateway surfaces that already show switch warnings pick it
 
 from __future__ import annotations
 
+import inspect
+
 from typing import Any, Callable, List, Optional
 
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
@@ -144,7 +146,7 @@ def merge_preflight_compression_warning(
     _append_warning(result, "".join(parts))
 
 
-def enrich_model_switch_warnings_for_gateway(
+async def enrich_model_switch_warnings_for_gateway(
     result: ModelSwitchResult,
     runner: Any,
     *,
@@ -153,7 +155,17 @@ def enrich_model_switch_warnings_for_gateway(
     custom_providers: list | None = None,
     load_gateway_config: Callable[[], dict] | None = None,
 ) -> None:
-    """Gateway helper: cached agent + session DB messages."""
+    """Gateway helper: cached agent + session DB messages.
+
+    Coroutine because the gateway holds its session DB as ``AsyncSessionDB``,
+    whose generic ``__getattr__`` forwarder returns an awaitable for every
+    method call (it offloads blocking SQLite work via ``asyncio.to_thread``).
+    Calling ``get_messages_as_conversation`` without awaiting produced a
+    coroutine instead of the message list, which raised ``TypeError: object of
+    type 'coroutine' has no len()`` inside ``_estimate_tokens``. The callers
+    swallow that at debug level, so the preflight-compression warning was
+    silently dead on every gateway ``/model`` switch.
+    """
     lock = getattr(runner, "_agent_cache_lock", None)
     cache = getattr(runner, "_agent_cache", None)
     agent = None
@@ -188,8 +200,13 @@ def enrich_model_switch_warnings_for_gateway(
         try:
             entry = store.get_or_create_session(source)
             messages = db.get_messages_as_conversation(entry.session_id)
+            # AsyncSessionDB forwards every call as a coroutine; a plain
+            # SessionDB returns the list directly. Accept both so this helper
+            # works under either wiring.
+            if inspect.isawaitable(messages):
+                messages = await messages
         except Exception:
-            pass
+            messages = None
 
     merge_preflight_compression_warning(
         result,
