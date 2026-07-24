@@ -71,6 +71,82 @@ def _patch_managed_uv(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _patch_pinned_git_update_helpers(monkeypatch, request, tmp_path):
+    """Isolate cmd_update tests while mocking only the new Git primitives."""
+    from hermes_cli import main as hm
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    old_sha = "a" * 40
+    target_sha = "b" * 40
+    apply_calls = []
+    hm._test_pinned_apply_calls = apply_calls
+    empty_sync = {"copied": [], "updated": [], "user_modified": [], "cleaned": []}
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda *a, **kw: empty_sync)
+    if request.node.cls is None or request.node.cls.__name__ != "TestCmdUpdateProfileSkillSync":
+        monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda: [])
+
+    def capture(_git_cmd, _root):
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        branch = result.stdout.strip() or "main"
+        return {
+            "ref": None if branch == "HEAD" else f"refs/heads/{branch}",
+            "head": old_sha,
+            "error": None,
+        }
+
+    def commit_sha(_git_cmd, _root, ref):
+        if ref.startswith("refs/remotes/origin/"):
+            return None if ref.endswith("/nonexistent") else target_sha
+        if ref == "refs/heads/main" or ref == "HEAD":
+            return old_sha
+        return None
+
+    def apply(*args, **kwargs):
+        apply_calls.append(args)
+        return {"success": True, "safe_to_restore_stash": True, "error": None}
+
+    monkeypatch.setattr(hm, "_capture_update_checkout_identity", capture)
+    monkeypatch.setattr(hm, "_git_update_commit_sha", commit_sha)
+    monkeypatch.setattr(
+        hm,
+        "_ensure_update_merge_base",
+        lambda *a, **kw: {"merge_base": old_sha, "error": None, "fetch_steps": []},
+    )
+    monkeypatch.setattr(hm, "_apply_pinned_default_update", apply)
+    monkeypatch.setattr(hm, "_rollback_pinned_default_update", lambda *a, **kw: True)
+    monkeypatch.setattr(hm, "_pinned_fast_forward_error", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        hm,
+        "_validate_critical_files_syntax_at_commit",
+        lambda *a, **kw: (True, None, None),
+    )
+    flow_classes = {
+        "TestCmdUpdateBranchFallback",
+        "TestCmdUpdateMigrationPrompt",
+        "TestCmdUpdateProfileSkillSync",
+        "TestCmdUpdateBranchFlag",
+    }
+    class_name = request.node.cls.__name__ if request.node.cls else ""
+    if class_name in flow_classes:
+        monkeypatch.setattr(
+            hm,
+            "_install_python_dependencies_with_optional_fallback",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda *a, **kw: True)
+        if request.node.name != "test_update_refreshes_repo_and_tui_node_dependencies":
+            monkeypatch.setattr(hm, "_update_node_dependencies", lambda *a, **kw: [])
+            monkeypatch.setattr(hm, "_build_web_ui", lambda *a, **kw: None)
+
+
+
 class TestCmdUpdateNpmLockfileCache:
     @staticmethod
     def _cache_file(hermes_root, project_root):
@@ -310,56 +386,44 @@ class TestCmdUpdateBranchFallback:
     def test_update_falls_back_to_main_when_branch_not_on_remote(
         self, mock_run, _mock_which, mock_args, capsys
     ):
+        from hermes_cli import main as hm
         mock_run.side_effect = _make_run_side_effect(
             branch="fix/stoicneko", verify_ok=False, commit_count="3"
         )
-
         cmd_update(mock_args)
-
+        assert len(hm._test_pinned_apply_calls) == 1
+        call = hm._test_pinned_apply_calls[0]
+        assert call[2] == "refs/heads/main"
+        assert call[5] == "refs/heads/fix/stoicneko"
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-
-        # rev-list should use origin/main, not origin/fix/stoicneko
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
-        assert "origin/fix/stoicneko" not in rev_list_cmds[0]
-
-        # pull should use main, not fix/stoicneko
-        pull_cmds = [c for c in commands if "pull" in c]
-        assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        assert not any(" pull " in f" {c} " or " reset " in f" {c} " for c in commands)
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_update_uses_current_branch_when_on_remote(
         self, mock_run, _mock_which, mock_args, capsys
     ):
+        from hermes_cli import main as hm
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="2"
         )
-
         cmd_update(mock_args)
-
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
-
-        pull_cmds = [c for c in commands if "pull" in c]
-        assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        call = hm._test_pinned_apply_calls[0]
+        assert call[2] == "refs/heads/main"
+        assert call[3] == "a" * 40
+        assert call[4] == "b" * 40
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_update_already_up_to_date(
         self, mock_run, _mock_which, mock_args, capsys
     ):
+        from hermes_cli import main as hm
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="0"
         )
-
-        with patch("hermes_cli.managed_uv.update_managed_uv") as mock_uv_update, \
+        with patch.object(hm, "_git_update_commit_sha", return_value="a" * 40), \
+             patch("hermes_cli.managed_uv.update_managed_uv") as mock_uv_update, \
              patch(
                  "hermes_cli.managed_uv.ensure_uv",
                  return_value=None,
@@ -368,6 +432,7 @@ class TestCmdUpdateBranchFallback:
 
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
+        assert hm._test_pinned_apply_calls == []
         update_observer = mock_uv_update.call_args.kwargs["repair_observer"]
         ensure_observer = mock_uv_ensure.call_args.kwargs["repair_observer"]
         assert update_observer.__self__ is ensure_observer.__self__
@@ -383,6 +448,7 @@ class TestCmdUpdateBranchFallback:
     def test_zero_commit_runtime_repair_requires_process_restart(
         self, mock_run, _mock_which, mock_args, capsys, tmp_path
     ):
+        from hermes_cli import main as hm
         from hermes_cli.managed_uv import RuntimeRepairResult
 
         mock_run.side_effect = _make_run_side_effect(
@@ -400,7 +466,7 @@ class TestCmdUpdateBranchFallback:
             repair_observer(repair)
             return "/managed/uv"
 
-        with patch(
+        with patch.object(hm, "_git_update_commit_sha", return_value="a" * 40), patch(
             "hermes_cli.managed_uv.update_managed_uv",
             side_effect=fake_update,
         ), patch(
@@ -419,33 +485,39 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_update_on_fork_checks_upstream_when_origin_up_to_date(
-        self, mock_run, _mock_which, mock_args, capsys
+    def test_update_on_fork_pins_upstream_before_apply_and_pushes_exact_sha(
+        self, mock_run, _mock_which, mock_args
     ):
-        """Regression for issue #26172: forks whose local HEAD already matches
-        origin/main must still consult upstream/main before printing
-        "Already up to date!" — otherwise a fork that's caught up to its own
-        origin but behind NousResearch/hermes-agent silently misses updates.
-        """
         from hermes_cli import main as hm
 
+        origin_sha = "a" * 40
+        upstream_sha = "c" * 40
         mock_run.side_effect = _make_run_side_effect(
-            branch="main", verify_ok=True, commit_count="0"
+            branch="main", verify_ok=True, commit_count="3"
         )
-
+        fork_plan = {
+            "target_sha": upstream_sha,
+            "origin_sha": origin_sha,
+            "sync_needed": True,
+            "error": None,
+        }
         with patch.object(
-            hm,
-            "_get_origin_url",
-            return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
+            hm, "_get_origin_url", return_value="https://github.com/example/hermes-agent.git"
+        ), patch.object(
+            hm, "_pin_fork_upstream_target", return_value=fork_plan
+        ) as pin_mock, patch.object(
+            hm, "_push_pinned_fork_target", return_value=True
+        ) as push_mock, patch.object(
+            hm, "_git_update_commit_sha", return_value=origin_sha
+        ):
             cmd_update(mock_args)
 
-        expected_git_cmd = (
-            ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
+        expected_git = ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
+        pin_mock.assert_called_once_with(expected_git, PROJECT_ROOT, origin_sha)
+        assert hm._test_pinned_apply_calls[0][4] == upstream_sha
+        push_mock.assert_called_once_with(
+            expected_git, PROJECT_ROOT, upstream_sha, origin_sha
         )
-        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
-        captured = capsys.readouterr()
-        assert "Already up to date!" in captured.out
 
     @patch("shutil.which")
     @patch("subprocess.run")
@@ -774,102 +846,64 @@ class TestCmdUpdateBranchFlag:
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_branch_flag_pulls_against_named_branch(self, mock_run, _mock_which, capsys):
-        """--branch bb/gui makes rev-list and pull target origin/bb/gui."""
+        from hermes_cli import main as hm
         mock_run.side_effect = self._branch_side_effect(
             current_branch="bb/gui", target_branch="bb/gui", commit_count="3"
         )
-        args = SimpleNamespace(branch="bb/gui")
-
-        cmd_update(args)
-
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-
-        # rev-list must compare against origin/bb/gui, not origin/main
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert any("origin/bb/gui" in c for c in rev_list_cmds), rev_list_cmds
-        assert not any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
-
-        # pull must target bb/gui
-        pull_cmds = [c for c in commands if "pull" in c and "ff-only" in c]
-        assert any("bb/gui" in c and "main" not in c.split() for c in pull_cmds), pull_cmds
+        cmd_update(SimpleNamespace(branch="bb/gui"))
+        call = hm._test_pinned_apply_calls[0]
+        assert call[2] == "refs/heads/bb/gui"
+        assert call[5] == "refs/heads/bb/gui"
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_branch_flag_defaults_to_main_when_none(self, mock_run, _mock_which, capsys):
-        """No --branch (or --branch=None) preserves the historical 'main' default."""
+        from hermes_cli import main as hm
         mock_run.side_effect = self._branch_side_effect(
-            current_branch="main", target_branch="main", commit_count="0"
+            current_branch="main", target_branch="main", commit_count="1"
         )
-        args = SimpleNamespace(branch=None)
-
-        cmd_update(args)
-
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert all("origin/main" in c for c in rev_list_cmds), rev_list_cmds
+        cmd_update(SimpleNamespace(branch=None))
+        assert hm._test_pinned_apply_calls[0][2] == "refs/heads/main"
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_branch_flag_switches_from_different_branch(self, mock_run, _mock_which, capsys):
-        """When HEAD is on main and --branch=bb/gui, switch to bb/gui first."""
+        from hermes_cli import main as hm
         mock_run.side_effect = self._branch_side_effect(
             current_branch="main", target_branch="bb/gui", commit_count="2"
         )
-        args = SimpleNamespace(branch="bb/gui")
-
-        cmd_update(args)
-
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # First checkout call should switch us to bb/gui (not -B; happy-path branch exists locally)
-        checkout_cmds = [c for c in commands if "checkout" in c and "rev-parse" not in c]
-        assert len(checkout_cmds) >= 1
-        assert "bb/gui" in checkout_cmds[0]
-
-        out = capsys.readouterr().out
-        assert "switching to bb/gui" in out
+        cmd_update(SimpleNamespace(branch="bb/gui"))
+        call = hm._test_pinned_apply_calls[0]
+        assert call[2] == "refs/heads/bb/gui"
+        assert call[5] == "refs/heads/main"
+        assert "pinned checkout" in capsys.readouterr().out
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_branch_flag_tracks_remote_when_branch_absent_locally(self, mock_run, _mock_which, capsys):
-        """If local lacks the branch but origin has it, fall back to ``checkout -B``."""
+        from hermes_cli import main as hm
         mock_run.side_effect = self._branch_side_effect(
-            current_branch="main",
-            target_branch="bb/gui",
-            checkout_fails=True,  # plain checkout fails
-            track_fails=False,    # -B from origin/bb/gui succeeds
-            commit_count="2",
+            current_branch="main", target_branch="bb/gui", commit_count="2"
         )
-        args = SimpleNamespace(branch="bb/gui")
-
-        cmd_update(args)
-
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have BOTH a failed `checkout bb/gui` AND a successful `checkout -B bb/gui origin/bb/gui`
-        track_cmds = [c for c in commands if "checkout" in c and "-B" in c]
-        assert len(track_cmds) == 1
-        assert "bb/gui" in track_cmds[0]
-        assert "origin/bb/gui" in track_cmds[0]
+        cmd_update(SimpleNamespace(branch="bb/gui"))
+        call = hm._test_pinned_apply_calls[0]
+        assert call[2] == "refs/heads/bb/gui"
+        assert call[3] is None
+        assert call[4] == "b" * 40
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_branch_flag_fails_when_branch_missing_everywhere(self, mock_run, _mock_which, capsys):
-        """If branch doesn't exist locally OR on origin, exit non-zero with clear error."""
+        from hermes_cli import main as hm
         mock_run.side_effect = self._branch_side_effect(
-            current_branch="main",
-            target_branch="nonexistent",
-            checkout_fails=True,
-            track_fails=True,
-            commit_count="0",
+            current_branch="main", target_branch="nonexistent", commit_count="0"
         )
-        args = SimpleNamespace(branch="nonexistent")
-
         with pytest.raises(SystemExit) as exc_info:
-            cmd_update(args)
+            cmd_update(SimpleNamespace(branch="nonexistent"))
         assert exc_info.value.code == 1
-
+        assert hm._test_pinned_apply_calls == []
         out = capsys.readouterr().out
-        assert "does not exist locally or on origin" in out
-        assert "nonexistent" in out
+        assert "refs/remotes/origin/nonexistent" in out
 
 
 class TestCmdUpdateCheckBranchFlag:
@@ -1236,3 +1270,76 @@ class TestNodeRuntimeNpmResolution:
             not call.args or not call.args[0] or call.args[0][0] != windows_npm
             for call in mock_run.call_args_list
         )
+
+
+def test_pin_fork_upstream_target_uses_pinned_shas(monkeypatch, tmp_path):
+    from hermes_cli import main as hm
+
+    origin_sha = "a" * 40
+    upstream_sha = "b" * 40
+    fetches = []
+
+    def fake_run(cmd, **kwargs):
+        fetches.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hm, "_has_upstream_remote", lambda *a: True)
+    monkeypatch.setattr(hm.subprocess, "run", fake_run)
+    monkeypatch.setattr(hm, "_git_update_commit_sha", lambda _g, _r, ref: upstream_sha)
+    merge_calls = []
+    monkeypatch.setattr(
+        hm,
+        "_ensure_update_merge_base",
+        lambda *a, **kw: merge_calls.append((a, kw)) or {
+            "merge_base": origin_sha,
+            "error": None,
+            "fetch_steps": [],
+        },
+    )
+    count_calls = []
+    def count(_g, _r, base, head):
+        count_calls.append((base, head))
+        return 0 if (base, head) == (upstream_sha, origin_sha) else 3
+    monkeypatch.setattr(hm, "_count_commits_between", count)
+
+    result = hm._pin_fork_upstream_target(["git"], tmp_path, origin_sha)
+
+    assert result == {
+        "target_sha": upstream_sha,
+        "origin_sha": origin_sha,
+        "sync_needed": True,
+        "error": None,
+    }
+    assert ["git", "fetch", "upstream", "main:refs/remotes/upstream/main", "--quiet"] in fetches
+    assert merge_calls[0][0][3:] == (origin_sha, upstream_sha)
+    assert merge_calls[0][1] == {"remote": "upstream"}
+    assert count_calls == [
+        (upstream_sha, origin_sha),
+        (origin_sha, upstream_sha),
+    ]
+
+
+def test_push_pinned_fork_target_uses_exact_refspec_and_lease(monkeypatch, tmp_path):
+    from hermes_cli import main as hm
+
+    target_sha = "b" * 40
+    origin_sha = "a" * 40
+    calls = []
+    monkeypatch.setattr(
+        hm.subprocess,
+        "run",
+        lambda cmd, **kwargs: calls.append((cmd, kwargs))
+        or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+
+    assert hm._push_pinned_fork_target(["git"], tmp_path, target_sha, origin_sha)
+    assert calls == [(
+        [
+            "git",
+            "push",
+            "origin",
+            f"{target_sha}:refs/heads/main",
+            f"--force-with-lease=refs/heads/main:{origin_sha}",
+        ],
+        {"cwd": tmp_path, "capture_output": True, "text": True},
+    )]
