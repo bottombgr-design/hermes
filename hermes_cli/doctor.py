@@ -861,7 +861,28 @@ def run_doctor(args):
         try:
             import yaml as _yaml
             cfg = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            model_section = cfg.get("model") or {}
+            # Coerce legacy/root-level shapes into the canonical nested mapping
+            # before reading. Every other config consumer (cli.py, config.py,
+            # managed_scope.py) runs this migration on load, so a config like
+            # ``model: <id>`` + root ``provider:`` resolves fine at runtime.
+            # Doctor read the raw YAML instead, so a scalar ``model:`` left
+            # ``model_section`` a str and the first ``.get()`` raised
+            # AttributeError — silently discarding every check in this block
+            # (unknown provider, vendor-prefixed id, missing API key) behind the
+            # generic "Could not validate model/provider config" warning. See
+            # #71019.
+            try:
+                from hermes_cli.config import _normalize_root_model_keys
+
+                cfg = _normalize_root_model_keys(cfg)
+            except Exception:
+                pass
+            model_section = cfg.get("model")
+            # Defence in depth: a hand-written ``model:`` that is neither a
+            # mapping nor a migratable scalar (a list, say) must not take the
+            # whole block down with it.
+            if not isinstance(model_section, dict):
+                model_section = {}
             provider_raw = (model_section.get("provider") or "").strip()
             provider = provider_raw.lower()
             default_model = (model_section.get("default") or model_section.get("model") or "").strip()
