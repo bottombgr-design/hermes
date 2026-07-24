@@ -2355,6 +2355,16 @@ def _redact_process_result(result: dict) -> dict:
     pass through ``redact_terminal_output`` which picks ``code_file`` based on
     the recorded command (env dumps get the ENV-assignment pass). The command
     string itself is also redacted in case it carried an inline credential.
+
+    Also invokes the ``transform_terminal_output`` plugin hook on the output
+    fields so plugins can reshape background-process output the same way they
+    can for foreground terminal output — issue #70760 (the hook was only
+    called on the foreground path, never on any background one). Every
+    background action returns through here, so ``poll``, ``wait``, ``log``, and
+    ``kill`` are covered by the single call site. ``returncode`` is None while
+    a process has not exited. The hook is fail-open (first valid string return
+    wins); exceptions are swallowed so a misbehaving plugin can't break
+    process polling.
     """
     if not isinstance(result, dict):
         return result
@@ -2367,6 +2377,43 @@ def _redact_process_result(result: dict) -> dict:
             result[field] = redact_terminal_output(value, command)
     if isinstance(result.get("command"), str) and result["command"]:
         result["command"] = redact_sensitive_text(result["command"], code_file=True)
+
+    # Invoke transform_terminal_output plugin hook on the (already-redacted)
+    # output fields, mirroring the foreground terminal path (terminal_tool.py
+    # ~line 2801). Without this, plugins that register transform_terminal_output
+    # — e.g. output-canonicalization / token-saving proxies — only fire on
+    # foreground commands and silently miss every background result, which is
+    # the default terminal path for persistent-shell users (#70760). Every
+    # background action reaches the model through this one seam, so poll, wait,
+    # log, and kill are all covered. The hook is fail-open: the first valid
+    # string return wins, and exceptions are swallowed so a broken plugin can't
+    # block process polling — same contract as the foreground path.
+    try:
+        from hermes_cli.plugins import invoke_hook
+        # ``exit_code`` is only present once the process has exited, so a poll
+        # on a running process and every ``log`` read have none. Pass that
+        # through as None instead of defaulting to 0, which would tell a plugin
+        # the command succeeded when it has not finished at all.
+        returncode = result.get("exit_code")
+        for field in ("output", "output_preview"):
+            value = result.get(field)
+            if not isinstance(value, str) or not value:
+                continue
+            hook_results = invoke_hook(
+                "transform_terminal_output",
+                command=command,
+                output=value,
+                returncode=returncode,
+                task_id="",
+                env_type="",
+            )
+            for hook_result in hook_results:
+                if isinstance(hook_result, str):
+                    result[field] = hook_result
+                    break
+    except Exception:
+        pass
+
     return result
 
 
