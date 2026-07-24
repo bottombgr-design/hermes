@@ -1102,6 +1102,7 @@ export const ar = defineLocale({
       connected: 'متصل',
       connecting: 'جار الاتصال',
       disabled: 'معطّل',
+      enabled: 'مفعّل',
       fatal: 'خطأ',
       gateway_stopped: 'تم إيقاف بوابة المراسلة',
       not_configured: 'يحتاج إعدادا',
