@@ -1453,6 +1453,11 @@ DEFAULT_CONFIG = {
                                       # episodic break instead of a tiny break every
                                       # tool iteration. 0 = commit any non-zero prune.
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
+        # Absolute token count at which the gateway nudges the user to rotate
+        # the session (0 = off). Chat surfaces show no context meter, so a
+        # 400k thread looks like a 40k one; a ratio of the context window is
+        # useless here because 95% of a 1M model is 950k. Opt-in, cooldowned.
+        "rotate_hint_tokens": 0,
         "hygiene_timeout_seconds": 30,  # max seconds gateway waits for pre-agent hygiene compression
         "hygiene_failure_cooldown_seconds": 300,  # skip repeated failed hygiene attempts for this session
         "protect_first_n": 3,         # non-system head messages always preserved
