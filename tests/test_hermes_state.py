@@ -639,10 +639,12 @@ class TestSessionLifecycle:
 
     def test_update_session_model_clears_browser_lock_and_preserves_lineage(self, db):
         """A later /model switch must replace, not compete with, a Browser lock."""
+        shared_prompt = "Model: x-ai/grok-4.5\nProvider: nous"
         db.create_session(
             session_id="s1",
             source="hermes_browser",
             model="x-ai/grok-4.5",
+            system_prompt=shared_prompt,
             model_config={
                 "_branched_from": "parent-session",
                 "browser_model_lock": {
@@ -652,14 +654,56 @@ class TestSessionLifecycle:
                 },
             },
         )
+        db.create_session(
+            session_id="s2",
+            source="cli",
+            system_prompt=shared_prompt,
+        )
 
         db.update_session_model("s1", "anthropic/claude-opus-4.8")
 
         session = db.get_session("s1")
         model_config = json.loads(session["model_config"])
         assert session["model"] == "anthropic/claude-opus-4.8"
+        assert session["system_prompt"] is None
         assert "browser_model_lock" not in model_config
         assert model_config["_branched_from"] == "parent-session"
+        assert db.get_session("s2")["system_prompt"] == shared_prompt
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM system_prompts"
+        ).fetchone()[0] == 1
+
+    def test_update_session_runtime_lock_invalidates_normalized_prompt(self, db):
+        """A Browser/API model lock must not leave a stale prompt hash hydrated."""
+        db.create_session(
+            session_id="s1",
+            source="hermes_browser",
+            model="gpt-5.5",
+            model_config={"_branched_from": "parent-session"},
+            system_prompt="Model: gpt-5.5\nProvider: openai-codex",
+        )
+
+        db.update_session_runtime_lock(
+            "s1",
+            model="x-ai/grok-4.5",
+            provider="nous",
+            confirmed=True,
+        )
+
+        session = db.get_session("s1")
+        model_config = json.loads(session["model_config"])
+        assert session["model"] == "x-ai/grok-4.5"
+        assert session["system_prompt"] is None
+        assert model_config["_branched_from"] == "parent-session"
+        assert model_config["browser_model_lock"]["provider"] == "nous"
+        raw = db._conn.execute(
+            "SELECT system_prompt, system_prompt_hash FROM sessions WHERE id = 's1'"
+        ).fetchone()
+        assert raw["system_prompt"] is None
+        assert raw["system_prompt_hash"] is None
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM system_prompts"
+        ).fetchone()[0] == 0
 
     def test_update_session_billing_route_overwrites_after_switch(self, db):
         """A mid-session provider switch must overwrite the billing route.

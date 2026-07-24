@@ -4466,10 +4466,10 @@ class SessionDB:
         Unlike ``update_token_counts`` which uses ``COALESCE(model, ?)``
         (only filling in NULL), this unconditionally sets the model column
         so that the dashboard reflects the user's latest /model choice.
-        Also nulls ``system_prompt`` so stale ``Model:`` / ``Provider:``
-        footer metadata is rebuilt on the next turn. A successful /model
-        switch explicitly replaces any confirmed Browser runtime lock while
-        preserving unrelated lineage markers in ``model_config``.
+        Also clears the normalized system-prompt reference so stale ``Model:`` /
+        ``Provider:`` footer metadata is rebuilt on the next turn. A successful
+        /model switch explicitly replaces any confirmed Browser runtime lock
+        while preserving unrelated lineage markers in ``model_config``.
         """
         def _do(conn):
             conn.execute(
@@ -4481,10 +4481,12 @@ class SessionDB:
                            THEN json_remove(model_config, '$.browser_model_lock')
                        ELSE model_config
                    END,
-                   system_prompt = NULL
+                   system_prompt = NULL,
+                   system_prompt_hash = NULL
                    WHERE id = ?""",
                 (model, session_id),
             )
+            self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
     def update_session_runtime_lock(
@@ -4500,8 +4502,9 @@ class SessionDB:
         """Persist a Browser / API client runtime lock without clobbering lineage markers.
 
         Merges ``browser_model_lock`` into the existing ``model_config`` JSON so
-        ``_branched_from`` / ``_delegate_from`` survive. Nulls ``system_prompt``
-        so cached ``Model:`` / ``Provider:`` footers cannot lie after a switch.
+        ``_branched_from`` / ``_delegate_from`` survive. Clears the normalized
+        system-prompt reference so cached ``Model:`` / ``Provider:`` footers
+        cannot lie after a switch.
         """
         lock = {
             "provider": provider or "",
@@ -4535,10 +4538,12 @@ class SessionDB:
                 """UPDATE sessions SET
                    model_config = ?,
                    model = COALESCE(?, model),
-                   system_prompt = NULL
+                   system_prompt = NULL,
+                   system_prompt_hash = NULL
                    WHERE id = ?""",
                 (json.dumps(config), model, session_id),
             )
+            self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
     def update_session_billing_route(
