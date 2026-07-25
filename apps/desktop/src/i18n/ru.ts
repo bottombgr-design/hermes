@@ -1180,6 +1180,158 @@ export const ru = defineLocale({
         save: 'Сохранить',
         saving: 'Сохранение…',
         cancel: 'Отмена'
+      },
+      state: {
+        notice: {
+          loggedOut: {
+            title: 'Подключите ваш аккаунт Nous',
+            message: 'Запустите /portal в TUI или откройте портал Nous, чтобы подключить аккаунт.',
+            action: 'Открыть портал ↗'
+          },
+          noCard: {
+            title: 'Нет привязанной карты',
+            message:
+              'Покупка пополняемых кредитов и автопополнение недоступны, пока не привязана карта. Добавьте её на портале.',
+            action: 'Добавить карту ↗'
+          }
+        },
+        paymentMethod: {
+          title: 'Способ оплаты',
+          description: 'Управление картой для пополнений и продления подписки.',
+          addAction: 'Добавить способ оплаты',
+          updateAction: 'Обновить'
+        },
+        buyCredits: {
+          description: 'Одноразовое списание с вашей карты — средства сразу поступают на баланс.'
+        },
+        autoRefill: {
+          title: 'Автопополнение',
+          genericDescription: 'Баланс будет автоматически пополняться при снижении ниже порога.',
+          offPill: 'Выкл',
+          enabledPill: 'Вкл',
+          notAvailablePill: '—',
+          manageCaption: 'Управляйте автопополнением через портал.',
+          turnOnCaption: 'Включите автопополнение через портал',
+          chargesDescription: (reloadTo: string, threshold: string) =>
+            `Списывается ${reloadTo} автоматически, когда баланс падает ниже ${threshold}.`,
+          distinctCardCaption: (cardLabel: string) =>
+            `Автопополнение списывает с ${cardLabel} — сверьте на портале`,
+          distinctCardFallback: 'другой карты',
+          reconcileAction: 'Сверить ↗'
+        },
+        usage: {
+          subscriptionCredits: {
+            title: 'Кредиты подписки',
+            barLabel: 'Остаток кредитов подписки',
+            captionResets: (date: string) => `Обновляются ${date}`,
+            valueOf: (remaining: string, monthly: string) => `${remaining} из ${monthly} осталось`,
+            valueOver: (remaining: string, monthly: string, over: string) =>
+              `${remaining} из ${monthly} осталось · перерасход ${over}`
+          },
+          topupCredits: {
+            title: 'Пополняемые кредиты',
+            caption: 'Не сгорают'
+          },
+          monthlyCap: {
+            title: 'Месячный лимит расходов',
+            barLabel: 'Использовано месячного лимита',
+            captionDefault: 'Лимит по умолчанию',
+            captionSpending: 'Месячные удалённые расходы',
+            valueUsed: (spent: string, limit: string) => `${spent} из ${limit} использовано`
+          }
+        },
+        planCard: {
+          freeTier: 'Бесплатный',
+          chooseAction: 'Выбрать ↗',
+          adjustPlanAction: 'Изменить тариф ↗',
+          unavailableCaption:
+            'Данные подписки недоступны; портал по-прежнему открыт.',
+          downgradeCaption: (tierName: string, when: string) => `Переход на ${tierName} с ${when}.`,
+          cancellationCaption: (when: string) => `Отмена с ${when}.`,
+          renewsCaption: (date: string) => `Продлевается ${date}`,
+          noSubscriptionCaption:
+            'Нет активной подписки — платные модели расходуют пополняемые кредиты.'
+        }
+      },
+      errors: {
+        consentRequired: {
+          title: 'Требуется подтверждение карты',
+          message: 'Подтвердите эту карту для терминальных списаний на портале'
+        },
+        insufficientScope: {
+          title: 'Удалённые расходы требуют разрешения',
+          message:
+            'Необходимо разрешить удалённые расходы. Начните пополнение, чтобы разрешить, затем повторите.'
+        },
+        remoteSpendingRevoked: {
+          title: 'Удалённые расходы остановлены',
+          messageByAdmin: 'Администратор остановил удалённые расходы для этого терминала.',
+          messageBySelf: 'Вы остановили удалённые расходы для этого терминала.'
+        },
+        sessionRevoked: {
+          title: 'Сессия завершена',
+          message: 'Ваша сессия была завершена. Войдите снова: Настройки → Шлюз.'
+        },
+        cliBillingDisabled: {
+          title: 'Удалённые расходы отключены',
+          message:
+            'Удалённые расходы отключены для этого аккаунта — администратор биллинга может включить их на странице Hermes Agent портала.'
+        },
+        roleRequired: {
+          title: 'Требуется роль администратора',
+          message:
+            'Для пополнения нужны права администратора или владельца организации. Обратитесь к администратору или управляйте через портал.'
+        },
+        idempotencyConflict: {
+          title: 'Начните новое пополнение',
+          message: '🔴 Этот ключ списания уже использован для другой суммы. Начните новое пополнение.'
+        },
+        noPaymentMethod: {
+          title: 'Нет сохранённой карты',
+          message:
+            '💳 Пока нет сохранённой карты для терминальных списаний. Настройте её на портале ' +
+            '(разовые покупки кредитов не сохраняют карту).'
+        },
+        orgAccessDenied: {
+          title: 'Доступ к организации запрещён',
+          message: 'Этот токен не привязан к организации, которой вы можете управлять'
+        },
+        monthlyCapExceeded: {
+          title: 'Достигнут месячный лимит расходов',
+          messageReached: '🔴 Достигнут месячный лимит расходов.',
+          messageHeadroom: (remaining: string) =>
+            `🔴 Достигнут месячный лимит расходов — осталось $${remaining}.`
+        },
+        rateLimited: {
+          title: 'Слишком много списаний',
+          message: (mins: string) =>
+            `🟡 Слишком много списаний прямо сейчас${mins}. Это не ошибка платежа.`
+        },
+        stripeUnavailable: {
+          title: 'Проблемы с Stripe',
+          message: (mins: string) => `Stripe испытывает трудности — повторите позже${mins}`
+        },
+        upgradeCapExceeded: {
+          title: 'Достигнут дневной лимит смены тарифа',
+          message: 'Достигнут дневной лимит смены тарифа — попробуйте завтра'
+        },
+        endpointUnavailable: {
+          title: 'Эндпоинт биллинга недоступен',
+          message:
+            'Эндпоинт биллинга вернул не-JSON ответ (возможно, он недоступен на этом развёртывании).'
+        },
+        timeout: {
+          title: 'Таймаут запроса биллинга',
+          message: 'Истекло время ожидания запроса биллинга.'
+        },
+        transport: {
+          title: 'Сбой соединения биллинга',
+          message: 'Запрос биллинга не достиг шлюза.'
+        },
+        default: {
+          title: 'Сбой запроса биллинга',
+          message: 'Запрос биллинга не удался.'
+        }
       }
     },
     providers: {

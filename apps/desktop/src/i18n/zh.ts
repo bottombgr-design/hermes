@@ -1112,6 +1112,147 @@ export const zh: Translations = {
         save: '保存',
         saving: '保存中…',
         cancel: '取消'
+      },
+      state: {
+        notice: {
+          loggedOut: {
+            title: '连接您的 Nous 账户',
+            message: '在 TUI 中运行 /portal 或打开 Nous 门户以连接您的账户。',
+            action: '打开门户 ↗'
+          },
+          noCard: {
+            title: '未绑定支付方式',
+            message: '在绑定银行卡之前，充值购买和自动充值将保持禁用。请在门户中添加一张卡。',
+            action: '添加银行卡 ↗'
+          }
+        },
+        paymentMethod: {
+          title: '支付方式',
+          description: '管理用于充值和订阅续费的银行卡。',
+          addAction: '添加支付方式',
+          updateAction: '更新'
+        },
+        buyCredits: {
+          description: '单次从您的卡中扣款，立即计入您的余额。'
+        },
+        autoRefill: {
+          title: '余额不足时自动充值',
+          genericDescription: '当余额低于阈值时自动为您充值。',
+          offPill: '关',
+          enabledPill: '开',
+          notAvailablePill: '—',
+          manageCaption: '通过门户管理自动充值。',
+          turnOnCaption: '通过门户开启自动充值',
+          chargesDescription: (reloadTo: string, threshold: string) =>
+            `余额低于 ${threshold} 时自动充值 ${reloadTo}。`,
+          distinctCardCaption: (cardLabel: string) =>
+            `自动充值从 ${cardLabel} 扣款 — 请在门户核实`,
+          distinctCardFallback: '另一张卡',
+          reconcileAction: '核实 ↗'
+        },
+        usage: {
+          subscriptionCredits: {
+            title: '订阅额度',
+            barLabel: '订阅额度剩余',
+            captionResets: (date: string) => `${date} 重置`,
+            valueOf: (remaining: string, monthly: string) => `${monthly} 中剩余 ${remaining}`,
+            valueOver: (remaining: string, monthly: string, over: string) =>
+              `${monthly} 中剩余 ${remaining} · 超出 ${over}`
+          },
+          topupCredits: {
+            title: '充值额度',
+            caption: '永不过期'
+          },
+          monthlyCap: {
+            title: '月度消费上限',
+            barLabel: '月度消费上限已使用',
+            captionDefault: '默认上限',
+            captionSpending: '月度远程消费',
+            valueUsed: (spent: string, limit: string) => `${limit} 中已使用 ${spent}`
+          }
+        },
+        planCard: {
+          freeTier: '免费',
+          chooseAction: '选择 ↗',
+          adjustPlanAction: '调整方案 ↗',
+          unavailableCaption: '订阅详情不可用；仍可打开门户。',
+          downgradeCaption: (tierName: string, when: string) => `将于 ${when} 变更为 ${tierName}。`,
+          cancellationCaption: (when: string) => `将于 ${when} 取消。`,
+          renewsCaption: (date: string) => `${date} 续期`,
+          noSubscriptionCaption: '无活跃订阅 — 付费模型将消耗充值额度。'
+        }
+      },
+      errors: {
+        consentRequired: {
+          title: '需要确认银行卡',
+          message: '请在门户中确认此卡以进行终端扣款'
+        },
+        insufficientScope: {
+          title: '远程消费需要批准',
+          message: '需要允许远程消费。发起一次充值以启用，然后重试。'
+        },
+        remoteSpendingRevoked: {
+          title: '远程消费已停止',
+          messageByAdmin: '管理员已停止此终端的远程消费。',
+          messageBySelf: '您已停止此终端的远程消费。'
+        },
+        sessionRevoked: {
+          title: '会话已注销',
+          message: '您的会话已注销。请通过设置 → 网关重新登录。'
+        },
+        cliBillingDisabled: {
+          title: '远程消费已关闭',
+          message: '此账户的远程消费已关闭 — 账单管理员可在门户的 Hermes Agent 页面开启。'
+        },
+        roleRequired: {
+          title: '需要管理员角色',
+          message: '充值需要组织管理员/所有者权限。请联系管理员，或在门户中操作。'
+        },
+        idempotencyConflict: {
+          title: '发起新的充值',
+          message: '🔴 该扣款密钥已用于其他金额。请发起新的充值。'
+        },
+        noPaymentMethod: {
+          title: '未保存银行卡',
+          message: '💳 尚未保存用于终端扣款的银行卡。请在门户中设置 ' + '（一次性购买额度不会保存可复用的卡）。'
+        },
+        orgAccessDenied: {
+          title: '组织访问被拒绝',
+          message: '此令牌未绑定到您可以管理的组织'
+        },
+        monthlyCapExceeded: {
+          title: '已达到月度消费上限',
+          messageReached: '🔴 已达到月度消费上限。',
+          messageHeadroom: (remaining: string) => `🔴 已达到月度消费上限 — 剩余 $${remaining}。`
+        },
+        rateLimited: {
+          title: '当前扣款次数过多',
+          message: (mins: string) => `🟡 当前扣款次数过多${mins}。这不是支付失败。`
+        },
+        stripeUnavailable: {
+          title: 'Stripe 出现问题',
+          message: (mins: string) => `Stripe 出现问题 — 请稍后重试${mins}`
+        },
+        upgradeCapExceeded: {
+          title: '已达到每日方案变更上限',
+          message: '已达到每日方案变更上限 — 请明天再试'
+        },
+        endpointUnavailable: {
+          title: '账单端点不可用',
+          message: '账单端点返回了非 JSON 响应（可能在此部署上不可用）。'
+        },
+        timeout: {
+          title: '账单请求超时',
+          message: '账单请求超时。'
+        },
+        transport: {
+          title: '账单连接失败',
+          message: '账单请求在到达网关前失败。'
+        },
+        default: {
+          title: '账单请求失败',
+          message: '账单请求失败。'
+        }
       }
     },
     providers: {
