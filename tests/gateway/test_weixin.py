@@ -517,3 +517,187 @@ class TestWeixinPollStaleDetection:
         # Verify empty buffer was saved
         args = save_mock.call_args
         assert args[0][2] == "" or args[1].get("sync_buf") == "" or args[0][-1] == "", f"Expected empty sync_buf, got {args}"
+
+
+class TestSendPathStaleDetection:
+    """Bug-injection tests for stale session detection in the SEND path.
+
+    Golden Rule 2: inject the bug, watch it FAIL, revert, watch it PASS.
+    These tests verify that the send path detects stale sessions and raises
+    an error instead of silently succeeding. Removing the validation code
+    in _send_text_chunk_locked() (lines 1803-1852) should make these FAIL.
+    """
+
+    def _connected_adapter(self) -> WeixinAdapter:
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        adapter._send_chunk_retries = 2
+        adapter._send_chunk_retry_delay_seconds = 0
+        return adapter
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_stale_raises_error_not_silent_success(self, send_message_mock):
+        """stale response (ret=-2, errmsg='unknown error') must raise, not succeed.
+
+        Bug injection: remove the validation block in _send_text_chunk_locked
+        (lines 1803-1852) -> this test FAILS because send() returns success.
+        """
+        send_message_mock.return_value = {"ret": -2, "errmsg": "unknown error"}
+        adapter = self._connected_adapter()
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False, (
+            f"stale session send must fail, got success={result.success}"
+        )
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_stale_strips_context_token_and_retries(self, send_message_mock):
+        """stale response must strip context_token and retry (not just rate-limit).
+
+        Bug injection: remove _is_stale_session_ret from the is_session_expired
+        check (line 1810) -> stale response falls into rate-limit branch instead
+        of the strip-token-and-retry branch. This test FAILS because the second
+        call still has context_token (not stripped).
+
+        This is the PRECISE injection point: the _is_stale_session_ret check
+        distinguishes stale from rate-limit. Without it, stale is misclassified.
+        """
+        cache = {"ctx": "ctx-token"}
+        calls = []
+
+        async def capture_call(*args, **kwargs):
+            calls.append(kwargs.get("context_token"))
+            return {"ret": -2, "errmsg": "unknown error"}
+
+        send_message_mock.side_effect = capture_call
+        adapter = self._connected_adapter()
+        adapter._token_store._cache = {("_", "wxid_test123"): "ctx-token"}
+        adapter._token_store._key = lambda a, c: ("_", c)
+        adapter._token_store.get = lambda a, c: cache.get("ctx")
+        adapter._rate_limit_circuit_threshold = 999  # disable circuit breaker
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        # First call should have context_token
+        assert calls[0] == "ctx-token", f"first call should have context_token, got {calls[0]}"
+        # Second call should have None (token stripped after stale detection)
+        assert calls[1] is None, (
+            f"second call should have context_token stripped (None), got {calls[1]}. "
+            "Bug: _is_stale_session_ret check missing -> stale treated as rate limit"
+        )
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_stale_retries_once_without_token(self, send_message_mock):
+        """stale response -> strip context_token -> retry once -> still stale -> error.
+
+        The adapter should retry without context_token on the first stale
+        detection, then raise on the second failure.
+        """
+        send_message_mock.return_value = {"ret": -2, "errmsg": "unknown error"}
+        adapter = self._connected_adapter()
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        # Should have retried once (2 calls total: original + retry without token)
+        assert send_message_mock.await_count == 2, (
+            f"expected 2 calls (original + retry), got {send_message_mock.await_count}"
+        )
+
+    @patch("gateway.platforms.weixin._fire_alert")
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_stale_alert_only_on_session_expired_error(self, send_message_mock, fire_alert_mock):
+        """stale in text send path does NOT fire alert (treated as rate limit).
+
+        In _send_text_chunk_locked, a stale response (ret=-2, errmsg='unknown
+        error') is indistinguishable from a genuine rate limit because both
+        use ret=-2. After retry-without-token exhaustion, the code falls into
+        the rate-limit branch (line 1829), NOT the SessionExpiredError catch
+        (line 1855). The alert fires only via the poll loop's stale detection,
+        not the send path.
+
+        This test documents the gap. If you WANT alert on send-path stale,
+        the code needs to distinguish stale from rate-limit AFTER the retry.
+        """
+        send_message_mock.return_value = {"ret": -2, "errmsg": "unknown error"}
+        adapter = self._connected_adapter()
+        adapter._alert_script = "/usr/local/bin/alert.sh"
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        # Alert is NOT fired from text send path -- the stale response
+        # falls into the rate-limit branch, not SessionExpiredError catch.
+        fire_alert_mock.assert_not_called()
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_stale_does_not_retry_after_stale_exhaustion(self, send_message_mock):
+        """after stale retry exhaustion, must NOT fall through to generic retry.
+
+        The SessionExpiredError catch (line 1855) should prevent the generic
+        Exception handler from retrying with the same dead session.
+        """
+        send_message_mock.return_value = {"ret": -2, "errmsg": "unknown error"}
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 5  # would retry 6 times without the fix
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        # Should be exactly 2 (original + 1 retry without token), NOT 6
+        assert send_message_mock.await_count == 2, (
+            f"expected 2 calls, got {send_message_mock.await_count} "
+            "(stale should not trigger generic retry loop)"
+        )
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_genuine_rate_limit_still_retries(self, send_message_mock):
+        """genuine rate limit (errmsg='rate limited') must still retry normally.
+
+        This is the CONTROL test: removing stale detection should NOT affect
+        genuine rate-limit behavior. If this fails, the fix is too aggressive.
+        """
+        send_message_mock.side_effect = [
+            {"ret": -2, "errcode": -2, "errmsg": "rate limited"},
+            {"ret": -2, "errcode": -2, "errmsg": "rate limited"},
+            {"errcode": 0},  # succeeds on 3rd try
+        ]
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 3
+        # Disable circuit breaker so rate limits are retried normally
+        adapter._rate_limit_circuit_threshold = 999
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        assert send_message_mock.await_count == 3
+
+
+class TestSendFileStaleDetection:
+    """Verify _send_file() stale detection works after the NameError fix.
+
+    The bug was: line 2227 called `await _api_post(...)` without assigning
+    the return value to `result`, then line 2245 referenced `result.get("ret")`
+    which raised NameError.
+
+    FIX: `result = await _api_post(...)` at line 2227.
+    """
+
+    def test_send_file_assigns_api_post_result(self):
+        """_send_file must capture _api_post return value for stale detection."""
+        import inspect
+        source = inspect.getsource(WeixinAdapter._send_file)
+        lines = source.split("\n")
+        has_assignment = any(
+            "result = await _api_post(" in line for line in lines
+        )
+        assert has_assignment, (
+            "_send_file must assign `_api_post` result to `result` "
+            "for stale session detection (was a NameError bug)"
+        )

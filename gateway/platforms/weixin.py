@@ -2224,7 +2224,7 @@ class WeixinAdapter(BasePlatformAdapter):
             )
 
         last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-        await _api_post(
+        result = await _api_post(
             self._send_session,
             base_url=self._base_url,
             endpoint=EP_SEND_MESSAGE,
