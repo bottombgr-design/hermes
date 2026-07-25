@@ -16,6 +16,7 @@ PASS and never conflated with a structural break.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 import yaml
@@ -23,7 +24,7 @@ import yaml
 from agent_factory.schema import load_spec
 from agent_factory.staging import stage_release
 from agent_factory.state import LayerEvidence, Verdict
-from agent_factory.tests_layer2 import run_layer2_config
+from agent_factory.tests_layer2 import _staged_profile_context, run_layer2_config
 
 
 @pytest.fixture
@@ -85,6 +86,63 @@ def test_environment_dependent_toolset_yields_unknown_not_silent_pass(tmp_path, 
     assert evidence.verdict == Verdict.UNKNOWN
     assert any(check["verdict"] == "UNKNOWN" for check in evidence.checks)
     assert not any(check["verdict"] == "FAIL" for check in evidence.checks)
+
+
+def test_live_pipeline_uses_staged_profile_context_not_invoker(
+    tmp_path, catalog, monkeypatch
+):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache
+
+    release_dir = _stage(tmp_path, catalog, tools_allow="todo")
+    invoking_profile = tmp_path / "invoking-profile"
+    invoking_profile.mkdir()
+    invoking_profile.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_invoker")
+
+    token = set_hermes_home_override(str(invoking_profile))
+    try:
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+        evidence = run_layer2_config(release_dir)
+    finally:
+        reset_hermes_home_override(token)
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+
+    assert evidence.verdict == Verdict.PASS
+    leak_check = next(c for c in evidence.checks if c["name"] == "no_schema_leak")
+    assert leak_check["verdict"] == "PASS"
+
+
+def test_staged_profile_context_restores_invoker_after_error(tmp_path, monkeypatch):
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    invoking_profile = tmp_path / "invoking-profile"
+    invoking_profile.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_invoker")
+
+    token = set_hermes_home_override(str(invoking_profile))
+    try:
+        with pytest.raises(RuntimeError, match="schema probe failed"):
+            with _staged_profile_context(release_dir):
+                assert get_hermes_home() == release_dir
+                assert "HERMES_KANBAN_TASK" not in os.environ
+                raise RuntimeError("schema probe failed")
+
+        assert get_hermes_home() == invoking_profile
+        assert os.environ["HERMES_KANBAN_TASK"] == "t_invoker"
+    finally:
+        reset_hermes_home_override(token)
 
 
 def test_canonical_agent_yaml_is_source_of_truth_for_recomputation(tmp_path, catalog):

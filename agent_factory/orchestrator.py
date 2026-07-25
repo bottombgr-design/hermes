@@ -23,7 +23,13 @@ from agent_factory.provenance import ProvenanceVerifier
 from agent_factory.review_packet import ReviewPacket, build_review_packet, review_packet_to_dict
 from agent_factory.schema import load_spec_from_yaml
 from agent_factory.skills_resolve import SkillAttachmentReport
-from agent_factory.staging import CANONICAL_SPEC_FILENAME, MANIFEST_FILENAME, RENDERED_CONFIG_FILENAME, stage_release
+from agent_factory.staging import (
+    CANONICAL_SPEC_FILENAME,
+    MANIFEST_FILENAME,
+    RENDERED_CONFIG_FILENAME,
+    recompute_manifest,
+    stage_release,
+)
 from agent_factory.state import (
     REVIEW_PACKET_FILENAME,
     ApprovalRecord,
@@ -90,6 +96,31 @@ def _rendered_effective_tools(release_dir: Path) -> EffectiveToolsReport:
     return EffectiveToolsReport(requested=allowed, allowed=allowed, denied_forbidden=(), denied_unknown=())
 
 
+def _verified_manifest(release_dir: Path, release_id: str) -> dict:
+    release_dir = Path(release_dir)
+    stored = json.loads((release_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    if recompute_manifest(release_dir) != stored:
+        raise ValueError("release contents no longer match manifest.json")
+    state = read_release_state(release_dir)
+    if state.release_id != release_id:
+        raise ValueError("release-state release_id does not match the requested release")
+    if state.manifest_combined_sha256 != stored["combined_sha256"]:
+        raise ValueError("release-state manifest hash does not match manifest.json")
+    return stored
+
+
+def _verified_test_report(release_dir: Path, release_id: str, manifest: dict) -> TestReport:
+    try:
+        report = read_test_report(release_dir)
+    except (KeyError, OSError, ValueError) as exc:
+        raise ValueError(f"test-report is invalid: {exc}") from exc
+    if report.release_id != release_id:
+        raise ValueError("test-report release_id does not match the requested release")
+    if report.manifest_combined_sha256 != manifest["combined_sha256"]:
+        raise ValueError("test-report manifest hash does not match manifest.json")
+    return report
+
+
 def run_tests(
     release_dir: Path,
     *,
@@ -103,7 +134,7 @@ def run_tests(
 ) -> TestReport:
     release_dir = Path(release_dir)
     spec_data = yaml.safe_load((release_dir / CANONICAL_SPEC_FILENAME).read_text(encoding="utf-8"))
-    manifest = json.loads((release_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    manifest = _verified_manifest(release_dir, release_id)
     effective_tools = _rendered_effective_tools(release_dir)
 
     layer1 = run_layer1_static(spec_data)
@@ -154,7 +185,12 @@ def run_tests(
             ),
         )
 
-    report = build_test_report(release_id, [layer1, layer2, layer3, layer4], generated_at=generated_at)
+    report = build_test_report(
+        release_id,
+        [layer1, layer2, layer3, layer4],
+        generated_at=generated_at,
+        manifest_combined_sha256=manifest["combined_sha256"],
+    )
     write_test_report(release_dir, report)
     return report
 
@@ -168,13 +204,17 @@ def build_report(
 ) -> ReviewPacket:
     release_dir = Path(release_dir)
     spec = load_spec_from_yaml((release_dir / CANONICAL_SPEC_FILENAME).read_text(encoding="utf-8"))
-    manifest = json.loads((release_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    manifest = _verified_manifest(release_dir, release_id)
     effective_tools = _rendered_effective_tools(release_dir)
     rendered = json.loads((release_dir / RENDERED_CONFIG_FILENAME).read_text(encoding="utf-8"))
     skills = SkillAttachmentReport(attached=tuple(rendered["skills"]["required"]), missing=())
 
     test_report_path = release_dir / "test-report.json"
-    test_report = read_test_report(release_dir) if test_report_path.exists() else None
+    test_report = (
+        _verified_test_report(release_dir, release_id, manifest)
+        if test_report_path.exists()
+        else None
+    )
 
     packet = build_review_packet(
         release_id=release_id,
@@ -205,21 +245,34 @@ def deploy(
     claimed_identity: Optional[str] = None,
 ) -> DeployResult:
     release_dir = Path(release_dir)
-    manifest = json.loads((release_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
     test_report_path = release_dir / "test-report.json"
-    test_report = read_test_report(release_dir) if test_report_path.exists() else None
 
-    result = deploy_release(
-        release_dir,
-        target_profile_name,
-        release_id=release_id,
-        manifest=manifest,
-        kanban_conn=kanban_conn,
-        kanban_task_id=kanban_task_id,
-        verifier=verifier,
-        test_report=test_report,
-        claimed_identity=claimed_identity,
-    )
+    try:
+        manifest = _verified_manifest(release_dir, release_id)
+        test_report = (
+            _verified_test_report(release_dir, release_id, manifest)
+            if test_report_path.exists()
+            else None
+        )
+        result = deploy_release(
+            release_dir,
+            target_profile_name,
+            release_id=release_id,
+            manifest=manifest,
+            kanban_conn=kanban_conn,
+            kanban_task_id=kanban_task_id,
+            verifier=verifier,
+            test_report=test_report,
+            claimed_identity=claimed_identity,
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        result = DeployResult(
+            outcome="refused",
+            target_profile=target_profile_name,
+            profile_dir=None,
+            failure_reason=f"release verification failed: {exc}",
+            verified_identity=None,
+        )
 
     from agent_factory.state import DeploymentRecord
 

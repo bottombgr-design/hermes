@@ -27,9 +27,9 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import profiles as hermes_profiles
-from hermes_cli.default_soul import DEFAULT_SOUL_MD
-
 from agent_factory.provenance import ProvenanceVerifier
+from agent_factory.schema import load_spec_from_yaml
+from agent_factory.staging import recompute_manifest
 from agent_factory.state import TestReport
 from agent_factory.tests_layer4 import evaluate_deployment_gate
 
@@ -70,13 +70,14 @@ def _require_test_profile_name(target_profile_name: str) -> str:
 def _build_profile_contents(temp_dir: Path, release_dir: Path) -> None:
     for subdir in _PROFILE_SKELETON_DIRS:
         (temp_dir / subdir).mkdir(parents=True, exist_ok=True)
-    (temp_dir / "SOUL.md").write_text(DEFAULT_SOUL_MD, encoding="utf-8")
     (temp_dir / ".env").write_text(
         "# Per-profile secrets for this Hermes profile.\n"
         "# API keys and tokens set here override the shell environment.\n",
         encoding="utf-8",
     )
     shutil.copy2(release_dir / "agent.yaml", temp_dir / "agent.yaml")
+    shutil.copy2(release_dir / "config.yaml", temp_dir / "config.yaml")
+    shutil.copy2(release_dir / "SOUL.md", temp_dir / "SOUL.md")
     shutil.copy2(release_dir / "rendered-config.json", temp_dir / "rendered-config.json")
     shutil.copy2(release_dir / "manifest.json", temp_dir / "manifest.json")
     release_skills = release_dir / "skills"
@@ -120,10 +121,28 @@ def deploy_release(
         if profile_dir.exists():
             raise DeploymentRefused(f"profile {canon!r} already exists at {profile_dir} — refusing to overwrite")
 
+        spec = load_spec_from_yaml((Path(release_dir) / "agent.yaml").read_text(encoding="utf-8"))
+        if not spec.deployment_policy_allow_deploy:
+            raise DeploymentRefused("agent.yaml deployment_policy.allow_deploy is false")
+
         if test_report is None or not test_report.deploy_allowed:
             raise DeploymentRefused(
                 "test-report does not permit deployment (missing, or a mandatory layer "
                 "is FAIL/SKIPPED/UNKNOWN)"
+            )
+
+        current_manifest = recompute_manifest(Path(release_dir))
+        if current_manifest != manifest:
+            raise DeploymentRefused(
+                "release contents no longer match manifest.json — refusing post-review artifact changes"
+            )
+        if test_report.release_id != release_id:
+            raise DeploymentRefused(
+                "test-report release_id does not match the release being deployed"
+            )
+        if test_report.manifest_combined_sha256 != manifest["combined_sha256"]:
+            raise DeploymentRefused(
+                "test-report manifest hash does not match the release being deployed"
             )
 
         if kanban_task_id is None:

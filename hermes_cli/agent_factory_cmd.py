@@ -22,27 +22,54 @@ from typing import Optional
 from agent_factory import orchestrator
 from agent_factory.provenance import DefaultFailClosedVerifier
 from agent_factory.state import Verdict, read_release_state
-from agent_factory.tests_layer3 import PromptScenario
+from agent_factory.tests_layer3 import PromptObservation, PromptScenario
 
 
 def _generated_at() -> int:
     return int(time.time())
 
 
-def _load_scenarios(path: Optional[str]) -> tuple[PromptScenario, ...]:
+class _RecordedPromptRunner:
+    def __init__(self, observations: dict[str, PromptObservation]):
+        self._observations = observations
+
+    def run(self, prompt: str) -> PromptObservation:
+        try:
+            return self._observations[prompt]
+        except KeyError as exc:
+            raise ValueError(f"no recorded observation for prompt: {prompt!r}") from exc
+
+
+def _load_scenarios(path: Optional[str]):
     if not path:
-        return ()
+        return (), None
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     scenarios = []
+    observations = {}
     for item in data:
+        prompt = item.get("prompt", "")
+        if prompt in observations:
+            raise ValueError(f"duplicate scenario prompt: {prompt!r}")
+        observation = item.get("observation")
+        if not isinstance(observation, dict):
+            raise ValueError(f"scenario {item['scenario_id']!r} is missing an observation mapping")
+        attempted_tools = observation.get("attempted_tools")
+        if not isinstance(attempted_tools, list) or not all(isinstance(tool, str) for tool in attempted_tools):
+            raise ValueError(
+                f"scenario {item['scenario_id']!r} observation.attempted_tools must be a string list"
+            )
+        observations[prompt] = PromptObservation(
+            response=str(observation.get("response", "")),
+            attempted_tools=tuple(attempted_tools),
+        )
         scenarios.append(PromptScenario(
             scenario_id=item["scenario_id"],
-            prompt=item.get("prompt", ""),
+            prompt=prompt,
             expected_allowed_tools=tuple(item.get("expected_allowed_tools", [])),
             expected_blocked_tools=tuple(item.get("expected_blocked_tools", [])),
             protected_paths=tuple(Path(p) for p in item.get("protected_paths", [])),
         ))
-    return tuple(scenarios)
+    return tuple(scenarios), _RecordedPromptRunner(observations)
 
 
 def _resolve_release_id(release_dir: Path, explicit: Optional[str]) -> str:
@@ -143,19 +170,21 @@ def _cmd_render(args: argparse.Namespace) -> int:
 def _cmd_test(args: argparse.Namespace) -> int:
     release_dir = Path(args.release_dir)
     release_id = _resolve_release_id(release_dir, args.release_id)
-    scenarios = _load_scenarios(args.scenarios)
+    scenarios, prompt_runner = _load_scenarios(args.scenarios)
 
     if args.kanban_task_id:
         from hermes_cli import kanban_db as kb
         with kb.connect_closing() as conn:
             report = orchestrator.run_tests(
                 release_dir, release_id=release_id, generated_at=_generated_at(),
-                prompt_scenarios=scenarios, kanban_conn=conn, kanban_task_id=args.kanban_task_id,
+                prompt_scenarios=scenarios, prompt_runner=prompt_runner,
+                kanban_conn=conn, kanban_task_id=args.kanban_task_id,
                 verifier=DefaultFailClosedVerifier(),
             )
     else:
         report = orchestrator.run_tests(
-            release_dir, release_id=release_id, generated_at=_generated_at(), prompt_scenarios=scenarios,
+            release_dir, release_id=release_id, generated_at=_generated_at(),
+            prompt_scenarios=scenarios, prompt_runner=prompt_runner,
         )
 
     if args.json:

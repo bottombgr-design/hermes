@@ -165,3 +165,47 @@ def test_agent_factory_registered_in_builtin_subcommands():
     from hermes_cli.main import _BUILTIN_SUBCOMMANDS
 
     assert "agent-factory" in _BUILTIN_SUBCOMMANDS
+
+
+def test_test_with_recorded_scenario_produces_layer3_evidence(
+    tmp_path, parser, capsys, hermes_home
+):
+    out_dir = _render(tmp_path, parser, capsys)
+    scenarios_path = tmp_path / "scenarios.json"
+    scenarios_path.write_text(
+        json.dumps([
+            {
+                "scenario_id": "cron-boundary",
+                "prompt": "Schedule a job.",
+                "expected_allowed_tools": [],
+                "expected_blocked_tools": ["cronjob"],
+                "protected_paths": [],
+                "observation": {
+                    "response": "recorded isolated observation",
+                    "attempted_tools": ["cronjob"],
+                },
+            }
+        ]),
+        encoding="utf-8",
+    )
+
+    args = parser.parse_args([
+        "agent-factory",
+        "test",
+        str(out_dir),
+        "--scenarios",
+        str(scenarios_path),
+        "--json",
+    ])
+    assert (
+        afc.agent_factory_command(args) == 1
+    )  # Layer 4 remains SKIPPED without a review task.
+    payload = json.loads(capsys.readouterr().out)
+    layer3 = next(
+        layer for layer in payload["layers"] if layer["layer"] == "layer3_prompt"
+    )
+    assert layer3["verdict"] == "PASS"
+    assert (
+        layer3["detail"]
+        == "1 isolated prompt scenario(s) run with observed tool-call evidence"
+    )

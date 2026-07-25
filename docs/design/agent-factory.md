@@ -38,6 +38,11 @@ canonical spec's *content* is inferred from what happens later.
    - `rendered-config.json` — the *derived* artifact: the resolved
      default-deny effective tool list and required skill names. Clearly
      separate from the canonical file on purpose.
+   - `config.yaml` — the enforceable per-platform toolset restriction used by
+     the deployed profile, including the `no_mcp` sentinel.
+   - `SOUL.md` — the generated identity derived from the validated role and
+     mission. Deployment copies this exact staged file; it does not substitute
+     the generic default identity.
    - `skills/<name>/` — one directory per required skill, copied
      individually (see "Skill resolution" below).
    - `manifest.json` — every file's SHA256 plus one `combined_sha256`,
@@ -54,14 +59,12 @@ canonical spec's *content* is inferred from what happens later.
 
 ## Default-deny effective tools (`agent_factory.effective_tools`)
 
-`compute_effective_tools(spec.tools_allow)` resolves each declared entry
-against the *live* `tools.registry` / `toolsets.TOOLSETS` — individual
-tool names and toolset names both work, toolsets expand recursively. Two
-toolsets are **always** forbidden, regardless of what a spec declares,
-because they carry cron-scheduling or shared cross-profile kanban-board
-authority: `cronjob`, `kanban` (`FORBIDDEN_TOOLSETS`). Anything not
-resolved from `tools.allow` is denied — there is no separate deny-list to
-maintain.
+`compute_effective_tools(spec.tools_allow)` accepts only names from the
+factory's narrow `ALLOWED_TOOLSETS` policy and resolves those toolsets against
+the *live* registry. Individual tool names and composite/high-authority
+toolsets are rejected because the deployed `config.yaml` can enforce exposure
+only at toolset granularity. Anything not resolved from an allowed toolset is
+denied — there is no separate deny-list to maintain.
 
 ## Local skill resolution (`agent_factory.skills_resolve`)
 
@@ -107,6 +110,10 @@ all four of `layer1_static` / `layer2_config` / `layer3_prompt` /
   `PASS`. This does **not** claim to test model behavior — only that the
   tool-exposure boundary a real model would be constrained by is enforced
   as declared.
+  The CLI `--scenarios` JSON supplies an `observation` object for each unique
+  prompt with `response` and `attempted_tools`. These are recorded outputs of
+  an isolated run; the CLI replays them through the policy gate and protected-
+  path hash checks. It does not call a model or dispatch a tool handler.
 - **Layer 4 — Kanban review / approval / deployment-control**
   (`tests_layer4.py`): creates a kanban `review_required` task
   (`create_review_task`) whose body embeds the release's
@@ -137,9 +144,9 @@ of them:
 | File | Written by | Content |
 |---|---|---|
 | `release-state.json` | `orchestrator.render` | release id, spec name/version, manifest hash, status |
-| `test-report.json` | `orchestrator.run_tests` | four `LayerEvidence` blocks + `overall_verdict` + `deploy_allowed` |
+| `test-report.json` | `orchestrator.run_tests` | four `LayerEvidence` blocks + `overall_verdict` + `deploy_allowed`, bound to release id and manifest hash |
 | `review-packet.json` | `orchestrator.build_report` | spec + manifest + effective-tools + skills + test-report summary + version comparison, for a human reviewer |
-| `approval.json` | not directly written by the orchestrator; `agent_factory.state.ApprovalRecord` exists for callers that want an audit record of a gate evaluation | decision, reviewer, provenance result — always re-derived, never the source of truth at deploy time |
+| `approval.json` | `orchestrator.run_tests` when Layer 4 is evaluated | decision, reviewer, provenance result — audit only; always re-derived, never the source of truth at deploy time |
 | `deployment-record.json` | `orchestrator.deploy` | outcome (`deployed`/`refused`), target profile, failure reason, verified identity — written on **every** attempt, success or refusal |
 
 ## Guarded deploy (`agent_factory.deploy`)
@@ -152,10 +159,18 @@ in order, each producing a distinct refusal reason:
 2. that profile does not already exist (**collision refusal** — an
    existing profile, factory-managed or not, is never touched, so there is
    no rollback path to implement);
-3. the release's `test-report.json` says `deploy_allowed`;
-4. a kanban review task id was supplied, and
+3. canonical `deployment_policy.allow_deploy` is true;
+4. the release's `test-report.json` says `deploy_allowed` and its release id
+   and manifest hash match this release;
+5. recomputed staged bytes match `manifest.json`, and release-state carries
+   the same release id and manifest hash;
+6. a kanban review task id was supplied, and
    `tests_layer4.evaluate_deployment_gate` passes (live "approve" +
    matching hash binding + trusted provenance).
+
+The orchestrator recomputes and checks the manifest before test, report, and
+deploy boundaries. A changed artifact or mismatched release-state/test-report
+binding fails closed; deployment still writes a refusal record.
 
 Profile contents are always assembled in a `tempfile.mkdtemp()` directory
 first; only after every precondition above holds does

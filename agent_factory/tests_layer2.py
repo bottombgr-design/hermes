@@ -23,13 +23,17 @@ deployment exactly like FAIL (see ``agent_factory.state``).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 
 import yaml
 
 from hermes_cli.tools_config import _get_platform_tools
-from model_tools import get_tool_definitions
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from model_tools import _clear_tool_defs_cache, get_tool_definitions
+from tools.registry import invalidate_check_fn_cache
 from toolsets import resolve_toolset
 
 from agent_factory.effective_tools import compute_effective_tools
@@ -44,6 +48,25 @@ from agent_factory.staging import (
 from agent_factory.state import LayerEvidence, Verdict
 
 LAYER_NAME = "layer2_config"
+
+
+@contextmanager
+def _staged_profile_context(release_dir: Path):
+    """Evaluate runtime schema gates as the staged profile, not the invoker."""
+    prior_task = os.environ.pop("HERMES_KANBAN_TASK", None)
+    token = None
+    try:
+        token = set_hermes_home_override(str(release_dir))
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+        yield
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+        if prior_task is not None:
+            os.environ["HERMES_KANBAN_TASK"] = prior_task
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
 
 
 def _tool_to_toolset_map(allowed_toolsets: tuple[str, ...]) -> dict[str, str]:
@@ -112,8 +135,9 @@ def run_layer2_config(release_dir: Path) -> LayerEvidence:
         _pass("no_undeclared_mcp", "config.yaml explicitly excludes MCP servers")
 
     # 3. Drive the real runtime pipeline against the release's own config.yaml.
-    enabled_toolsets = _get_platform_tools(config_yaml, DEPLOYED_PLATFORM)
-    schemas = get_tool_definitions(enabled_toolsets=sorted(enabled_toolsets), quiet_mode=True)
+    with _staged_profile_context(release_dir):
+        enabled_toolsets = _get_platform_tools(config_yaml, DEPLOYED_PLATFORM)
+        schemas = get_tool_definitions(enabled_toolsets=sorted(enabled_toolsets), quiet_mode=True)
     exposed_names = {schema["function"]["name"] for schema in schemas}
 
     leaked = exposed_names - set(recomputed.allowed)
