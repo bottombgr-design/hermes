@@ -340,6 +340,33 @@ describe('CronView trigger feedback', () => {
     await waitFor(() => expect(getCronJobRuns).toHaveBeenCalledTimes(2))
   })
 
+  it('clears stale run rows and loads the selected job while the previous poll is in flight', async () => {
+    const previousJobPoll = deferred<SessionInfo[]>()
+    const previousRunTitle = 'Previous job run'
+    const selectedRunTitle = 'Selected job run'
+    const previousRun = { ...run, id: 'run-job-1', title: previousRunTitle }
+    const selectedRun = { ...run, id: 'run-job-2', title: selectedRunTitle }
+
+    getCronJobs.mockResolvedValue([job, otherJob])
+    getCronJobRuns.mockResolvedValueOnce([previousRun])
+    await renderCron()
+    await screen.findByText(previousRunTitle)
+
+    getCronJobRuns.mockImplementation(jobId =>
+      jobId === job.id ? previousJobPoll.promise : Promise.resolve([selectedRun])
+    )
+
+    await act(async () => window.document.dispatchEvent(new Event('visibilitychange')))
+    await waitFor(() => expect(getCronJobRuns).toHaveBeenCalledTimes(2))
+    await act(async () => rowButton('Weekly release notes').click())
+
+    expect(screen.queryByText(previousRunTitle)).toBeNull()
+    await screen.findByText(selectedRunTitle)
+    expect(getCronJobRuns).toHaveBeenCalledWith(otherJob.id)
+
+    await act(async () => previousJobPoll.resolve([previousRun]))
+  })
+
   it('unlocks the action when a queued run does not appear before the timeout', async () => {
     const nextRuns = deferred<SessionInfo[]>()
 
