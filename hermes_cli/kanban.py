@@ -610,7 +610,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
         help=(
             "Typed block reason. 'dependency' waits in todo (auto-promoted "
-            "when parents finish, no human); 'needs_input'/'capability' go to "
+            "when parents finish, no human); 'review_required' marks a human "
+            "review gate and requires the reason to include a concise review "
+            "summary with what changed, what should be reviewed, and "
+            "recommended decision; 'needs_input'/'capability' go to "
             "blocked for a human; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
@@ -633,6 +636,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
+
+    p_review = sub.add_parser("review", help="Apply a review-required decision")
+    p_review.add_argument("task_id")
+    p_review.add_argument("decision", choices=["approve", "request-changes", "reject"])
+    p_review.add_argument(
+        "--comment",
+        required=True,
+        help="Reviewer decision note to record on the task",
+    )
+    p_review.add_argument(
+        "--reviewer",
+        default=None,
+        help="Reviewer name (default: active profile author)",
+    )
+    p_review.add_argument("--capture-note", action="store_true",
+                          help="Write an explicit knowledge-capture note after approve/reject")
+    p_review.add_argument("--what-changed", default=None,
+                          help="Concise change summary for --capture-note")
+    p_review.add_argument("--lesson", default=None,
+                          help="Key lesson / implementation note for --capture-note")
+    p_review.add_argument("--file", dest="files", action="append", default=[],
+                          help="Repository-relative affected file metadata (repeatable)")
+    p_review.add_argument("--area", default=None,
+                          help="Affected area metadata for --capture-note")
 
     p_promote = sub.add_parser(
         "promote",
@@ -1044,6 +1071,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "review":   _cmd_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1658,6 +1686,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
+    print(f"  lifecycle: {kb.effective_lifecycle_state(task)}")
+    if task.block_kind:
+        print(f"  block kind: {task.block_kind}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
@@ -2241,18 +2272,26 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            error_printed = False
+            try:
+                ok = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except ValueError as exc:
+                ok = False
+                error_printed = True
+                print(f"cannot block {tid}: {exc}", file=sys.stderr)
+            if not ok:
                 failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
+                if not error_printed:
+                    print(f"cannot block {tid}", file=sys.stderr)
             else:
+                if reason:
+                    kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -2312,6 +2351,73 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    reviewer = (getattr(args, "reviewer", None) or _profile_author()).strip()
+    comment = (getattr(args, "comment", None) or "").strip()
+    decision = getattr(args, "decision", "")
+    capture_requested = bool(getattr(args, "capture_note", False))
+    capture = None
+    if capture_requested:
+        if decision == "request-changes":
+            print("cannot review with --capture-note: capture is not allowed for request-changes", file=sys.stderr)
+            return 1
+        try:
+            from hermes_cli.kanban_knowledge import validate_capture_request
+            capture = validate_capture_request(
+                what_changed=getattr(args, "what_changed", None),
+                lesson=getattr(args, "lesson", None),
+                files=getattr(args, "files", None),
+                area=getattr(args, "area", None),
+            )
+        except ValueError as exc:
+            print(f"cannot capture review knowledge: {exc}", file=sys.stderr)
+            return 1
+    capture_warning = None
+    capture_path = None
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.review_required_decision(
+                conn,
+                args.task_id,
+                decision=decision,
+                reviewer=reviewer,
+                comment=comment,
+            )
+            if ok and capture_requested and capture is not None:
+                try:
+                    from hermes_cli.kanban_knowledge import write_review_capture_note
+                    capture_path = write_review_capture_note(
+                        conn,
+                        args.task_id,
+                        decision=decision,
+                        reviewer=reviewer,
+                        comment=comment,
+                        capture=capture,
+                    )
+                except Exception as exc:
+                    capture_warning = (
+                        "review decision succeeded but knowledge capture failed: "
+                        f"{exc}"
+                    )
+    except ValueError as exc:
+        print(f"cannot review {args.task_id}: {exc}", file=sys.stderr)
+        return 1
+    if not ok:
+        print(f"cannot review {args.task_id}", file=sys.stderr)
+        return 1
+    if decision == "approve":
+        print(f"Review approved {args.task_id}")
+    elif decision == "request-changes":
+        print(f"Review requested changes for {args.task_id}")
+    else:
+        print(f"Review rejected {args.task_id}")
+    if capture_path:
+        print(f"Knowledge captured: {capture_path}")
+    if capture_warning:
+        print(f"WARNING: {capture_warning}", file=sys.stderr)
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:

@@ -212,7 +212,11 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({
+    "dependency",
+    "needs_input",
+    "review_required",
+})
 
 
 def _goal_judge_available() -> bool:
@@ -375,6 +379,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "title": task.title,
         "assignee": task.assignee,
         "status": task.status,
+        "effective_lifecycle_state": kb.effective_lifecycle_state(task),
+        "review_required": kb.effective_lifecycle_state(task) == "review_required",
         "priority": task.priority,
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
@@ -423,6 +429,8 @@ def _handle_show(args: dict, **kw) -> str:
                 return {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
+                    "effective_lifecycle_state": kb.effective_lifecycle_state(t),
+                    "review_required": kb.effective_lifecycle_state(t) == "review_required",
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
@@ -748,8 +756,9 @@ def _handle_block(args: dict, **kw) -> str:
         # this, a worker that learns kanban_complete is gated can just call
         # kanban_block(reason="anything") to escape the loop instead.
         # Restrict goal_mode tasks to the kinds that represent a genuine
-        # external blocker the worker cannot resolve itself; `capability`
-        # and `transient` (or an unset kind) route back through
+        # external blocker the worker cannot resolve itself, or a
+        # review_required handoff with a structured review summary;
+        # `capability` and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
         if (
@@ -786,6 +795,9 @@ def _handle_block(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
+                effective_lifecycle_state=(
+                    kb.effective_lifecycle_state(landed) if landed else "blocked"
+                ),
             )
         finally:
             conn.close()
@@ -1633,10 +1645,20 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "enum": [
+                    "dependency",
+                    "needs_input",
+                    "capability",
+                    "transient",
+                    "review_required",
+                ],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
+                    "resumes automatically; 'review_required' marks a human "
+                    "review gate and requires the reason to include a concise "
+                    "review summary with what changed, what should be "
+                    "reviewed, and recommended decision; the others surface "
+                    "to a human. "
                     "Omit only if none apply."
                 ),
             },

@@ -731,9 +731,49 @@ def test_block_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, worker_env).status == "blocked"
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "blocked"
     finally:
         conn.close()
+
+
+def _review_summary() -> str:
+    return (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+
+
+def test_block_accepts_review_required_kind_with_summary(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_block({"reason": _review_summary(), "kind": "review_required"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "blocked"
+    assert d["block_kind"] == "review_required"
+    assert d["effective_lifecycle_state"] == "review_required"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "review_required"
+    finally:
+        conn.close()
+
+
+def test_block_rejects_review_required_without_summary(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_block({"reason": "What changed: partial", "kind": "review_required"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "what should be reviewed" in d["error"]
 
 
 def test_block_rejects_empty_reason(worker_env):
@@ -844,7 +884,29 @@ def test_block_goal_mode_allows_needs_input_kind(monkeypatch, tmp_path):
 
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, tid).status == "blocked"
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_goal_mode_allows_review_required_kind_with_summary(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block({"reason": _review_summary(), "kind": "review_required"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d["effective_lifecycle_state"] == "review_required"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "review_required"
     finally:
         conn.close()
 

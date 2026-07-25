@@ -14,6 +14,7 @@ profile's path is used.  They are the productionized form of the manual smoke
 probes used to confirm the bug class.
 """
 
+import importlib
 import threading
 from pathlib import Path
 
@@ -87,6 +88,98 @@ class TestSkillsHubPathResolution:
 
         assert lock_b.path == prof_b / "skills" / ".hub" / "lock.json"
         assert taps_b.path == prof_b / "skills" / ".hub" / "taps.json"
+
+
+def _skill_content(name: str) -> str:
+    return f"""---
+name: {name}
+description: Regression skill for profile-root isolation
+---
+
+# {name}
+
+This temporary skill exists only inside pytest tmp_path.
+"""
+
+
+class TestSkillManagerPathResolution:
+    """skill_manage writes must resolve the active profile root at operation time."""
+
+    def test_create_after_import_under_default_root_targets_active_profile(
+        self, two_profiles, monkeypatch
+    ):
+        prof_a, prof_b = two_profiles
+        monkeypatch.setenv("HERMES_HOME", str(prof_a))
+
+        import tools.skill_manager_tool as sm
+
+        sm = importlib.reload(sm)
+
+        assert sm.HERMES_HOME == prof_a
+        assert sm.SKILLS_DIR == prof_a / "skills"
+
+        result = _under_override(
+            prof_b,
+            lambda: sm._create_skill(
+                "profile-root-regression",
+                _skill_content("profile-root-regression"),
+            ),
+        )
+
+        assert result["success"] is True
+        assert Path(result["skill_md"]) == prof_b / "skills" / "profile-root-regression" / "SKILL.md"
+        assert (prof_b / "skills" / "profile-root-regression" / "SKILL.md").is_file()
+        assert not (prof_a / "skills" / "profile-root-regression").exists()
+
+    def test_path_resolution_after_import_under_default_root_targets_active_profile(
+        self, two_profiles, monkeypatch
+    ):
+        prof_a, prof_b = two_profiles
+        monkeypatch.setenv("HERMES_HOME", str(prof_a))
+
+        import tools.skill_manager_tool as sm
+
+        sm = importlib.reload(sm)
+
+        resolved = _under_override(
+            prof_b,
+            lambda: sm._resolve_skill_dir("profile-root-regression", "dev"),
+        )
+
+        assert resolved == prof_b / "skills" / "dev" / "profile-root-regression"
+        assert not (prof_a / "skills" / "dev").exists()
+        assert not resolved.exists()
+
+    def test_background_thread_create_preserves_active_profile_with_context_propagation(
+        self, two_profiles, monkeypatch
+    ):
+        prof_a, prof_b = two_profiles
+        monkeypatch.setenv("HERMES_HOME", str(prof_a))
+
+        import tools.skill_manager_tool as sm
+        from tools.thread_context import propagate_context_to_thread
+
+        sm = importlib.reload(sm)
+        seen = {}
+
+        def worker():
+            seen["result"] = sm._create_skill(
+                "thread-profile-root-regression",
+                _skill_content("thread-profile-root-regression"),
+            )
+
+        def run():
+            t = threading.Thread(target=propagate_context_to_thread(worker))
+            t.start()
+            t.join()
+
+        _under_override(prof_b, run)
+
+        result = seen["result"]
+        assert result["success"] is True
+        assert Path(result["skill_md"]) == prof_b / "skills" / "thread-profile-root-regression" / "SKILL.md"
+        assert (prof_b / "skills" / "thread-profile-root-regression" / "SKILL.md").is_file()
+        assert not (prof_a / "skills" / "thread-profile-root-regression").exists()
 
 
 class TestGatewayCacheDirResolution:

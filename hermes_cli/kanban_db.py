@@ -116,13 +116,73 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
 #   * ``transient``    — a flaky/temporary failure that may clear on retry.
+#   * ``review_required`` — implementation is ready but must be reviewed
+#                        before it can count as complete. It stays in the
+#                        physical ``blocked`` column so the dispatcher does not
+#                        spawn another worker until a reviewer explicitly
+#                        requests changes / approves by unblocking.
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {
+    "dependency",
+    "needs_input",
+    "capability",
+    "transient",
+    "review_required",
+}
+REVIEW_REQUIRED_REASON_PREFIX = "review-required:"
+REVIEW_REQUIRED_SUMMARY_LABELS = (
+    "what changed",
+    "what should be reviewed",
+    "recommended decision",
+)
+VALID_REVIEW_DECISIONS = {"approve", "request_changes", "reject"}
+
+
+def is_review_required_reason(reason: Optional[str]) -> bool:
+    """Return True for the legacy ``review-required:`` block convention."""
+    return bool(
+        reason
+        and str(reason).strip().lower().startswith(REVIEW_REQUIRED_REASON_PREFIX)
+    )
+
+
+def missing_review_summary_labels(reason: Optional[str]) -> list[str]:
+    """Return required review-summary fields missing from ``reason``.
+
+    New structured review-required blocks must carry a concise summary that
+    tells the reviewer what changed, what to inspect, and the recommended
+    decision. The legacy ``review-required: ...`` prefix remains recognised for
+    backward compatibility, but callers using ``kind='review_required'`` get
+    this stricter contract.
+    """
+    text = (reason or "").strip().lower()
+    return [label for label in REVIEW_REQUIRED_SUMMARY_LABELS if label not in text]
+
+
+def effective_lifecycle_state(task: "Task") -> str:
+    """Return the Task Queue lifecycle view derived from Kanban state."""
+    if task.status == "blocked" and task.block_kind == "review_required":
+        return "review_required"
+    if task.status == "review":
+        return "review_required"
+    if task.status in {"triage", "todo", "scheduled"}:
+        return "planned"
+    if task.status == "ready":
+        return "assigned" if task.assignee else "ready"
+    if task.status == "running":
+        return "in_progress"
+    if task.status == "blocked":
+        return "blocked"
+    if task.status == "done":
+        return "completed"
+    if task.status == "archived":
+        return "closed"
+    return "planned"
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -5410,6 +5470,11 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    * ``review_required`` — treated like a human block for routing, but
+      reported as the ``review_required`` lifecycle. The reason must include a
+      concise review summary with what changed, what should be reviewed, and
+      the recommended decision.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -5417,6 +5482,13 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if kind == "review_required":
+        missing = missing_review_summary_labels(reason)
+        if missing:
+            raise ValueError(
+                "review_required blocks require a concise review summary "
+                "including: " + ", ".join(missing)
+            )
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -5728,6 +5800,103 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             {"status": new_status} if new_status != "ready" else None,
         )
         return True
+
+
+def _current_profile_name_for_review() -> Optional[str]:
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name()
+    except Exception:
+        return None
+
+
+def _review_comment_prefix(decision: str) -> str:
+    if decision == "approve":
+        return "REVIEW APPROVED"
+    if decision == "request_changes":
+        return "REVIEW REQUEST CHANGES"
+    return "REVIEW REJECTED"
+
+
+def review_required_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str,
+    reviewer: str,
+    comment: str,
+) -> bool:
+    """Apply an explicit reviewer decision to a structured review-required task.
+
+    Phase 4 gates operate only on Phase 3's canonical state:
+    ``status='blocked'`` and ``block_kind='review_required'``. They deliberately
+    do not touch the existing physical ``status='review'`` dispatcher lane.
+    """
+    norm_decision = (decision or "").strip().replace("-", "_")
+    if norm_decision not in VALID_REVIEW_DECISIONS:
+        raise ValueError(
+            f"review decision must be one of {sorted(VALID_REVIEW_DECISIONS)}"
+        )
+    reviewer = (reviewer or "").strip()
+    comment = (comment or "").strip()
+    if not reviewer:
+        raise ValueError("reviewer is required")
+    if not comment:
+        raise ValueError("review comment is required")
+
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    if task.status != "blocked" or task.block_kind != "review_required":
+        raise ValueError(
+            "review decisions apply only to status='blocked' with "
+            "block_kind='review_required'"
+        )
+
+    reviewer_key = _canonical_assignee(reviewer)
+    assignee_key = _canonical_assignee(task.assignee)
+    profile_key = _canonical_assignee(_current_profile_name_for_review())
+    if os.environ.get("HERMES_KANBAN_TASK") == task_id:
+        raise ValueError("implementing worker cannot review its own task")
+    if assignee_key and reviewer_key == assignee_key:
+        raise ValueError("task assignee cannot review its own task")
+    if assignee_key and profile_key == assignee_key:
+        raise ValueError("active profile cannot review its own assigned task")
+
+    before_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    event_payload = {
+        "decision": norm_decision,
+        "reviewer": reviewer,
+        "comment": comment,
+    }
+    add_comment(
+        conn,
+        task_id,
+        reviewer,
+        f"{_review_comment_prefix(norm_decision)}: {comment}",
+    )
+
+    if norm_decision == "approve":
+        ok = complete_task(
+            conn,
+            task_id,
+            result=comment,
+            summary=comment,
+            metadata={"review_decision": "approved", "reviewer": reviewer},
+        )
+    elif norm_decision == "request_changes":
+        ok = unblock_task(conn, task_id)
+    else:
+        ok = archive_task(conn, task_id)
+
+    if not ok:
+        return False
+    after_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    if after_count != before_count:
+        raise RuntimeError("review decision unexpectedly changed task count")
+    with write_txn(conn):
+        _append_event(conn, task_id, "review_decision", event_payload)
+    return True
 
 
 def specify_triage_task(

@@ -4524,6 +4524,13 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_knowledge(args):
+    """Search local review knowledge captures."""
+    from hermes_cli.knowledge_index import knowledge_command
+
+    return knowledge_command(args)
+
+
 def cmd_project(args):
     """Manage projects (named, multi-folder workspaces)."""
     from hermes_cli.projects_cmd import projects_command
@@ -14332,10 +14339,10 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "agent-factory", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "egress", "fallback", "gateway", "hooks", "import", "insights", "knowledge",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "profile",
@@ -15145,6 +15152,20 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # =========================================================================
+    # knowledge command — deterministic local review-capture retrieval
+    # =========================================================================
+    from hermes_cli.knowledge_index import build_parser as _build_knowledge_parser
+
+    _build_knowledge_parser(subparsers)
+
+    # =========================================================================
+    # agent-factory command — Phase 7 Hermes Agent Factory MVP
+    # =========================================================================
+    from hermes_cli.agent_factory_cmd import build_parser as _build_agent_factory_parser
+
+    _build_agent_factory_parser(subparsers)
 
     # =========================================================================
     # project command — named, multi-folder workspaces

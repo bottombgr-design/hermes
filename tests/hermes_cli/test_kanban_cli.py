@@ -159,6 +159,209 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_run_slash_review_required_block_shows_lifecycle_and_kind(kanban_home):
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    reason = (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+    blocked = kc.run_slash(f"block {tid} '{reason}' --kind review_required")
+    assert "Blocked" in blocked
+    show = kc.run_slash(f"show {tid}")
+    assert "status:    blocked" in show
+    assert "lifecycle: review_required" in show
+    assert "block kind: review_required" in show
+
+
+def test_run_slash_review_required_block_rejects_missing_summary(kanban_home):
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    blocked = kc.run_slash(f"block {tid} 'What changed: partial' --kind review_required")
+    assert "review_required blocks require" in blocked
+
+
+def test_run_slash_review_approve_completes_task(kanban_home):
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    reason = (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+    kc.run_slash(f"block {tid} '{reason}' --kind review_required")
+
+    out = kc.run_slash(f"review {tid} approve --reviewer reviewer --comment 'looks good'")
+    assert "Review approved" in out
+    assert "status:    done" in kc.run_slash(f"show {tid}")
+
+
+def test_run_slash_review_request_changes_returns_ready(kanban_home):
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    reason = (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+    kc.run_slash(f"block {tid} '{reason}' --kind review_required")
+
+    out = kc.run_slash(f"review {tid} request-changes --reviewer reviewer --comment 'fix tests'")
+    assert "Review requested changes" in out
+    assert "status:    ready" in kc.run_slash(f"show {tid}")
+
+
+def test_run_slash_review_reject_archives_task(kanban_home):
+    out = kc.run_slash("create 'x' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    reason = (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+    kc.run_slash(f"block {tid} '{reason}' --kind review_required")
+
+    out = kc.run_slash(f"review {tid} reject --reviewer reviewer --comment 'close it'")
+    assert "Review rejected" in out
+    assert "status:    archived" in kc.run_slash(f"show {tid}")
+
+
+def _make_review_required_cli_task():
+    out = kc.run_slash("create 'capture <b>x</b>' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    reason = (
+        "What changed: implementation is ready. "
+        "What should be reviewed: changed files and tests. "
+        "Recommended decision: approve if checks pass."
+    )
+    kc.run_slash(f"block {tid} '{reason}' --kind review_required")
+    return tid
+
+
+def test_run_slash_review_approve_with_capture_writes_note_and_event(kanban_home):
+    tid = _make_review_required_cli_task()
+    out = kc.run_slash(
+        f"review {tid} approve --reviewer reviewer --comment 'ok token=SECRET123' "
+        "--capture-note --what-changed '<script>changed</script>' "
+        "--lesson 'api_key=SECRET123 learned' --file hermes_cli/kanban.py "
+        "--area 'Kanban <review>'"
+    )
+    assert "Review approved" in out
+    assert "Knowledge captured: kanban/knowledge/review-captures/" in out
+
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "knowledge_captured"]
+        assert len(events) == 1
+        assert events[0].payload is not None
+        rel = events[0].payload["path"]
+        note = kb.kanban_home() / rel
+        text = note.read_text(encoding="utf-8")
+        assert "&lt;script&gt;changed&lt;/script&gt;" in text
+        assert "SECRET123" not in text
+        assert "hermes_cli/kanban.py" in text
+
+
+def test_run_slash_review_reject_with_capture_writes_note(kanban_home):
+    tid = _make_review_required_cli_task()
+    out = kc.run_slash(
+        f"review {tid} reject --reviewer reviewer --comment 'close' "
+        "--capture-note --what-changed 'closed' --lesson 'not worth merging' "
+        "--file hermes_cli/kanban_db.py"
+    )
+    assert "Review rejected" in out
+    assert "Knowledge captured: kanban/knowledge/review-captures/" in out
+
+
+def test_run_slash_review_approve_without_capture_creates_no_note(kanban_home):
+    tid = _make_review_required_cli_task()
+    out = kc.run_slash(f"review {tid} approve --reviewer reviewer --comment 'ok'")
+    assert "Knowledge captured" not in out
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "knowledge_captured"]
+
+
+def test_run_slash_review_capture_validation_errors(kanban_home):
+    tid = _make_review_required_cli_task()
+    out = kc.run_slash(
+        f"review {tid} request-changes --reviewer reviewer --comment 'fix' "
+        "--capture-note --what-changed 'x' --lesson 'y'"
+    )
+    assert "capture is not allowed for request-changes" in out
+
+    out = kc.run_slash(
+        f"review {tid} approve --reviewer reviewer --comment 'ok' "
+        "--capture-note --lesson 'y'"
+    )
+    assert "what_changed is required" in out
+
+    out = kc.run_slash(
+        f"review {tid} approve --reviewer reviewer --comment 'ok' "
+        "--capture-note --what-changed 'x'"
+    )
+    assert "lesson is required" in out
+
+    out = kc.run_slash(
+        f"review {tid} approve --reviewer reviewer --comment 'ok' "
+        "--capture-note --what-changed 'x' --lesson 'y' --file /abs/path.py"
+    )
+    assert "repository-relative" in out
+
+    out = kc.run_slash(
+        f"review {tid} approve --reviewer reviewer --comment 'ok' "
+        "--capture-note --what-changed 'x' --lesson 'y' --file ../secret.py"
+    )
+    assert "traversal" in out
+
+
+def test_run_slash_review_capture_write_failure_preserves_decision(kanban_home, monkeypatch):
+    tid = _make_review_required_cli_task()
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.kanban_knowledge as kk
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(kk, "write_review_capture_note", fail_write)
+    out = kc.run_slash(
+        f"review {tid} approve --reviewer reviewer --comment 'ok' "
+        "--capture-note --what-changed 'x' --lesson 'y'"
+    )
+    assert "Review approved" in out
+    assert "knowledge capture failed: disk full" in out
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "knowledge_captured"]
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)
