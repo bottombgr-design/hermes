@@ -5,7 +5,7 @@ import unittest
 import zipfile
 from unittest.mock import patch
 
-from tools.skills_hub import ClawHubSource, SkillMeta
+from tools.skills_hub import ClawHubSource, SkillMeta, _guarded_http_stream
 
 
 class _MockResponse:
@@ -43,6 +43,22 @@ class _MockStreamContext:
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+
+class _MockSafeClient:
+    def __init__(self, response):
+        self.response = response
+        self.stream_calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def stream(self, method, url, *, params=None):
+        self.stream_calls.append((method, url, params))
+        return _MockStreamContext(self.response)
 
 
 def _zip_bytes(files):
@@ -154,7 +170,37 @@ class TestClawHubSource(unittest.TestCase):
         self.assertEqual(results[0].name, "self-improving-agent")
         self.assertIn("continuous improvement", results[0].description)
 
-    @patch("tools.skills_hub.httpx.stream")
+    @patch("tools.url_safety.create_ssrf_safe_client")
+    def test_guarded_stream_blocks_private_redirect_before_connect(self, mock_create):
+        initial_url = "https://clawhub.ai/api/v1/download"
+        private_url = "http://127.0.0.1/private.zip"
+        client = _MockSafeClient(
+            _MockStreamResponse(status_code=302, headers={"location": private_url})
+        )
+        mock_create.return_value = client
+
+        with patch(
+            "tools.skills_hub.is_safe_url",
+            side_effect=lambda url: url != private_url,
+        ) as mock_safe:
+            with _guarded_http_stream(
+                initial_url,
+                params={"slug": "demo"},
+                timeout=30,
+            ) as response:
+                self.assertIsNone(response)
+
+        self.assertEqual(
+            [call.args[0] for call in mock_safe.call_args_list],
+            [initial_url, private_url],
+        )
+        mock_create.assert_called_once_with(timeout=30, follow_redirects=False)
+        self.assertEqual(
+            client.stream_calls,
+            [("GET", initial_url, {"slug": "demo"})],
+        )
+
+    @patch("tools.skills_hub._guarded_http_stream")
     def test_download_zip_streams_archive_and_extracts_text(self, mock_stream):
         archive = _zip_bytes({"SKILL.md": "# Demo\n"})
         response = _MockStreamResponse(chunks=[archive[:7], archive[7:]])
@@ -165,12 +211,11 @@ class TestClawHubSource(unittest.TestCase):
         self.assertEqual(files, {"SKILL.md": "# Demo\n"})
         self.assertEqual(response.chunk_sizes, [self.src.ZIP_DOWNLOAD_CHUNK_BYTES])
         args, kwargs = mock_stream.call_args
-        self.assertEqual(args[0], "GET")
-        self.assertTrue(args[1].endswith("/download"))
+        self.assertTrue(args[0].endswith("/download"))
         self.assertEqual(kwargs["params"], {"slug": "demo", "version": "1.0.0"})
 
     @patch("tools.skills_hub.time.sleep")
-    @patch("tools.skills_hub.httpx.stream")
+    @patch("tools.skills_hub._guarded_http_stream")
     def test_download_zip_exhausts_rate_limit_retries(self, mock_stream, mock_sleep):
         mock_stream.side_effect = [
             _MockStreamContext(
@@ -189,7 +234,7 @@ class TestClawHubSource(unittest.TestCase):
         )
 
     @patch("tools.skills_hub.time.sleep")
-    @patch("tools.skills_hub.httpx.stream")
+    @patch("tools.skills_hub._guarded_http_stream")
     def test_download_zip_clamps_negative_retry_after(self, mock_stream, mock_sleep):
         mock_stream.side_effect = [
             _MockStreamContext(
@@ -204,7 +249,7 @@ class TestClawHubSource(unittest.TestCase):
         mock_sleep.assert_called_once_with(0)
 
     @patch.object(ClawHubSource, "ZIP_DOWNLOAD_MAX_BYTES", 10)
-    @patch("tools.skills_hub.httpx.stream")
+    @patch("tools.skills_hub._guarded_http_stream")
     def test_download_zip_rejects_declared_oversized_archive(self, mock_stream):
         response = _MockStreamResponse(
             chunks=[b"not-read"],
@@ -218,7 +263,7 @@ class TestClawHubSource(unittest.TestCase):
         self.assertEqual(response.iterated_chunks, 0)
 
     @patch.object(ClawHubSource, "ZIP_DOWNLOAD_MAX_BYTES", 10)
-    @patch("tools.skills_hub.httpx.stream")
+    @patch("tools.skills_hub._guarded_http_stream")
     def test_download_zip_stops_when_stream_exceeds_archive_cap(self, mock_stream):
         response = _MockStreamResponse(chunks=[b"12345", b"678901", b"ignored"])
         mock_stream.return_value = _MockStreamContext(response)
@@ -323,7 +368,7 @@ class TestClawHubSource(unittest.TestCase):
         self.assertEqual(meta.tags, ["automation"])
 
     @patch("tools.skills_hub._ssrf_safe_http_get")
-    @patch("tools.skills_hub.httpx.stream")
+    @patch("tools.skills_hub._guarded_http_stream")
     @patch("tools.skills_hub.httpx.get")
     def test_fetch_resolves_latest_version_and_downloads_raw_files(
         self, mock_get, mock_stream, mock_safe_get
@@ -364,7 +409,7 @@ class TestClawHubSource(unittest.TestCase):
         mock_safe_get.assert_called_once_with("https://files.example/skill-md", timeout=20)
         mock_stream.assert_called_once()
 
-    @patch("tools.skills_hub.httpx.stream")
+    @patch("tools.skills_hub._guarded_http_stream")
     @patch("tools.skills_hub.httpx.get")
     def test_fetch_falls_back_to_versions_list(self, mock_get, mock_stream):
         mock_stream.return_value = _MockStreamContext(_MockStreamResponse(status_code=404))
@@ -387,7 +432,7 @@ class TestClawHubSource(unittest.TestCase):
 
     @patch("tools.skills_hub.check_website_access", return_value=None)
     @patch("tools.skills_hub.is_safe_url")
-    @patch("tools.skills_hub.httpx.stream")
+    @patch("tools.skills_hub._guarded_http_stream")
     @patch("tools.skills_hub.httpx.get")
     @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_fetch_blocks_private_raw_url(
