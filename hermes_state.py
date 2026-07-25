@@ -4003,13 +4003,25 @@ class SessionDB:
         (dashboard viewer disconnect before #60609) are treated as recoverable;
         explicit conversation boundaries such as /new, /resume switches, and
         compression splits are not.
+
+        The returned row carries a ``last_active`` field (newest message
+        timestamp, falling back to ``started_at``) so callers can tell how
+        stale a recoverable row actually is. ``ended_at`` is NOT a substitute:
+        it records when the process closed the row, which a later shutdown can
+        push hours past the conversation's real last activity.
         """
         if not session_key:
             return None
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT * FROM sessions
+                SELECT sessions.*,
+                       COALESCE(
+                           (SELECT MAX(m.timestamp) FROM messages m
+                            WHERE m.session_id = sessions.id),
+                           sessions.started_at
+                       ) AS last_active
+                FROM sessions
                 WHERE session_key = ?
                   AND source = ?
                   AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
@@ -4031,7 +4043,13 @@ class SessionDB:
                 return None
             row = self._conn.execute(
                 """
-                SELECT * FROM sessions
+                SELECT sessions.*,
+                       COALESCE(
+                           (SELECT MAX(m.timestamp) FROM messages m
+                            WHERE m.session_id = sessions.id),
+                           sessions.started_at
+                       ) AS last_active
+                FROM sessions
                 WHERE source = ?
                   AND COALESCE(user_id, '') = COALESCE(?, '')
                   AND COALESCE(chat_id, '') = COALESCE(?, '')

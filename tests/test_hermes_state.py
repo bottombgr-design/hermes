@@ -6943,6 +6943,52 @@ def test_gateway_session_peer_round_trip_and_recovery(db):
     assert recovered["id"] == "gw-session"
 
 
+def test_gateway_session_recovery_row_carries_last_active(db):
+    """Recovered rows must expose real last activity, not just started_at.
+
+    The gateway uses it to decide whether a recoverable row is already past its
+    reset boundary. ``ended_at`` cannot stand in: a later shutdown pushes it
+    hours past the conversation's actual last message.
+    """
+    db.create_session(
+        "gw-last-active",
+        "weixin",
+        user_id="user-1",
+        session_key="agent:main:weixin:dm:chat-1",
+        chat_id="chat-1",
+        chat_type="dm",
+    )
+    db.append_message("gw-last-active", "user", "hello")
+    newest = db._conn.execute(
+        "SELECT MAX(timestamp) FROM messages WHERE session_id = 'gw-last-active'"
+    ).fetchone()[0]
+
+    recovered = db.find_latest_gateway_session_for_peer(
+        source="weixin",
+        user_id="user-1",
+        session_key="agent:main:weixin:dm:chat-1",
+        chat_id="chat-1",
+        chat_type="dm",
+    )
+    assert recovered["id"] == "gw-last-active"
+    assert recovered["last_active"] == pytest.approx(newest)
+
+    # A row whose messages were all pruned falls back to started_at rather than
+    # reporting NULL, so callers never have to special-case it.
+    db._conn.execute("DELETE FROM messages WHERE session_id = 'gw-last-active'")
+    db._conn.commit()
+    fallback = db.find_latest_gateway_session_for_peer(
+        source="weixin",
+        user_id="user-1",
+        session_key="agent:main:weixin:dm:chat-1",
+        chat_id="chat-1",
+        chat_type="dm",
+    )
+    assert fallback is None or fallback["last_active"] == pytest.approx(
+        fallback["started_at"]
+    )
+
+
 def test_gateway_session_recovery_reopens_ws_orphan_reap_rows(db):
     """Rows wrongly ended by the TUI ws-orphan reaper must be recoverable (#63207)."""
     db.create_session(

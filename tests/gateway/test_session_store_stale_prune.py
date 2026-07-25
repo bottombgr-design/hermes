@@ -11,6 +11,8 @@ import json
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from gateway.config import GatewayConfig, Platform, SessionResetPolicy
 from gateway.session import SessionEntry, SessionSource, SessionStore
 
@@ -217,6 +219,92 @@ class TestPruneStaleSessionsLocked:
         with patch.object(store, "_save") as mock_save:
             store._prune_stale_sessions_locked()
             mock_save.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Recovered entries must carry real last-activity, not "now"
+# ---------------------------------------------------------------------------
+
+class TestRecoveredEntryTimestamps:
+    def _source(self) -> SessionSource:
+        return SessionSource(
+            platform=Platform.WEIXIN,
+            chat_id="contact-1",
+            chat_type="dm",
+            user_id="contact-1",
+        )
+
+    def test_updated_at_comes_from_row_last_active(self, tmp_path):
+        """updated_at is the sole input to _should_reset.
+
+        Stamping a recovered row as "just active" made it immune to the very
+        next idle/daily check, so a session recovered long after its reset
+        boundary kept absorbing new messages into stale history.
+        """
+        store = _make_store_with_db(tmp_path, MagicMock())
+        last_active = datetime.now() - timedelta(days=5)
+        started_at = last_active - timedelta(minutes=2)
+
+        entry = store._create_entry_from_recovered_row(
+            row={
+                "id": "sid_old",
+                "started_at": started_at.timestamp(),
+                "last_active": last_active.timestamp(),
+            },
+            session_key="agent:main:weixin:dm:contact-1",
+            source=self._source(),
+            now=datetime.now(),
+        )
+
+        assert entry.updated_at == pytest.approx(last_active, abs=timedelta(seconds=1))
+        assert entry.created_at == pytest.approx(started_at, abs=timedelta(seconds=1))
+
+    def test_updated_at_falls_back_to_now_without_last_active(self, tmp_path):
+        """Hand-built rows (no last_active column) keep the old behaviour."""
+        store = _make_store_with_db(tmp_path, MagicMock())
+        now = datetime.now()
+
+        entry = store._create_entry_from_recovered_row(
+            row={"id": "sid_x", "started_at": (now - timedelta(hours=3)).timestamp()},
+            session_key="agent:main:weixin:dm:contact-1",
+            source=self._source(),
+            now=now,
+        )
+
+        assert entry.updated_at == now
+
+    def test_recovered_stale_session_is_rotated_by_reset_policy(self, tmp_path):
+        """End-to-end: carrying real last-activity re-arms the existing policy.
+
+        This is what makes the next inbound message open a FRESH session
+        instead of continuing a long-dead conversation — no separate freshness
+        rule, the operator's own session_reset config stays the single source
+        of truth.
+        """
+        config = GatewayConfig(
+            default_reset_policy=SessionResetPolicy(
+                mode="both", at_hour=4, idle_minutes=1440
+            )
+        )
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = MagicMock()
+        store._loaded = True
+
+        source = self._source()
+        last_active = datetime.now() - timedelta(days=5)
+        entry = store._create_entry_from_recovered_row(
+            row={
+                "id": "sid_old",
+                "started_at": last_active.timestamp(),
+                "last_active": last_active.timestamp(),
+            },
+            session_key=store._generate_session_key(source),
+            source=source,
+            now=datetime.now(),
+        )
+
+        assert store._should_reset(entry, source) in {"idle", "daily"}
 
 
 # ---------------------------------------------------------------------------
