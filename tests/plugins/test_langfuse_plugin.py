@@ -1021,3 +1021,88 @@ class TestUsageFromSanitizedResponse:
 
         assert seen["resp"] is resp
         assert captured["usage_details"] == {"input": 7, "output": 3}
+
+
+# ---------------------------------------------------------------------------
+# Prefer gateway_session_key for Langfuse session grouping (#71556)
+# ---------------------------------------------------------------------------
+
+
+class TestGatewaySessionKeyGrouping:
+    def _fresh_plugin(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    def test_langfuse_session_id_prefers_gateway_key(self):
+        mod = self._fresh_plugin()
+        assert mod._langfuse_session_id("uuid-ephemeral", "agent:main:api:chat:1") == (
+            "agent:main:api:chat:1"
+        )
+        assert mod._langfuse_session_id("uuid-only", "") == "uuid-only"
+        assert mod._langfuse_session_id("", "  gw-key  ") == "gw-key"
+        assert mod._langfuse_session_id("", "") == ""
+
+    def test_two_turns_with_different_session_ids_share_gateway_key(self, monkeypatch):
+        """Open WebUI /v1/responses mints a fresh UUID session_id each turn.
+
+        With the same X-Hermes-Session-Key both turns must open Langfuse
+        traces under one stable session id.
+        """
+        mod = self._fresh_plugin()
+        seen_sessions: list[str] = []
+
+        class _Span:
+            def update(self, **kw):
+                pass
+
+            def end(self, **kw):
+                pass
+
+            def set_trace_io(self, **kw):
+                pass
+
+            def start_observation(self, **kw):
+                return _Span()
+
+        class _RootCM:
+            def __enter__(self):
+                return _Span()
+
+            def __exit__(self, *exc):
+                return False
+
+        class _Client:
+            def create_trace_id(self, seed=None):
+                return f"trace::{seed}"
+
+            def start_as_current_observation(self, **kw):
+                ctx = kw.get("trace_context") or {}
+                seen_sessions.append(ctx.get("session_id"))
+                return _RootCM()
+
+            def flush(self):
+                pass
+
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: _Client())
+        monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
+        # Force the start_as_current_observation path even without the SDK.
+        monkeypatch.setattr(mod, "propagate_attributes", None)
+        mod._TRACE_STATE.clear()
+
+        gw = "openwebui-thread-abc"
+        for n, sid in enumerate(("uuid-turn-1", "uuid-turn-2"), start=1):
+            turn_id = f"{sid}:turn{n}"
+            mod.on_pre_llm_request(
+                task_id=sid,
+                session_id=sid,
+                gateway_session_key=gw,
+                model="m",
+                provider="p",
+                api_mode="chat",
+                api_call_count=1,
+                request_messages=[{"role": "user", "content": f"hi{n}"}],
+                turn_id=turn_id,
+                api_request_id=f"{turn_id}:api:1",
+            )
+
+        assert seen_sessions == [gw, gw]

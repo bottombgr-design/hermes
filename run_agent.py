@@ -2677,6 +2677,7 @@ class AIAgent:
                 turn_id=turn_id,
                 api_request_id=api_request_id,
                 session_id=self.session_id or "",
+                gateway_session_key=getattr(self, "_gateway_session_key", None) or "",
                 platform=self.platform or "",
                 model=self.model,
                 provider=self.provider,

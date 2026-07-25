@@ -503,6 +503,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         _invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
+            gateway_session_key=getattr(agent, "_gateway_session_key", None) or "",
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
         )
@@ -1891,6 +1892,7 @@ def run_conversation(
                             turn_id=turn_id,
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
+                            gateway_session_key=getattr(agent, "_gateway_session_key", None) or "",
                             user_message=original_user_message,
                             conversation_history=list(messages),
                             platform=agent.platform or "",
@@ -5154,6 +5156,7 @@ def run_conversation(
                         turn_id=turn_id,
                         api_request_id=api_request_id,
                         session_id=agent.session_id or "",
+                        gateway_session_key=getattr(agent, "_gateway_session_key", None) or "",
                         platform=agent.platform or "",
                         model=agent.model,
                         provider=agent.provider,
