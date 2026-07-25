@@ -3,6 +3,7 @@
 Tests the unified streaming API call, delta callbacks, tool-call
 suppression, provider fallback, and CLI streaming display.
 """
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -718,6 +719,68 @@ class TestStreamingFallback:
         assert agent._disable_streaming is True
         assert deltas == []
 
+    @patch("run_agent.AIAgent._abort_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    def test_moa_interrupt_closes_stream_handle(
+        self, mock_create, mock_close_openai, mock_abort_openai
+    ):
+        """MoA interrupts must close the per-request stream, not the facade client."""
+        from run_agent import AIAgent
+
+        class _BlockingClosableStream:
+            def __init__(self):
+                self.entered = threading.Event()
+                self.closed = threading.Event()
+                self.close_calls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.entered.set()
+                if not self.closed.wait(timeout=5):
+                    raise TimeoutError("MoA test stream was not closed")
+                raise RuntimeError("stream closed")
+
+            def close(self):
+                self.close_calls += 1
+                self.closed.set()
+
+        stream = _BlockingClosableStream()
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = stream
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            model="default",
+            provider="moa",
+            api_key="test-key",
+            base_url="moa://local",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent.client = mock_client
+
+        def _request_interrupt():
+            assert stream.entered.wait(timeout=2)
+            agent._interrupt_requested = True
+
+        interrupter = threading.Thread(target=_request_interrupt, daemon=True)
+        interrupter.start()
+
+        with pytest.raises(InterruptedError):
+            agent._interruptible_streaming_api_call({"model": "default", "messages": []})
+
+        assert stream.closed.wait(timeout=2)
+        assert stream.close_calls == 1
+        mock_create.assert_called_once()
+        mock_close_openai.assert_not_called()
+        mock_abort_openai.assert_not_called()
+
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
     def test_stream_error_propagates_original(self, mock_close, mock_create):
@@ -1196,6 +1259,9 @@ class TestAnthropicStreamCallbacks:
 
         agent._anthropic_client = MagicMock()
         agent._anthropic_client.messages.stream.return_value = mock_stream
+        # #67142: streaming now runs on a request-local anthropic client; route
+        # it to the test mock so .messages.stream is exercised.
+        agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
 
         agent._interruptible_streaming_api_call({})
 
@@ -1251,16 +1317,18 @@ class TestAnthropicStreamCallbacks:
             _BadStream(),
             good_stream,
         ]
+        agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
 
         response = agent._interruptible_streaming_api_call({})
 
         assert response is final_message
         assert agent._anthropic_client.messages.stream.call_count == 2
-        # Anthropic-native cleanup: close + rebuild the Anthropic client, never
-        # the OpenAI primary client.
+        # #67142: cleanup runs on the request-local anthropic client (closed,
+        # worker-owned, via _close_request_client_once), never rebuilding the
+        # shared client and never touching the OpenAI primary client.
         assert mock_replace.call_count == 0
-        assert mock_rebuild.call_count == 1
-        assert agent._anthropic_client.close.call_count == 1
+        assert mock_rebuild.call_count == 0
+        assert agent._anthropic_client.close.call_count >= 1
 
     @patch("run_agent.AIAgent._replace_primary_openai_client")
     def test_generic_anthropic_valueerror_still_propagates_without_stream_retry(
@@ -1286,6 +1354,7 @@ class TestAnthropicStreamCallbacks:
         agent._anthropic_client.messages.stream.side_effect = ValueError(
             "invalid local request shape"
         )
+        agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
 
         with pytest.raises(ValueError, match="invalid local request shape"):
             agent._interruptible_streaming_api_call({})
@@ -1326,15 +1395,17 @@ class TestAnthropicStreamCallbacks:
 
         agent._anthropic_client = MagicMock()
         agent._anthropic_client.messages.stream.return_value = empty_stream
+        agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
 
         with pytest.raises(EmptyStreamError):
             agent._interruptible_streaming_api_call({})
 
         assert agent._anthropic_client.messages.stream.call_count == 3
-        # Anthropic-native cleanup between attempts: rebuild the Anthropic
-        # client, never the OpenAI primary client.
+        # #67142: cleanup between attempts runs on the request-local anthropic
+        # client (fresh one built per attempt); the shared client is never
+        # rebuilt and the OpenAI primary client is never touched.
         assert mock_replace.call_count == 0
-        assert mock_rebuild.call_count == 2
+        assert mock_rebuild.call_count == 0
 
     @patch("run_agent.AIAgent._try_refresh_anthropic_client_credentials")
     @patch("run_agent.AIAgent._rebuild_anthropic_client")
@@ -1369,13 +1440,14 @@ class TestAnthropicStreamCallbacks:
 
         agent._anthropic_client = MagicMock()
         agent._anthropic_client.messages.stream.return_value = empty_stream
+        agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
 
         with pytest.raises(EmptyStreamError):
             agent._interruptible_streaming_api_call({})
 
         assert agent._anthropic_client.messages.stream.call_count == 3
         assert mock_replace.call_count == 0
-        assert mock_rebuild.call_count == 2
+        assert mock_rebuild.call_count == 0
 
 
 class TestPartialToolCallWarning:
