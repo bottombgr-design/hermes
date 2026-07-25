@@ -3559,15 +3559,21 @@ class GatewaySlashCommandsMixin:
             if platform_key is not None:
                 runtime_kwargs["platform"] = platform_key
             runtime_kwargs["gateway_session_key"] = session_key
-            tmp_agent = AIAgent(
-                **runtime_kwargs,
-                model=model,
-                max_iterations=4,
-                quiet_mode=True,
-                skip_memory=True,
-                enabled_toolsets=["memory"],
-                session_id=session_entry.session_id,
-                session_db=getattr(self._session_db, "_db", self._session_db),
+            # Construction runs the selected context engine's synchronous
+            # session-start hook. Keep plugin-controlled work off the gateway
+            # event loop just like normal turns and automatic hygiene.
+            tmp_agent = await self._construct_temporary_agent_off_loop(
+                lambda: AIAgent(
+                    **runtime_kwargs,
+                    model=model,
+                    max_iterations=4,
+                    quiet_mode=True,
+                    skip_memory=True,
+                    enabled_toolsets=["memory"],
+                    session_id=session_entry.session_id,
+                    session_db=getattr(self._session_db, "_db", self._session_db),
+                ),
+                context="manual compress construction cancellation",
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
