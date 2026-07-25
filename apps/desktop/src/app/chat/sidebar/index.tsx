@@ -113,6 +113,7 @@ import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } 
 import { ProfileRail } from './profile-switcher'
 import { ProjectDialog } from './project-dialog'
 import {
+  EnteredMainSessionButton,
   orderProjectsByIds,
   overlayLiveLanes,
   overlayLivePreviews,
@@ -1309,6 +1310,11 @@ export function ChatSidebar({
                 headerAction={
                   inProject && enteredProject ? (
                     <div className="group/workspace flex shrink-0 items-center gap-0.5">
+                      <EnteredMainSessionButton
+                        onNewSession={onNewSessionInWorkspace}
+                        project={enteredProjectContent ?? enteredProject}
+                        repoWorktrees={scopedRepoWorktrees}
+                      />
                       {enteredProject.path && (
                         <StartWorkButton onStarted={onNewSessionInWorkspace} repoPath={enteredProject.path} />
                       )}
