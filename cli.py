@@ -9338,8 +9338,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_image_command(cmd_original)
         elif canonical == "reload":
             from hermes_cli.config import reload_env
+            # Capture SSH-related vars before reload so we can detect changes
+            _ssh_keys = {"TERMINAL_SSH_HOST", "TERMINAL_SSH_PORT",
+                         "TERMINAL_SSH_USER", "TERMINAL_SSH_KEY"}
+            _before = {k: os.environ.get(k) for k in _ssh_keys}
             count = reload_env()
             print(f"  Reloaded .env ({count} var(s) updated)")
+            # If any SSH config changed, tear down cached SSH environments
+            # so the next tool call recreates them with the new connection info.
+            _after = {k: os.environ.get(k) for k in _ssh_keys}
+            if _before != _after:
+                try:
+                    from tools.terminal_tool import cleanup_all_environments
+                    cleaned = cleanup_all_environments()
+                    if cleaned:
+                        print(f"  Cleared {cleaned} cached environment(s) (SSH config changed)")
+                except Exception as e:
+                    logger.debug("Failed to clean environments after reload: %s", e)
         elif canonical == "reload-mcp":
             # Interactive reload: confirm first (unless the user has opted out).
             # The auto-reload path (file watcher) calls _reload_mcp directly
