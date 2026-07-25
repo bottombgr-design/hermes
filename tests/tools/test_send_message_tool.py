@@ -29,10 +29,7 @@ from gateway.config import Platform
 from tools.send_message_tool import (
     _is_telegram_thread_not_found,
     _parse_target_ref,
-<<<<<<< HEAD
     _resolve_slack_user_target,
-=======
->>>>>>> ddabf23822 (refactor(qqbot): route media through live adapter / standalone sender)
     _send_matrix_via_adapter,
     _send_signal,
     _send_telegram,
