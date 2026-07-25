@@ -663,7 +663,7 @@ class TestProfileScopedChatPty:
 
         monkeypatch.setattr(
             "hermes_cli.main._make_tui_argv",
-            lambda root, tui_dev=False: (["cat"], None),
+            lambda root, tui_dev=False, **_kwargs: (["cat"], None),
             raising=False,
         )
         argv, cwd, env = web_server._resolve_chat_argv(profile="worker_beta")
@@ -677,7 +677,7 @@ class TestProfileScopedChatPty:
 
         monkeypatch.setattr(
             "hermes_cli.main._make_tui_argv",
-            lambda root, tui_dev=False: (["cat"], None),
+            lambda root, tui_dev=False, **_kwargs: (["cat"], None),
             raising=False,
         )
         argv, cwd, env = web_server._resolve_chat_argv()
@@ -689,7 +689,7 @@ class TestProfileScopedChatPty:
 
         monkeypatch.setattr(
             "hermes_cli.main._make_tui_argv",
-            lambda root, tui_dev=False: (["cat"], None),
+            lambda root, tui_dev=False, **_kwargs: (["cat"], None),
             raising=False,
         )
         # Reuse the HTTPException class web_server itself raises — avoids a

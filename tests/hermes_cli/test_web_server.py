@@ -9584,7 +9584,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             main_mod,
             "_make_tui_argv",
-            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+            lambda project_root, tui_dev=False, **_kwargs: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
 
         _argv, _cwd, env = self.ws_module._resolve_chat_argv()
@@ -9592,6 +9592,27 @@ class TestPtyWebSocket:
         assert env["HERMES_TUI_DASHBOARD"] == "1"
         assert env["HERMES_TUI_INLINE"] == "1"
         assert env["HERMES_TUI_DISABLE_MOUSE"] == "1"
+
+    def test_resolve_chat_argv_uses_runtime_bundle_and_actionable_errors(self, monkeypatch):
+        """The browser PTY must not rebuild a fresh TUI on every connection."""
+        import hermes_cli.main as main_mod
+
+        captured: dict = {}
+
+        def fake_make_tui_argv(project_root, tui_dev=False, **kwargs):
+            captured["project_root"] = project_root
+            captured["tui_dev"] = tui_dev
+            captured["kwargs"] = kwargs
+            return (["node", "dist/entry.js"], "/tmp/ui-tui")
+
+        monkeypatch.setattr(main_mod, "_make_tui_argv", fake_make_tui_argv)
+
+        self.ws_module._resolve_chat_argv()
+
+        assert captured["kwargs"] == {
+            "prefer_existing_bundle": True,
+            "raise_launch_errors": True,
+        }
 
     def test_resolve_chat_argv_backfills_colorterm_truecolor(self, monkeypatch):
         """Headless servers (cloud/systemd) have no COLORTERM, which made
@@ -9603,7 +9624,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             main_mod,
             "_make_tui_argv",
-            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+            lambda project_root, tui_dev=False, **_kwargs: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
         monkeypatch.delenv("COLORTERM", raising=False)
 
@@ -9618,7 +9639,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             main_mod,
             "_make_tui_argv",
-            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+            lambda project_root, tui_dev=False, **_kwargs: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
         monkeypatch.setenv("COLORTERM", "24bit")
 
@@ -9636,7 +9657,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             main_mod,
             "_make_tui_argv",
-            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+            lambda project_root, tui_dev=False, **_kwargs: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
 
         _argv, _cwd, env = self.ws_module._resolve_chat_argv()
@@ -9656,7 +9677,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             main_mod,
             "_make_tui_argv",
-            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+            lambda project_root, tui_dev=False, **_kwargs: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
 
         _argv, _cwd, env = self.ws_module._resolve_chat_argv()
@@ -9683,7 +9704,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             main_mod,
             "_make_tui_argv",
-            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+            lambda project_root, tui_dev=False, **_kwargs: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
 
         _argv, _cwd, env = self.ws_module._resolve_chat_argv()
@@ -9722,7 +9743,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             main_mod,
             "_make_tui_argv",
-            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+            lambda project_root, tui_dev=False, **_kwargs: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
 
         _argv, _cwd, env = self.ws_module._resolve_chat_argv()
@@ -9754,7 +9775,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             main_mod,
             "_make_tui_argv",
-            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+            lambda project_root, tui_dev=False, **_kwargs: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
 
         _argv, _cwd, env = self.ws_module._resolve_chat_argv()
@@ -9886,6 +9907,35 @@ class TestPtyWebSocket:
             raise SystemExit("node not found")
 
         self._assert_pty_propagates(monkeypatch, boom)
+
+    def test_pty_ws_surfaces_actionable_tui_launch_error(self, monkeypatch):
+        """A failed npm/TUI launch must never collapse to ``Chat unavailable: 1``."""
+        from starlette.websockets import WebSocketDisconnect
+
+        class FakeTuiLaunchError(RuntimeError):
+            pass
+
+        monkeypatch.setattr(
+            self.ws_module,
+            "TuiLaunchError",
+            FakeTuiLaunchError,
+            raising=False,
+        )
+
+        def boom(resume=None, sidecar_url=None, profile=None):
+            raise FakeTuiLaunchError("TUI build failed.\nsh: esbuild: command not found")
+
+        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", boom)
+
+        with self.client.websocket_connect(self._url()) as conn:
+            notice = conn.receive_text()
+            with pytest.raises(WebSocketDisconnect) as exc:
+                conn.receive_text()
+
+        assert "TUI build failed" in notice
+        assert "esbuild: command not found" in notice
+        assert exc.value.code == 1011
+        assert "TUI build failed" in exc.value.reason
 
     def test_pty_ws_propagates_httpexception_through_async_wrapper(self, monkeypatch):
         """An invalid-profile HTTPException raised inside the threaded resolver
