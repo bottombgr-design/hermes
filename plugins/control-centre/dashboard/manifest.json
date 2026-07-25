@@ -1,0 +1,14 @@
+{
+  "name": "control-centre",
+  "label": "Control Centre",
+  "description": "Unified operator cockpit for products, agents, builds, approvals, and system health",
+  "icon": "Activity",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/control-centre",
+    "position": "before:sessions"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

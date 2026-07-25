@@ -70,3 +70,30 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
 
     assert result.returncode == 0, result.stderr
     assert list(tmp_path.glob(artifact_glob))
+
+
+def test_built_wheel_can_import_control_centre_outside_source_tree(tmp_path):
+    result = _build_artifact("wheel", tmp_path, nix_build=True)
+    assert result.returncode == 0, result.stderr
+    wheel = next(tmp_path.glob("hermes_agent-*.whl"))
+
+    imported = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import sys; "
+                f"sys.path.insert(0, {str(wheel)!r}); "
+                "import control_centre; "
+                "print(control_centre.__file__)"
+            ),
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert imported.returncode == 0, imported.stderr
+    assert str(wheel) in imported.stdout
