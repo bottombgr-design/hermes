@@ -306,6 +306,25 @@ class TestJobCRUD:
         job = create_job(prompt="One-shot", schedule="1h")
         assert job["repeat"]["times"] == 1
 
+    def test_duration_with_multiple_repeats_becomes_interval(self, tmp_cron_dir):
+        job = create_job(prompt="Repeat", schedule="2m", repeat=3)
+
+        assert job["schedule"] == {
+            "kind": "interval",
+            "minutes": 2,
+            "display": "every 2m",
+        }
+        assert job["schedule_display"] == "every 2m"
+
+        mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["state"] == "scheduled"
+        assert updated["enabled"] is True
+        assert updated["repeat"] == {"times": 3, "completed": 1}
+        assert updated["next_run_at"] is not None
+
     def test_rejects_stale_past_one_shot_at_creation(self, tmp_cron_dir, monkeypatch):
         now = datetime(2026, 3, 18, 4, 30, 0, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
@@ -374,6 +393,141 @@ class TestUpdateJob:
         fetched = get_job(job["id"])
         assert fetched["schedule"]["minutes"] == 120
         assert fetched["schedule_display"] == "every 120m"
+
+    def test_update_duration_schedule_promotes_existing_repeat_to_interval(self, tmp_cron_dir):
+        job = create_job(prompt="Repeat", schedule="every 1m", repeat=3)
+        duration_schedule = parse_schedule("2m")
+
+        updated = update_job(
+            job["id"],
+            {
+                "schedule": duration_schedule,
+                "schedule_display": duration_schedule["display"],
+            },
+        )
+
+        assert updated is not None
+        assert updated["schedule"] == {
+            "kind": "interval",
+            "minutes": 2,
+            "display": "every 2m",
+        }
+        assert updated["schedule_display"] == "every 2m"
+        assert updated["next_run_at"] is not None
+
+    def test_update_repeat_promotes_existing_bare_duration_to_interval(self, tmp_cron_dir, monkeypatch):
+        created_at = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: created_at)
+        job = create_job(prompt="Repeat", schedule="2m")
+        original_next_run = job["next_run_at"]
+        assert job["schedule"]["kind"] == "once"
+
+        monkeypatch.setattr(
+            "cron.jobs._hermes_now",
+            lambda: created_at + timedelta(minutes=1),
+        )
+        updated = update_job(job["id"], {"repeat": {"times": 3, "completed": 0}})
+
+        assert updated is not None
+        assert updated["schedule"] == {
+            "kind": "interval",
+            "minutes": 2,
+            "display": "every 2m",
+        }
+        assert updated["schedule_display"] == "every 2m"
+        assert updated["repeat"] == {"times": 3, "completed": 0}
+        assert updated["next_run_at"] == original_next_run
+
+    def test_update_normalizes_api_integer_repeat_before_promoting_duration(self, tmp_cron_dir):
+        job = create_job(prompt="Repeat", schedule="every 1m")
+
+        updated = update_job(job["id"], {"schedule": "2m", "repeat": 3})
+
+        assert updated is not None
+        assert updated["schedule"] == {
+            "kind": "interval",
+            "minutes": 2,
+            "display": "every 2m",
+        }
+        assert updated["schedule_display"] == "every 2m"
+        assert updated["repeat"] == {"times": 3, "completed": 0}
+        assert updated["next_run_at"] is not None
+
+    def test_legacy_duration_repeat_job_is_promoted_before_first_run(self, tmp_cron_dir):
+        job = create_job(prompt="Repeat", schedule="every 1m", repeat=3)
+        legacy_schedule = parse_schedule("2m")
+        legacy_schedule.pop("interval_minutes")
+        job["schedule"] = legacy_schedule
+        job["schedule_display"] = legacy_schedule["display"]
+        job["repeat"] = 3
+        job["next_run_at"] = legacy_schedule["run_at"]
+        save_jobs([job])
+
+        mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["schedule"] == {
+            "kind": "interval",
+            "minutes": 2,
+            "display": "every 2m",
+        }
+        assert updated["schedule_display"] == "every 2m"
+        assert updated["repeat"] == {"times": 3, "completed": 1}
+        assert updated["state"] == "scheduled"
+        assert updated["next_run_at"] is not None
+
+    def test_legacy_completed_duration_repeat_job_is_rearmed(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Repeat", schedule="every 1m", repeat=3)
+        legacy_schedule = parse_schedule("2m")
+        legacy_schedule.pop("interval_minutes")
+        job.update(
+            {
+                "schedule": legacy_schedule,
+                "schedule_display": legacy_schedule["display"],
+                "repeat": {"times": 3, "completed": 1},
+                "enabled": False,
+                "state": "completed",
+                "last_run_at": (now - timedelta(minutes=2)).isoformat(),
+                "next_run_at": None,
+            }
+        )
+        save_jobs([job])
+
+        migrated = load_jobs()[0]
+
+        assert migrated["schedule"] == {
+            "kind": "interval",
+            "minutes": 2,
+            "display": "every 2m",
+        }
+        assert migrated["enabled"] is True
+        assert migrated["state"] == "scheduled"
+        assert migrated["next_run_at"] == now.isoformat()
+        assert [due["id"] for due in get_due_jobs()] == [job["id"]]
+
+    def test_legacy_migration_skips_malformed_repeat_count(self, tmp_cron_dir):
+        malformed = create_job(prompt="Malformed", schedule="every 1m")
+        legacy_schedule = parse_schedule("2m")
+        legacy_schedule.pop("interval_minutes")
+        malformed.update(
+            {
+                "schedule": legacy_schedule,
+                "schedule_display": legacy_schedule["display"],
+                "repeat": {"times": "3", "completed": 0},
+                "enabled": False,
+                "state": "paused",
+            }
+        )
+        healthy = create_job(prompt="Healthy", schedule="every 1m")
+        save_jobs([malformed, healthy])
+
+        loaded = load_jobs()
+
+        assert [job["id"] for job in loaded] == [malformed["id"], healthy["id"]]
+        assert loaded[0]["schedule"] == legacy_schedule
 
     def test_update_to_past_oneshot_rejected(self, tmp_cron_dir, monkeypatch):
         """Updating a job's schedule to a one-shot >ONESHOT_GRACE_SECONDS in the
