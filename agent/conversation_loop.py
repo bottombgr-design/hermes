@@ -1518,6 +1518,21 @@ def run_conversation(
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
 
+        # Strict progressive disclosure: completed tool outputs stay available
+        # during their active turn, then become request-only summaries. The
+        # persisted transcript remains complete.
+        from tools.tool_search import load_config as _load_tool_search_config
+
+        _tool_search_config = _load_tool_search_config()
+        if _tool_search_config.defer_core:
+            from agent.agent_runtime_helpers import compact_historical_tool_results
+
+            api_messages = compact_historical_tool_results(
+                api_messages,
+                current_turn_user_idx=current_turn_user_idx,
+                max_words=_tool_search_config.summary_max_words,
+            )
+
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
         # External recall context is injected into the user message, not the system
