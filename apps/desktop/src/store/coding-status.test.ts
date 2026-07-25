@@ -10,6 +10,7 @@ import {
   $currentCwd,
   $selectedStoredSessionId,
   $workspaceCwdOwner,
+  releaseWorkspaceCwdOwner,
   setSessions,
   setWorkspaceCwdOwner,
   workspaceCwdBelongsToSelectedSession
@@ -533,13 +534,14 @@ describe('refreshRepoStatus', () => {
     stubProbe(probe)
 
     // Resuming a DETACHED conversation leaves the workspace marked as belonging
-    // to nobody (a private unowned sentinel), so the leftover path on screen is
-    // provably not this conversation's and every DEFAULTED refresh is withheld.
-    // Modeled here as "the owner is not the selected id" — the contract is the
-    // mismatch, not the particular marker value.
+    // to nobody, so the leftover path on screen is provably not this
+    // conversation's and every DEFAULTED refresh is withheld. Released through the
+    // same call the resume path uses: the marker itself is module-private, and a
+    // hand-copied literal would keep passing on any mismatching string even if the
+    // real marker changed.
     $currentCwd.set('/repo-previous')
     $selectedStoredSessionId.set('session-detached')
-    setWorkspaceCwdOwner('workspace-cwd-unowned')
+    releaseWorkspaceCwdOwner()
     vi.advanceTimersByTime(200)
     await vi.runAllTicks()
     await drainProbeMicrotasks()
@@ -580,7 +582,7 @@ describe('refreshRepoStatus', () => {
 
     $currentCwd.set('/repo-previous')
     $selectedStoredSessionId.set('session-detached')
-    setWorkspaceCwdOwner('workspace-cwd-unowned')
+    releaseWorkspaceCwdOwner()
     vi.advanceTimersByTime(200)
     await vi.runAllTicks()
     await drainProbeMicrotasks()
@@ -605,6 +607,28 @@ describe('refreshRepoStatus', () => {
     await vi.runAllTicks()
     await drainProbeMicrotasks()
 
+    expect(probe).not.toHaveBeenCalled()
+    expect($repoStatus.get()).toBeNull()
+  })
+
+  it('keeps withholding after a release while no conversation is selected', async () => {
+    // Why the release marker cannot be `null`: a fresh draft's selection is also
+    // null, so a null release would COMPARE EQUAL and hand the leftover path to
+    // the draft as its own workspace — #71254, one selection over. This is a
+    // reachable state, not a hypothetical: applyRuntimeInfo treats a null
+    // selection as "describes the selected session", so a settled report carrying
+    // no cwd releases while the draft is on screen.
+    const probe = vi.fn(async () => sampleStatus)
+    stubProbe(probe)
+
+    $currentCwd.set('/repo-previous')
+    $selectedStoredSessionId.set(null)
+    releaseWorkspaceCwdOwner()
+    vi.advanceTimersByTime(200)
+    await vi.runAllTicks()
+    await drainProbeMicrotasks()
+
+    expect(workspaceCwdBelongsToSelectedSession()).toBe(false)
     expect(probe).not.toHaveBeenCalled()
     expect($repoStatus.get()).toBeNull()
   })
