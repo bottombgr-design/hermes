@@ -18,9 +18,12 @@ const HIDDEN_PANE = `[${PANE_HIDDEN_ATTR}]`
 /** Spread onto a kept pane layer so the lookups below can skip it. */
 export const hiddenPaneProps = (hidden: boolean): Record<string, string> => (hidden ? { [PANE_HIDDEN_ATTR]: '' } : {})
 
+/** Whether an element belongs to an inactive keep-alive pane. */
+export const isElementInHiddenPane = (element: Element): boolean => Boolean(element.closest(HIDDEN_PANE))
+
 /** `querySelectorAll` minus anything inside an inactive tab. */
 export const queryAllVisible = <T extends HTMLElement>(selector: string, root: ParentNode = document): T[] =>
-  [...root.querySelectorAll<T>(selector)].filter(el => !el.closest(HIDDEN_PANE))
+  [...root.querySelectorAll<T>(selector)].filter(el => !isElementInHiddenPane(el))
 
 /** `querySelector` minus anything inside an inactive tab. */
 export const queryVisible = <T extends HTMLElement>(selector: string, root: ParentNode = document): null | T =>

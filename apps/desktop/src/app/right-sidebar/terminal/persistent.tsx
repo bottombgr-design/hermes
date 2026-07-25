@@ -2,6 +2,8 @@ import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
+import { isElementInHiddenPane } from '@/components/pane-shell/pane-visibility'
+
 import { $terminalTakeover } from '../store'
 
 import { ensureTerminal } from './terminals'
@@ -45,6 +47,7 @@ interface PersistentTerminalProps {
 }
 
 interface Rect {
+  hidden: boolean
   top: number
   left: number
   width: number
@@ -52,7 +55,7 @@ interface Rect {
 }
 
 const sameRect = (a: Rect | null, b: Rect) =>
-  !!a && a.top === b.top && a.left === b.left && a.width === b.width && a.height === b.height
+  !!a && a.hidden === b.hidden && a.top === b.top && a.left === b.left && a.width === b.width && a.height === b.height
 
 export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalProps) {
   const slot = useStore($slot)
@@ -90,7 +93,16 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
       // full pixel footprint, so half-pixel rects can't leak page bg through.
       const top = Math.floor(r.top)
       const left = Math.floor(r.left)
-      const next: Rect = { top, left, width: Math.ceil(r.right) - left, height: Math.ceil(r.bottom) - top }
+
+      // Inactive keep-alive panes deliberately retain the same rect as the
+      // foreground pane, so visibility must be sampled independently.
+      const next: Rect = {
+        hidden: isElementInHiddenPane(slot),
+        top,
+        left,
+        width: Math.ceil(r.right) - left,
+        height: Math.ceil(r.bottom) - top
+      }
 
       if (!sameRect(prev, next)) {
         prev = next
@@ -109,7 +121,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
     return () => cancelAnimationFrame(frame)
   }, [slot])
 
-  const visible = Boolean(rect && rect.width > 0 && rect.height > 0)
+  const visible = Boolean(rect && !rect.hidden && rect.width > 0 && rect.height > 0)
 
   const style: CSSProperties = {
     position: 'fixed',
