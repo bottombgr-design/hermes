@@ -1002,6 +1002,116 @@ export const zh: Translations = {
         mcp: { label: 'MCP', hint: 'MCP 工具路由' },
         title_generation: { label: '标题生成', hint: '会话标题' },
         curator: { label: '维护器', hint: '技能使用审查' }
+      },
+      moaTitle: '多智能体混合',
+      moaDesc:
+        '配置命名预设，作为 Mixture of Agents 提供方下的模型。聚合器是执行模型。',
+      moaEnabled: '已启用',
+      moaPreset: '预设',
+      moaSetDefault: '设为默认',
+      moaDelete: '删除',
+      moaNewPreset: '新建预设',
+      moaAddPreset: '添加预设',
+      moaDefault: name => `默认: ${name}`,
+      moaReference: n => `参考模型 ${n}`,
+      moaRemove: '移除',
+      moaAddRefModel: '添加参考模型',
+      moaAggregator: '聚合器'
+    },
+    customEndpoints: {
+      title: '自定义端点',
+      emptyTitle: '无自定义端点',
+      emptyDescription: '在下方添加兼容 OpenAI 的端点。',
+      addTitle: '添加端点',
+      editTitle: '编辑端点',
+      active: '使用中',
+      apiKeySet: 'API 密钥已设置',
+      use: '使用',
+      deleteEndpoint: '删除端点',
+      deleteConfirm: name => `删除 ${name}？`,
+      newEndpoint: '新建端点',
+      couldNotLoad: '无法加载自定义端点',
+      endpointSaved: '自定义端点已保存。',
+      saveFailed: '保存失败',
+      validationFailed: '验证失败',
+      activationFailed: '激活失败',
+      deleteFailed: '删除失败',
+      endpointReachable: '端点可访问。',
+      endpointReachableModels: n => `端点可访问。已发现 ${n} 个模型。`,
+      endpointValidationFailed: '端点验证失败。',
+      test: '测试',
+      save: '保存',
+      fields: {
+        name: '名称',
+        providerId: '提供方 ID',
+        endpointUrl: '端点 URL',
+        defaultModel: '默认模型',
+        context: '上下文',
+        apiKey: 'API 密钥',
+        apiKeyPlaceholder: '可选',
+        apiKeyNewPlaceholder: '留空以保留当前密钥',
+        useNewChats: '用于新会话',
+        discoverModels: '发现模型'
+      }
+    },
+    billing: {
+      title: '账单',
+      preview: '预览',
+      summary: {
+        balance: '余额',
+        plan: '方案',
+        autoRefill: '自动充值'
+      },
+      sections: {
+        plan: '方案',
+        paymentAndCredits: '付款与额度',
+        usage: '使用量'
+      },
+      usage: {
+        title: '使用量'
+      },
+      buyCredits: {
+        title: '立即购买额度',
+        buyButton: '购买',
+        processing: '处理中… 正在检查结算',
+        added: amount => `已添加 ${amount}。余额正在刷新。`,
+        retry: '重试',
+        openPortal: '打开门户'
+      },
+      plan: {
+        title: '方案',
+        changePlan: '更换方案',
+        viewPlans: '查看方案',
+        backAria: '返回账单',
+        current: '当前方案',
+        scheduled: '已预约',
+        empty: '当前没有可选方案。',
+        undo: '撤销',
+        undoing: '撤销中…',
+        downgrade: '降级',
+        confirmDowngrade: '确认降级',
+        tryAgain: '重试',
+        checkingChange: '正在检查此变更…',
+        cannotChange: '此处无法更改。',
+        alreadyOn: name => `您已在 ${name} 方案 — 无需更改。`,
+        notScheduleable: '此变更无法在此处预约。',
+        scheduling: '预约中…',
+        cancel: '取消',
+        effectScheduled: (targetName, effectiveAt, creditsDelta) =>
+          `更改为 ${targetName} — 将于 ${effectiveAt} 生效。现在不收费；届时前保留当前方案。${creditsDelta ? ` 月度额度变化：${creditsDelta}。` : ''}`
+      },
+      autoReload: {
+        threshold: '阈值',
+        reloadTo: '充值至',
+        turnOffConfirm: '关闭自动充值？',
+        turnOff: '关闭',
+        disable: '禁用',
+        updated: '自动充值已更新。',
+        turnedOff: '自动充值已关闭。',
+        manage: '管理',
+        save: '保存',
+        saving: '保存中…',
+        cancel: '取消'
       }
     },
     providers: {

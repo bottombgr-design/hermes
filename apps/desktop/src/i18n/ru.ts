@@ -1070,6 +1070,116 @@ export const ru = defineLocale({
           label: 'Куратор',
           hint: 'Ревью использования навыков'
         }
+      },
+      moaTitle: 'Mixture of Agents',
+      moaDesc:
+        'Настройте именованные пресеты, которые отображаются как модели у провайдера Mixture of Agents. Агрегатор — действующая модель.',
+      moaEnabled: 'Включено',
+      moaPreset: 'Пресет',
+      moaSetDefault: 'По умолчанию',
+      moaDelete: 'Удалить',
+      moaNewPreset: 'новый пресет',
+      moaAddPreset: 'Добавить пресет',
+      moaDefault: name => `По умолчанию: ${name}`,
+      moaReference: n => `Модель ${n}`,
+      moaRemove: 'Удалить',
+      moaAddRefModel: 'Добавить модель',
+      moaAggregator: 'Агрегатор',
+    },
+    customEndpoints: {
+      title: 'Пользовательские эндпоинты',
+      emptyTitle: 'Нет пользовательских эндпоинтов',
+      emptyDescription: 'Добавьте OpenAI-совместимый эндпоинт ниже.',
+      addTitle: 'Добавить эндпоинт',
+      editTitle: 'Изменить эндпоинт',
+      active: 'Активен',
+      apiKeySet: 'API-ключ задан',
+      use: 'Использовать',
+      deleteEndpoint: 'Удалить эндпоинт',
+      deleteConfirm: name => `Удалить ${name}?`,
+      newEndpoint: 'Новый эндпоинт',
+      couldNotLoad: 'Не удалось загрузить пользовательские эндпоинты',
+      endpointSaved: 'Пользовательский эндпоинт сохранён.',
+      saveFailed: 'Не удалось сохранить',
+      validationFailed: 'Не удалось проверить',
+      activationFailed: 'Не удалось активировать',
+      deleteFailed: 'Не удалось удалить',
+      endpointReachable: 'Эндпоинт доступен.',
+      endpointReachableModels: n => `Эндпоинт доступен. Найдено ${n} ${ruPlural(n, 'модель', 'модели', 'моделей')}.`,
+      endpointValidationFailed: 'Проверка эндпоинта не удалась.',
+      test: 'Проверить',
+      save: 'Сохранить',
+      fields: {
+        name: 'Название',
+        providerId: 'ID провайдера',
+        endpointUrl: 'URL эндпоинта',
+        defaultModel: 'Модель по умолчанию',
+        context: 'Контекст',
+        apiKey: 'API-ключ',
+        apiKeyPlaceholder: 'Необязательно',
+        apiKeyNewPlaceholder: 'Оставьте пустым, чтобы сохранить текущий ключ',
+        useNewChats: 'Использовать для новых чатов',
+        discoverModels: 'Найти модели'
+      }
+    },
+    billing: {
+      title: 'Биллинг',
+      preview: 'превью',
+      summary: {
+        balance: 'Баланс',
+        plan: 'Тариф',
+        autoRefill: 'Автопополнение'
+      },
+      sections: {
+        plan: 'Тариф',
+        paymentAndCredits: 'Оплата и кредиты',
+        usage: 'Использование'
+      },
+      usage: {
+        title: 'Использование'
+      },
+      buyCredits: {
+        title: 'Купить кредиты сейчас',
+        buyButton: 'Купить',
+        processing: 'Обработка… проверка платежа',
+        added: amount => `${amount} добавлено. Баланс обновляется.`,
+        retry: 'Повторить',
+        openPortal: 'Открыть портал'
+      },
+      plan: {
+        title: 'Тарифы',
+        changePlan: 'Сменить тариф',
+        viewPlans: 'Посмотреть тарифы',
+        backAria: 'Назад к биллингу',
+        current: 'Текущий тариф',
+        scheduled: 'Запланирован',
+        empty: 'Сейчас нет доступных для смены тарифов.',
+        undo: 'Отменить',
+        undoing: 'Отмена…',
+        downgrade: 'Понизить',
+        confirmDowngrade: 'Подтвердить понижение',
+        tryAgain: 'Попробовать снова',
+        checkingChange: 'Проверка изменения…',
+        cannotChange: 'Это изменение невозможно выполнить здесь.',
+        alreadyOn: name => `Вы уже на тарифе ${name} — нечего менять.`,
+        notScheduleable: 'Это изменение нельзя запланировать здесь.',
+        scheduling: 'Планирование…',
+        cancel: 'Отмена',
+        effectScheduled: (targetName, effectiveAt, creditsDelta) =>
+          `Переход на ${targetName} — вступит в силу ${effectiveAt}. Сейчас оплата не взимается; вы сохраняете текущий тариф до этого момента.${creditsDelta ? ` Изменение месячных кредитов: ${creditsDelta}.` : ''}`
+      },
+      autoReload: {
+        threshold: 'Порог',
+        reloadTo: 'Пополнить до',
+        turnOffConfirm: 'Отключить автопополнение?',
+        turnOff: 'Отключить',
+        disable: 'Отключить',
+        updated: 'Автопополнение обновлено.',
+        turnedOff: 'Автопополнение отключено.',
+        manage: 'Управление',
+        save: 'Сохранить',
+        saving: 'Сохранение…',
+        cancel: 'Отмена'
       }
     },
     providers: {

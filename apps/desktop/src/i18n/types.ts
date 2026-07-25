@@ -684,6 +684,114 @@ export interface Translations {
       fallbackEmpty: string
       notInCatalog: string
       tasks: Record<string, AuxTaskCopy>
+      moaTitle: string
+      moaDesc: string
+      moaEnabled: string
+      moaPreset: string
+      moaSetDefault: string
+      moaDelete: string
+      moaNewPreset: string
+      moaAddPreset: string
+      moaDefault: (name: string) => string
+      moaReference: (n: number) => string
+      moaRemove: string
+      moaAddRefModel: string
+      moaAggregator: string
+    }
+    customEndpoints: {
+      title: string
+      emptyTitle: string
+      emptyDescription: string
+      addTitle: string
+      editTitle: string
+      active: string
+      apiKeySet: string
+      use: string
+      deleteEndpoint: string
+      deleteConfirm: (name: string) => string
+      newEndpoint: string
+      couldNotLoad: string
+      endpointSaved: string
+      saveFailed: string
+      validationFailed: string
+      activationFailed: string
+      deleteFailed: string
+      endpointReachable: string
+      endpointReachableModels: (n: number) => string
+      endpointValidationFailed: string
+      test: string
+      save: string
+      fields: {
+        name: string
+        providerId: string
+        endpointUrl: string
+        defaultModel: string
+        context: string
+        apiKey: string
+        apiKeyPlaceholder: string
+        apiKeyNewPlaceholder: string
+        useNewChats: string
+        discoverModels: string
+      }
+    }
+    billing: {
+      title: string
+      preview: string
+      summary: {
+        balance: string
+        plan: string
+        autoRefill: string
+      }
+      sections: {
+        plan: string
+        paymentAndCredits: string
+        usage: string
+      }
+      usage: {
+        title: string
+      }
+      buyCredits: {
+        title: string
+        buyButton: string
+        processing: string
+        added: (amount: string) => string
+        retry: string
+        openPortal: string
+      }
+      plan: {
+        title: string
+        changePlan: string
+        viewPlans: string
+        backAria: string
+        current: string
+        scheduled: string
+        empty: string
+        undo: string
+        undoing: string
+        downgrade: string
+        confirmDowngrade: string
+        tryAgain: string
+        checkingChange: string
+        cannotChange: string
+        alreadyOn: (name: string) => string
+        notScheduleable: string
+        scheduling: string
+        cancel: string
+        effectScheduled: (targetName: string, effectiveAt: string, creditsDelta: string) => string
+      }
+      autoReload: {
+        threshold: string
+        reloadTo: string
+        turnOffConfirm: string
+        turnOff: string
+        disable: string
+        updated: string
+        turnedOff: string
+        manage: string
+        save: string
+        saving: string
+        cancel: string
+      }
     }
     providers: {
       connectAccount: string
