@@ -1325,21 +1325,34 @@ def _ensure_terminal_env_bridged() -> None:
     config.yaml selects ``terminal.backend: docker``, running commands on the
     host the user intended to sandbox (#63141, #54449, #61115, #65696).
 
-    Explicit env always wins: when TERMINAL_ENV is already set (a launcher's
-    bridge or the user's .env made a deliberate choice) this is a no-op.  The
-    config bridge only fills the unset case, so it changes an accidental
-    default — never an explicit selection.
+    Explicit config.yaml wins: when config.yaml has a ``terminal`` section,
+    it overrides .env values (which may be stale from ``hermes setup``).
+    When no terminal section exists in config.yaml, .env values are
+    preserved so exported/.env values keep working.
     """
     global _terminal_config_bridge_attempted
-    if "TERMINAL_ENV" in os.environ or _terminal_config_bridge_attempted:
+    if _terminal_config_bridge_attempted:
         return
     _terminal_config_bridge_attempted = True
     try:
-        from hermes_cli.config import apply_terminal_config_to_env
+        from hermes_cli.config import apply_terminal_config_to_env, read_raw_config
 
-        # env=None targets os.environ inside the helper; override=False keeps
-        # any already-set TERMINAL_* values (e.g. from .env) authoritative.
-        apply_terminal_config_to_env(env=None, override=False)
+        # Check if config.yaml has an explicit terminal section.
+        # If it does, config.yaml is authoritative — bridge with override
+        # so stale .env values (e.g. TERMINAL_ENV=ssh from `hermes setup`)
+        # are replaced by the user's current config.yaml settings.
+        # If no terminal section in config.yaml, only backfill missing env
+        # vars so .env values keep working.
+        raw_config = read_raw_config()
+        has_terminal_section = isinstance(raw_config.get("terminal"), dict)
+
+        if has_terminal_section:
+            # Config.yaml has terminal section — it wins over .env
+            apply_terminal_config_to_env(env=None, override=True)
+        elif "TERMINAL_ENV" not in os.environ:
+            # No terminal section in config.yaml, TERMINAL_ENV not set —
+            # backfill from config defaults
+            apply_terminal_config_to_env(env=None, override=False)
     except Exception:
         # Never let a config problem take the terminal tool down — the
         # historical local default still applies.
