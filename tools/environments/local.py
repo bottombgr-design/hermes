@@ -1361,6 +1361,11 @@ class LocalEnvironment(BaseEnvironment):
     CWD persists via file-based read after each command.
     """
 
+    # Local spawns receive canonical process/profile identity on every call via
+    # _make_run_env(). Do not let one shared session's shell exports persist a
+    # stale HOME/HERMES_HOME/HERMES_REAL_HOME over that authoritative baseline.
+    _snapshot_exclude_structural_home = True
+
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
