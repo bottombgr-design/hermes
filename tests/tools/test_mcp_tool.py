@@ -409,6 +409,22 @@ class TestSchemaConversion:
         # The $ref into the legacy location was rewritten too.
         assert schema["parameters"]["properties"]["payload"]["$ref"] == "#/$defs/Payload"
 
+    def test_definition_named_definitions_keeps_inner_name(self):
+        """The ``definitions`` keyword block is renamed, but a definition whose
+        name happens to be ``definitions`` is a name, not a keyword, and must
+        be preserved (with its ``$ref`` rewritten to point at it)."""
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {"p": {"$ref": "#/definitions/definitions"}},
+            "definitions": {"definitions": {"type": "string"}},
+        })
+
+        assert "definitions" not in schema
+        assert list(schema["$defs"].keys()) == ["definitions"]
+        assert schema["properties"]["p"]["$ref"] == "#/$defs/definitions"
+
     def test_missing_type_on_object_is_coerced(self):
         """Schemas that describe an object but omit ``type`` get type='object'."""
         from tools.mcp_tool import _normalize_mcp_input_schema
