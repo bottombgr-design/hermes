@@ -370,6 +370,75 @@ def test_api_gmail_send_uses_conventional_mime_header_casing(api_module):
     assert "\nsubject: " not in raw_text
 
 
+def test_api_gmail_filter_create_uses_settings_api(api_module, capsys):
+    captured = {}
+
+    def fake_run_gws(parts, *, params=None, body=None):
+        captured.update(parts=parts, params=params, body=body)
+        return {"id": "filter-1", **body}
+
+    api_module._run_gws = fake_run_gws
+    args = api_module.argparse.Namespace(
+        from_address="alerts@example.com",
+        to="",
+        subject="",
+        query="has:attachment",
+        negated_query="",
+        has_attachment=False,
+        exclude_chats=True,
+        add_labels="Label_1, STARRED",
+        remove_labels="INBOX",
+        func=api_module.gmail_filter_create,
+    )
+
+    api_module.gmail_filter_create(args)
+
+    assert captured == {
+        "parts": ["gmail", "users", "settings", "filters", "create"],
+        "params": {"userId": "me"},
+        "body": {
+            "criteria": {
+                "from": "alerts@example.com",
+                "query": "has:attachment",
+                "excludeChats": True,
+            },
+            "action": {
+                "addLabelIds": ["Label_1", "STARRED"],
+                "removeLabelIds": ["INBOX"],
+            },
+        },
+    }
+    assert json.loads(capsys.readouterr().out)["filter"]["id"] == "filter-1"
+
+
+@pytest.mark.parametrize(
+    ("criteria", "actions", "message"),
+    [
+        ({}, {"add_labels": "Label_1"}, "matching criterion"),
+        ({"from_address": "alerts@example.com"}, {}, "--add-labels or --remove-labels"),
+    ],
+)
+def test_api_gmail_filter_create_rejects_incomplete_filter(
+    api_module, criteria, actions, message
+):
+    values = {
+        "from_address": "",
+        "to": "",
+        "subject": "",
+        "query": "",
+        "negated_query": "",
+        "has_attachment": False,
+        "exclude_chats": False,
+        "add_labels": "",
+        "remove_labels": "",
+        **criteria,
+        **actions,
+    }
+
+    with pytest.raises(SystemExit, match=message):
+        api_module.gmail_filter_create(api_module.argparse.Namespace(**values))
+
+
 @pytest.mark.parametrize(
     "header_names",
     [
