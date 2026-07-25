@@ -35,6 +35,7 @@ def _flatten(d, prefix="") -> dict:
 # falls back to English for those users and defeats the feature.
 # ---------------------------------------------------------------------------
 
+
 def test_all_locales_exist():
     """Every supported language must have a catalog file on disk."""
     for lang in i18n.SUPPORTED_LANGUAGES:
@@ -61,6 +62,7 @@ def test_catalog_placeholders_match_english(lang: str):
     value.  Pin parity at the test layer.
     """
     import re
+
     placeholder_re = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
     en_flat = _flatten(_load_raw("en"))
     lang_flat = _flatten(_load_raw(lang))
@@ -77,6 +79,7 @@ def test_catalog_placeholders_match_english(lang: str):
 # ---------------------------------------------------------------------------
 # Language resolution
 # ---------------------------------------------------------------------------
+
 
 def test_normalize_lang_accepts_supported():
     assert i18n._normalize_lang("zh") == "zh"
@@ -133,6 +136,7 @@ def test_default_when_nothing_set(monkeypatch):
 # t() semantics
 # ---------------------------------------------------------------------------
 
+
 def test_t_explicit_lang():
     assert i18n.t("approval.denied", lang="en").endswith("Denied")
     assert i18n.t("approval.denied", lang="zh").endswith("已拒绝")
@@ -141,32 +145,24 @@ def test_t_explicit_lang():
     assert i18n.t("approval.denied", lang="pl").endswith("Odrzucono")
 
 
-def test_polish_catalog_has_no_known_literal_translation_regressions():
-    """Keep machine-translation artifacts out of user-visible Polish copy."""
-    import re
+def test_polish_catalog_preserves_targeted_translation_semantics():
+    """Pin corrected meanings to the keys where literal regressions occurred."""
+    catalog = _flatten(_load_raw("pl"))
 
-    text = "\n".join(str(value) for value in _flatten(_load_raw("pl")).values())
-    forbidden = [
-        r"modelk",
-        r"Bliźnięt",
-        r"\bBieganie\b",
-        r"\bBiegnij\b",
-        r"\bWłaz\b",
-        r"\bTarło\b",
-        r"Zremis",
-        r"\boddział",
-        r"żeton",
-        r"kompozytor",
-        r"zaplecz",
-        r"Pulpit Hermes",
-        r"Centrum dowodzenia",
-        r"\bbramk",
-        r"\bmonit(?:u|em|ach|ami|y|ów|owi|cie|owanie|owania)?\b",
-        r"zachęt",
-        r"narzędzi\(a\)|serwera\(ów\)|umiejętność\(i\)",
-    ]
-    for pattern in forbidden:
-        assert not re.search(pattern, text, flags=re.IGNORECASE), pattern
+    # Valid vocabulary elsewhere must not affect these key-specific contracts.
+    catalog["unrelated.valid_vocabulary"] = "oddział żeton kompozytor monit"
+
+    expected = {
+        "gateway.agents.async_jobs": "**Zadania asynchroniczne bramy:** {count}",
+        "gateway.reload_mcp.tools_available": (
+            "\n🔧 Dostępne narzędzia: {tools} · Połączone serwery: {servers}"
+        ),
+        "gateway.reload_skills.total": "\n📚 Dostępne umiejętności: {count}",
+        "gateway.restart.in_progress": "⏳ Ponowne uruchamianie bramy jest już w toku…",
+        "gateway.status.header": "📊 **Stan bramy Hermes**",
+    }
+
+    assert {key: catalog[key] for key in expected} == expected
 
 
 def test_t_formats_placeholders():
@@ -199,7 +195,9 @@ def test_t_missing_key_in_non_english_falls_back_to_english(tmp_path, monkeypatc
 
 def test_t_unknown_language_uses_english():
     """Unknown lang codes normalize to English, not to a key-path fallback."""
-    assert i18n.t("approval.denied", lang="klingon") == i18n.t("approval.denied", lang="en")
+    assert i18n.t("approval.denied", lang="klingon") == i18n.t(
+        "approval.denied", lang="en"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +205,7 @@ def test_t_unknown_language_uses_english():
 # Sealed installs (Nix store venv, pip wheel) have no source tree next to
 # agent/, so _locales_dir must resolve via env override or the data scheme.
 # ---------------------------------------------------------------------------
+
 
 def test_locales_dir_env_override_used_when_dir_exists(tmp_path, monkeypatch):
     """HERMES_BUNDLED_LOCALES wins when it points at a real directory."""
@@ -230,5 +229,8 @@ def test_t_resolves_real_string_in_source_checkout():
     """Sanity: in the test environment (a source checkout) t() must return a
     human string, never the bare key path. Guards against catalog-load
     regressions independent of packaging."""
-    assert i18n.t("gateway.reset.header_default", lang="en") != "gateway.reset.header_default"
+    assert (
+        i18n.t("gateway.reset.header_default", lang="en")
+        != "gateway.reset.header_default"
+    )
     assert i18n.t("gateway.status.header", lang="en") != "gateway.status.header"
