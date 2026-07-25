@@ -7400,11 +7400,15 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
         ) from exc
 
     if loaded is not None and not isinstance(loaded, dict):
-        _backup_corrupt_config(config_path)
+        exc = TypeError(
+            f"top-level YAML must be a mapping, got {type(loaded).__name__}"
+        )
+        _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
         raise RuntimeError(
             f"Refusing to overwrite {config_path}: top-level YAML must be a mapping, "
-            f"got {type(loaded).__name__}. Fix the file or move it aside first."
-        )
+            f"got {type(loaded).__name__}. Fix the file or restore from a "
+            f".corrupt.*.bak backup first."
+        ) from exc
 
 
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
@@ -9034,7 +9038,15 @@ def set_config_value(key: str, value: str, force: bool = False):
     if config_path.exists():
         with open(config_path, encoding="utf-8") as f:
             loaded = fast_safe_load(f)
-        user_config = {} if loaded is None else loaded
+        if loaded is None:
+            user_config = {}
+        elif not isinstance(loaded, dict):
+            raise RuntimeError(
+                f"Refusing to overwrite {config_path}: top-level YAML must be a mapping, "
+                f"got {type(loaded).__name__}. Fix the file or move it aside first."
+            )
+        else:
+            user_config = loaded
 
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
@@ -9172,7 +9184,15 @@ def unset_config_value(key: str):
     if config_path.exists():
         with open(config_path, encoding="utf-8") as f:
             loaded = fast_safe_load(f)
-        user_config = {} if loaded is None else loaded
+        if loaded is None:
+            user_config = {}
+        elif not isinstance(loaded, dict):
+            raise RuntimeError(
+                f"Refusing to overwrite {config_path}: top-level YAML must be a mapping, "
+                f"got {type(loaded).__name__}. Fix the file or move it aside first."
+            )
+        else:
+            user_config = loaded
 
     removed = _unset_nested(user_config, key)
 

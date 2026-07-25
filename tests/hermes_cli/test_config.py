@@ -495,6 +495,9 @@ class TestSaveAndLoadRoundtrip:
                 set_config_value("model.default", "gpt-4o")
 
         assert config_path.read_text(encoding="utf-8") == original
+        assert list(tmp_path.glob("config.yaml.corrupt.*.bak")), (
+            "non-mapping root should snapshot a corrupt backup before refusing"
+        )
 
     def test_config_set_allows_valid_empty_mapping(self, tmp_path):
         """A genuine empty {} config must still be writable (not a false refuse)."""
@@ -536,6 +539,7 @@ class TestSaveAndLoadRoundtrip:
             atomic_config_write(config_path, {"model": {"provider": "openai"}})
 
         assert config_path.read_text(encoding="utf-8") == original
+        assert list(tmp_path.glob("config.yaml.corrupt.*.bak"))
 
     def test_atomic_config_write_creates_new_file(self, tmp_path):
         """A genuinely absent config.yaml must still be created — the guard
