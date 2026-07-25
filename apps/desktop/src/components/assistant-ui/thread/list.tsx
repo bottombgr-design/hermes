@@ -134,6 +134,24 @@ export function isVirtualizedGroup(indexInVisible: number, visibleCount: number,
   return indexInVisible < visibleCount - liveTail
 }
 
+const TURN_TOP_OFFSET = 8
+
+export function scrollLatestTurnStartIntoView(viewport: HTMLElement): boolean {
+  const turns = viewport.querySelectorAll<HTMLElement>('[data-slot="aui_turn-pair"]')
+  const latestTurn = turns.item(turns.length - 1)
+
+  if (!latestTurn) {
+    return false
+  }
+
+  viewport.scrollTop = Math.max(
+    0,
+    viewport.scrollTop + latestTurn.getBoundingClientRect().top - viewport.getBoundingClientRect().top - TURN_TOP_OFFSET
+  )
+
+  return true
+}
+
 const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   clampToComposer,
   components,
@@ -216,6 +234,10 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   const hiddenCount = firstVisibleGroupIndex(groups, renderBudget)
   const visibleGroups = hiddenCount > 0 ? groups.slice(hiddenCount) : groups
   const restoreFromBottomRef = useRef<number | null>(null)
+  const responseAnchorActiveRef = useRef(false)
+  const responseAnchorWriteRef = useRef(false)
+  const responseAnchorTopRef = useRef<number | null>(null)
+  const threadRunning = useAuiState(s => s.thread.isRunning)
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // hide the titlebar tool cluster + session header, but the OS traffic lights
   // still sit in the top-left, so reserve the titlebar gap above the transcript.
@@ -259,8 +281,72 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   useEffect(() => onThreadEditOpen(beginEditHold), [beginEditHold])
   useEffect(() => onThreadEditClose(endEditHold), [endEditHold])
   useEffect(() => () => endEditHold(), [endEditHold])
-  // New run → snap to the latest turn.
-  useAuiEvent('thread.runStart', () => void scrollToBottom())
+
+  const anchorLatestTurnStart = useCallback(() => {
+    const el = scrollRef.current
+
+    if (!el) {
+      return
+    }
+
+    stopScroll()
+    responseAnchorWriteRef.current = true
+
+    if (scrollLatestTurnStartIntoView(el)) {
+      responseAnchorTopRef.current = el.scrollTop
+    }
+
+    queueMicrotask(() => {
+      responseAnchorWriteRef.current = false
+    })
+  }, [scrollRef, stopScroll])
+
+  useEffect(() => {
+    const el = scrollRef.current
+
+    if (!el) {
+      return
+    }
+
+    const onScroll = () => {
+      const anchoredTop = responseAnchorTopRef.current
+
+      if (!responseAnchorActiveRef.current || responseAnchorWriteRef.current || anchoredTop == null) {
+        return
+      }
+
+      if (Math.abs(el.scrollTop - anchoredTop) > 24) {
+        responseAnchorActiveRef.current = false
+      }
+    }
+
+    el.addEventListener('scroll', onScroll, { passive: true })
+
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [scrollRef])
+
+  // New run → keep the start of the new user/assistant turn in view, not the
+  // bottom of a long streamed reply. If the user manually scrolls, the native
+  // listener above releases this anchor and normal stick-to-bottom behavior can
+  // re-engage when they jump back down.
+  useAuiEvent('thread.runStart', () => {
+    responseAnchorActiveRef.current = true
+    anchorLatestTurnStart()
+    requestAnimationFrame(anchorLatestTurnStart)
+  })
+
+  useLayoutEffect(() => {
+    if (!threadRunning) {
+      responseAnchorActiveRef.current = false
+      responseAnchorTopRef.current = null
+
+      return
+    }
+
+    if (responseAnchorActiveRef.current) {
+      anchorLatestTurnStart()
+    }
+  }, [anchorLatestTurnStart, messageSignature, threadRunning])
 
   // Reset the cap and pin to bottom on mount + every session switch (messages
   // swap in place on a long-lived runtime, so sessionKey is the only signal).
