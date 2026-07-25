@@ -173,7 +173,17 @@ let
   # resolves each package from the lockfile's own `integrity` hashes, so the
   # lockfile is the single source of truth — no separate dependency hash to
   # keep in sync with it.
-  npmDeps = pkgs.importNpmLock.importNpmLock { npmRoot = npmDepsSrc; };
+  #
+  # package/packageLock come from repoRoot, not npmDepsSrc: importNpmLock would
+  # otherwise importJSON them out of the fileset copy, which only materialises
+  # when nix may write to the store.  Reading one during evaluation therefore
+  # breaks read-only eval (`nix flake check --no-build`) with "path '…-source'
+  # is not valid".  repoRoot is the flake's own source, always valid.
+  npmDeps = pkgs.importNpmLock.importNpmLock {
+    npmRoot = npmDepsSrc;
+    package = rootPackageJson;
+    packageLock = lib.importJSON (repoRoot + "/package-lock.json");
+  };
 
   # Build a per-package npm source: workspace resolution files + the
   # package's own directory tree(s).  Source ROOT is always the repo
@@ -220,6 +230,7 @@ in
   #   src, npmDeps, npmRoot      — filtered workspace source + importNpmLock dep set
   #   npmConfigHook              — importNpmLock's offline `npm install` hook
   #   passthru.packageJsonPath   — relative path to this workspace's package.json
+  #   passthru.packageJson       — its parsed contents (for `version`)
   #   nodejs                     — fixed nodejs version for all packages we use in the repo
   #
   # `dirs` is the single source of truth for what the package contains:
@@ -261,6 +272,8 @@ in
 
       passthru = {
         packageJsonPath = "${folder}/package.json";
+        # From repoRoot, never from `src`. See npmDeps above.
+        packageJson = lib.importJSON (repoRoot + "/${folder}/package.json");
       };
     };
 

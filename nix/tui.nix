@@ -8,8 +8,7 @@ let
     ];
   };
 
-  packageJson = builtins.fromJSON (builtins.readFile (npm.src + "/ui-tui/package.json"));
-  version = packageJson.version;
+  version = npm.passthru.packageJson.version;
 in
 pkgs.buildNpmPackage (npm // {
   pname = "hermes-tui";
