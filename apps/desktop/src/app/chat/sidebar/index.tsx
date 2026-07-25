@@ -867,9 +867,17 @@ export function ChatSidebar({
       return []
     }
 
+    // The fetch is already profile-scoped, but a profile switch doesn't wipe
+    // $messagingSessions (only a gateway-mode switch does), so the previous
+    // profile's rows would linger until the next refresh lands. Filtering here
+    // makes the switch instant; it's a no-op once the scoped rows arrive.
+    const visibleMessaging = showAllProfiles
+      ? messagingSessions
+      : messagingSessions.filter(s => normalizeProfileKey(s.profile) === profileScope)
+
     const bySource = new Map<string, SessionInfo[]>()
 
-    for (const session of messagingSessions) {
+    for (const session of visibleMessaging) {
       const sourceId = normalizeSessionSource(session.source)
 
       if (!sourceId) {
@@ -899,7 +907,7 @@ export function ChatSidebar({
         }
       })
       .sort((a, b) => sessionTime(b.sessions[0]) - sessionTime(a.sessions[0]))
-  }, [messagingSessions, messagingPlatformTotals, messagingTruncated])
+  }, [messagingSessions, messagingPlatformTotals, messagingTruncated, profileScope, showAllProfiles])
 
   // ALL-profiles view: one collapsible group per profile, color on the header
   // (not on every row). Default profile floats to the top, the rest alpha.

@@ -2079,6 +2079,51 @@ class TestWebServerEndpoints:
         assert isinstance(data.get("errors"), list)
         assert data["recents"]["total"] >= 1
 
+    def test_profiles_sessions_sidebar_scopes_messaging_to_profile(self):
+        """Messaging-platform conversations (WeChat/Telegram/…) live in the
+        owning profile's state.db, so the sidebar's per-platform sections must
+        window ONE profile's rows. Unscoped, the shared ``messaging_limit``
+        window is filled from the union, so a busy profile crowds the quieter
+        one out and every profile shows a truncated mix."""
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True)
+
+        default_db = SessionDB()
+        try:
+            default_db.create_session(session_id="wx-default", source="weixin")
+            default_db.append_message("wx-default", role="user", content="hi")
+        finally:
+            default_db.close()
+
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            worker_db.create_session(session_id="wx-worker", source="weixin")
+            worker_db.append_message("wx-worker", role="user", content="hi")
+        finally:
+            worker_db.close()
+
+        query = (
+            "/api/profiles/sessions/sidebar"
+            "?recents_profile=worker&recents_limit=20&recents_exclude=weixin"
+            "&cron_limit=50&messaging_limit=100"
+            "&messaging_exclude=cron,cli,codex,desktop,gateway,local,tui"
+        )
+
+        scoped = self.client.get(f"{query}&messaging_profile=worker")
+        assert scoped.status_code == 200
+        ids = {s["id"] for s in scoped.json()["messaging"]["sessions"]}
+        assert ids == {"wx-worker"}
+
+        # 'all' keeps the unified view, and so does omitting the param entirely
+        # (back-compat: an older desktop sends no messaging_profile).
+        for unified in (self.client.get(f"{query}&messaging_profile=all"), self.client.get(query)):
+            assert unified.status_code == 200
+            ids = {s["id"] for s in unified.json()["messaging"]["sessions"]}
+            assert {"wx-default", "wx-worker"} <= ids
+
     def test_sessions_endpoint_reads_requested_profile(self):
         """The machine dashboard's global profile switcher must retarget
         the Sessions page, not just config/skills/model pages."""

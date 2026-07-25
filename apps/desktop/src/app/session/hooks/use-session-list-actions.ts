@@ -76,13 +76,20 @@ interface UseSessionListActionsArgs {
 export function useSessionListActions({ profileScope }: UseSessionListActionsArgs) {
   const refreshSessionsRequestRef = useRef(0)
 
+  // Messaging conversations are stored in the owning profile's state.db, and
+  // every messaging read windows a shared row budget — so an unscoped fetch
+  // lets a busy profile crowd the others out of the window. Scope them like
+  // recents/cron: a concrete profile sees only its own platform conversations,
+  // ALL_PROFILES keeps the unified view.
+  const messagingProfile = profileScope === ALL_PROFILES ? 'all' : profileScope
+
   // Messaging-platform sessions as their own slice, fetched separately from
   // local recents so each platform renders a self-managed section and never
   // competes with local chats for the recents page budget. One combined fetch
   // seeds every platform; the sidebar splits the rows per source.
   const refreshMessagingSessions = useCallback(async () => {
     try {
-      const result = await listAllProfileSessions(MESSAGING_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
+      const result = await listAllProfileSessions(MESSAGING_SECTION_LIMIT, 1, 'exclude', 'recent', messagingProfile, {
         excludeSources: MESSAGING_EXCLUDED_SOURCES
       })
 
@@ -97,7 +104,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     } catch {
       // Non-fatal: the messaging sections just stay empty/stale.
     }
-  }, [])
+  }, [messagingProfile])
 
   // Page a single platform's section independently (mirrors the per-profile
   // pager): fetch that source's next window and merge it back in place, leaving
@@ -106,9 +113,14 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     const inPlatform = (s: SessionInfo) => normalizeSessionSource(s.source) === platform
     const loaded = $messagingSessions.get().filter(inPlatform).length
 
-    const result = await listAllProfileSessions(loaded + SIDEBAR_SESSIONS_PAGE_SIZE, 1, 'exclude', 'recent', 'all', {
-      source: platform
-    })
+    const result = await listAllProfileSessions(
+      loaded + SIDEBAR_SESSIONS_PAGE_SIZE,
+      1,
+      'exclude',
+      'recent',
+      messagingProfile,
+      { source: platform }
+    )
 
     const incoming = result.sessions.filter(s => normalizeSessionSource(s.source) === platform)
 
@@ -119,7 +131,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
     const total = result.total ?? incoming.length
     setMessagingPlatformTotals(prev => ({ ...prev, [platform]: Math.max(total, incoming.length) }))
-  }, [])
+  }, [messagingProfile])
 
   // Cron *jobs* drive the sidebar "Cron jobs" section. Jobs are created
   // synchronously (agent tool call or the cron UI), so refreshing here right
@@ -162,8 +174,9 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       // the same rows tagged profile="default".
       // Scope recents to the active profile (not always 'all') so a profile
       // with few recent sessions isn't windowed out of the cross-profile
-      // recency page — the empty-history-on-profile-switch bug. Cron + messaging
-      // stay cross-profile.
+      // recency page — the empty-history-on-profile-switch bug. Messaging is
+      // scoped the same way (see messagingProfile); only cron stays
+      // cross-profile.
       const sessionProfile = profileScope === ALL_PROFILES ? 'all' : profileScope
 
       // Batched: one request opens each profile DB once and returns all three
@@ -175,7 +188,8 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         recentsExclude: SIDEBAR_EXCLUDED_SOURCES,
         cronLimit: CRON_SECTION_LIMIT,
         messagingLimit: MESSAGING_SECTION_LIMIT,
-        messagingExclude: MESSAGING_EXCLUDED_SOURCES
+        messagingExclude: MESSAGING_EXCLUDED_SOURCES,
+        messagingProfile
       })
 
       if (refreshSessionsRequestRef.current === requestId) {
@@ -233,7 +247,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
     // Cron *jobs* are a distinct API (getCronJobs), not a session slice.
     void refreshCronJobs()
-  }, [profileScope, refreshCronJobs])
+  }, [messagingProfile, profileScope, refreshCronJobs])
 
   const loadMoreSessions = useCallback(async () => {
     bumpSessionsLimit()

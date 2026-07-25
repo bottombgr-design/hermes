@@ -231,8 +231,50 @@ describe('refreshSessions batches slices into one request', () => {
       expect.objectContaining({
         recentsProfile: 'work',
         recentsExclude: expect.arrayContaining(['cron']),
-        messagingExclude: expect.arrayContaining(['cron'])
+        messagingExclude: expect.arrayContaining(['cron']),
+        messagingProfile: 'work'
       })
+    )
+  })
+
+  // Messaging conversations live in the owning profile's state.db and every
+  // messaging read windows a shared row budget, so an unscoped fetch let a busy
+  // profile crowd the quieter ones out of the window — the sidebar's WeChat /
+  // Telegram sections showed a truncated union no matter which profile was
+  // selected.
+  it('scopes the messaging slices to the active profile (all → unified view)', async () => {
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [], total: 0, profile_totals: {} }))
+    listAllProfileSessions.mockResolvedValue({ sessions: [], total: 0 })
+
+    const scoped = renderHook(() => useSessionListActions({ profileScope: 'work' }))
+
+    await act(async () => {
+      await scoped.result.current.refreshMessagingSessions()
+    })
+
+    // 5th positional arg of listAllProfileSessions is the profile.
+    expect(listAllProfileSessions.mock.calls.at(-1)?.[4]).toBe('work')
+
+    await act(async () => {
+      await scoped.result.current.loadMoreMessagingForPlatform('weixin')
+    })
+
+    expect(listAllProfileSessions.mock.calls.at(-1)?.[4]).toBe('work')
+
+    const unified = renderHook(() => useSessionListActions({ profileScope: '__all__' }))
+
+    await act(async () => {
+      await unified.result.current.refreshMessagingSessions()
+    })
+
+    expect(listAllProfileSessions.mock.calls.at(-1)?.[4]).toBe('all')
+
+    await act(async () => {
+      await unified.result.current.refreshSessions()
+    })
+
+    expect(listSidebarSessions).toHaveBeenLastCalledWith(
+      expect.objectContaining({ messagingProfile: 'all' })
     )
   })
 
