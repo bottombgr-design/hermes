@@ -268,6 +268,7 @@ class TurnContext:
     ext_prefetch_cache: str = ""
     # Retrieved semantic skills context (appended to user message dynamically per-turn).
     retrieved_skills_context: str = ""
+    # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
 
 
