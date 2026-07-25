@@ -2755,10 +2755,32 @@ def terminal_tool(
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                  max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+
+                    # Auto-evict stale SSH environments on connection failures
+                    error_str = str(e)
+                    _ssh_conn_errors = (
+                        "SSH connection failed", "Connection refused", "Connection timed out",
+                        "No route to host", "Host is unreachable",
+                    )
+                    if any(msg in error_str for msg in _ssh_conn_errors):
+                        try:
+                            with _env_lock:
+                                _active_environments.pop(effective_task_id, None)
+                                _last_activity.pop(effective_task_id, None)
+                            logger.info("Evicted stale SSH environment for task %s", effective_task_id[:8])
+                        except Exception:
+                            pass
+                        error_str += (
+                            "\n\nHINT: The SSH connection is stale (remote host may have restarted)."
+                            "\nTo fix: update TERMINAL_SSH_HOST and TERMINAL_SSH_PORT in .env"
+                            "\nif they changed, then run /reload. The next command will"
+                            "\ncreate a fresh SSH connection."
+                        )
+
                     return json.dumps({
                         "output": "",
                         "exit_code": -1,
-                        "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
+                        "error": f"Command execution failed: {type(e).__name__}: {error_str}"
                     }, ensure_ascii=False)
                 
                 # Got a result
