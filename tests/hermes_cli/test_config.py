@@ -502,6 +502,19 @@ class TestSaveAndLoadRoundtrip:
             "non-mapping root should snapshot a corrupt backup before refusing"
         )
 
+    def test_config_unset_refuses_non_mapping_root(self, tmp_path):
+        """Unset shares the same non-mapping refuse path as set."""
+        config_path = tmp_path / "config.yaml"
+        original = "- just\n- a\n- list\n"
+        config_path.write_text(original, encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with pytest.raises(RuntimeError, match="must be a mapping"):
+                unset_config_value("model.default")
+
+        assert config_path.read_text(encoding="utf-8") == original
+        assert list(tmp_path.glob("config.yaml.corrupt.*.bak"))
+
     def test_config_set_allows_valid_empty_mapping(self, tmp_path):
         """A genuine empty {} config must still be writable (not a false refuse)."""
         config_path = tmp_path / "config.yaml"

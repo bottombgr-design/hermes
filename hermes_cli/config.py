@@ -7351,7 +7351,9 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
-def require_readable_config_before_write(config_path: Optional[Path] = None) -> None:
+def require_readable_config_before_write(
+    config_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     """Refuse to replace an existing config.yaml that cannot be read or parsed.
 
     Guards two collapse-to-empty failure modes that would otherwise let a
@@ -7363,17 +7365,19 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
        as ``{}``, so a subsequent write would replace the recoverable file
        with only the caller's partial dict.
 
-    A missing file, an empty file, and a valid empty mapping (``{}``) are
-    allowed through so first-time installs and intentional empty configs
-    still work. On parse failure this also snapshots a ``.corrupt.*.bak``
-    via :func:`_warn_config_parse_failure` before raising.
+    Returns the loaded mapping (or ``{}`` for a missing / empty / null
+    document) so mutation callers can skip a second parse. A valid empty
+    mapping (``{}``) is allowed through so first-time installs and
+    intentional empty configs still work. On parse failure this also
+    snapshots a ``.corrupt.*.bak`` via :func:`_warn_config_parse_failure`
+    before raising.
     """
     if config_path is None:
         config_path = get_config_path()
     try:
         config_path.stat()
     except FileNotFoundError:
-        return
+        return {}
     except OSError as exc:
         raise RuntimeError(
             f"Refusing to overwrite {config_path}: existing config.yaml cannot be accessed "
@@ -7389,40 +7393,26 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
             f"({exc}). Fix the file permissions or move it aside first."
         ) from exc
 
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            loaded = fast_safe_load(f)
-    except Exception as exc:
-        _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
-        raise RuntimeError(
-            f"Refusing to overwrite {config_path}: existing config.yaml is not valid YAML "
-            f"({exc}). Fix the file or restore from a .corrupt.*.bak backup first."
-        ) from exc
-
-    if loaded is not None and not isinstance(loaded, dict):
-        exc = TypeError(
-            f"top-level YAML must be a mapping, got {type(loaded).__name__}"
-        )
-        _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
-        raise RuntimeError(
-            f"Refusing to overwrite {config_path}: top-level YAML must be a mapping, "
-            f"got {type(loaded).__name__}. Fix the file or restore from a "
-            f".corrupt.*.bak backup first."
-        ) from exc
+    return _load_user_config_for_mutation(config_path)
 
 
 def _load_user_config_for_mutation(config_path: Path) -> Dict[str, Any]:
-    """Load raw user config after :func:`require_readable_config_before_write`.
+    """Load raw user config for a fail-closed mutation path.
 
     Fail closed on parse / non-mapping (no bare-except → ``{}`` collapse).
-    Callers must invoke the require guard first; this re-check closes the
-    TOCTOU window between the guard and the mutation load.
+    Used by :func:`require_readable_config_before_write` and any caller that
+    must re-validate after other work.
     """
     if not config_path.exists():
         return {}
     try:
         with open(config_path, encoding="utf-8") as f:
             loaded = fast_safe_load(f)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Refusing to overwrite {config_path}: existing config.yaml cannot be read "
+            f"({exc}). Fix the file permissions or move it aside first."
+        ) from exc
     except Exception as exc:
         _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
         raise RuntimeError(
@@ -9063,8 +9053,7 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Read the raw user config (not merged with defaults) to avoid
     # dumping all default values back to the file.
     config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = _load_user_config_for_mutation(config_path)
+    user_config = require_readable_config_before_write(config_path)
 
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
@@ -9197,8 +9186,7 @@ def unset_config_value(key: str):
         return
 
     config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = _load_user_config_for_mutation(config_path)
+    user_config = require_readable_config_before_write(config_path)
 
     removed = _unset_nested(user_config, key)
 
