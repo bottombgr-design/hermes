@@ -1618,6 +1618,82 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(event.text, "/help test")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_extract_at_all_slash_message_becomes_command(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Feishu Group", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "User", "user_id_alt": None}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"@_all /new"}',
+            message_id="om_at_all_command",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                is_bot=False,
+                chat_type="group",
+                message_id="om_at_all_command",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.message_type.value, "command")
+        self.assertEqual(event.text, "/new")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_extract_at_all_prose_strips_edge_mention_but_stays_text(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Feishu Group", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "User", "user_id_alt": None}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"@_all please /new"}',
+            message_id="om_at_all_prose",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                is_bot=False,
+                chat_type="group",
+                message_id="om_at_all_prose",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.message_type.value, "text")
+        self.assertEqual(event.text, "[Mentioned: @all]\n\nplease /new")
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_extract_text_file_injects_content(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -5128,7 +5204,8 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
             [{"key": "@_all"}],
         )
         self.assertTrue(event.text.startswith("[Mentioned: @all]"))
-        self.assertIn("@all meeting at 3pm", event.text)
+        self.assertIn("meeting at 3pm", event.text)
+        self.assertNotIn("@all meeting at 3pm", event.text)
 
     def test_scenario_trailing_self_mention_stripped(self):
         """Trailing @bot at the end of a message is routing noise, not content —
