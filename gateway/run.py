@@ -13820,6 +13820,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if message_text is None:
             return
 
+        # /stop or /new during setup (STT, media, hygiene awaits above) bumps
+        # generation while this turn may still hold only the pending sentinel —
+        # interrupt() cannot run yet. Abort before staging notes / _run_agent so
+        # a superseded turn never enters run_conversation.
+        if not self._is_session_run_current(_quick_key, run_generation):
+            logger.info(
+                "Aborting stale turn for %s before agent run — generation %d "
+                "is no longer current",
+                _quick_key or "?",
+                run_generation,
+            )
+            return None
+
         # Capture the platform event time as message metadata and keep the
         # persisted transcript clean (strip any leading timestamp prefix).
         # This runs regardless of the toggle so storage stays clean and the
@@ -18966,6 +18979,101 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         generations = self.__dict__.get("_session_run_generation") or {}
         return int(generations.get(session_key, 0)) == int(generation)
 
+    def _stale_generation_abort_result(
+        self,
+        *,
+        history: Optional[List[Dict[str, Any]]] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Empty agent-result shape used when a superseded turn aborts early."""
+        return {
+            "final_response": "",
+            "messages": [],
+            "api_calls": 0,
+            "tools": [],
+            "history_offset": len(history) if history else 0,
+            "session_id": session_id,
+            "response_previewed": False,
+        }
+
+    def _abort_result_if_stale_generation(
+        self,
+        session_key: Optional[str],
+        run_generation: Optional[int],
+        *,
+        history: Optional[List[Dict[str, Any]]] = None,
+        session_id: Optional[str] = None,
+        log_label: str = "agent run",
+    ) -> Optional[Dict[str, Any]]:
+        """Return an empty abort result when ``run_generation`` is no longer current."""
+        if run_generation is None or not session_key:
+            return None
+        if self._is_session_run_current(session_key, run_generation):
+            return None
+        logger.info(
+            "Skipping stale %s for %s — generation %s is no longer current",
+            log_label,
+            session_key or "?",
+            run_generation,
+        )
+        return self._stale_generation_abort_result(
+            history=history, session_id=session_id
+        )
+
+    def _promote_or_interrupt_stale_agent(
+        self,
+        session_key: Optional[str],
+        agent: Any,
+        run_generation: Optional[int],
+    ) -> bool:
+        """Install ``agent`` in ``_running_agents`` when this generation is current.
+
+        If /stop or /new already superseded the turn (pending-sentinel path
+        never called ``interrupt()``), interrupt now so a race inside
+        ``run_conversation`` stops tools, and leave the newer owner's slot alone.
+        Returns True when promoted.
+        """
+        if not session_key:
+            return False
+
+        def _reject_stale() -> bool:
+            logger.info(
+                "Skipping stale agent promotion for %s — generation %s is no longer current",
+                session_key or "",
+                run_generation,
+            )
+            if agent is not None:
+                agent.interrupt(_INTERRUPT_REASON_STOP)
+            return False
+
+        if run_generation is not None and not self._is_session_run_current(
+            session_key, run_generation
+        ):
+            return _reject_stale()
+
+        existing = self._running_agents.get(session_key)
+        # Re-check after reading the slot so we never clobber a newer real agent
+        # that claimed ownership between the generation check and this write.
+        if run_generation is not None and not self._is_session_run_current(
+            session_key, run_generation
+        ):
+            return _reject_stale()
+        if (
+            existing is not None
+            and existing is not _AGENT_PENDING_SENTINEL
+            and existing is not agent
+        ):
+            logger.info(
+                "Skipping stale agent promotion for %s — slot already held by another agent",
+                session_key or "",
+            )
+            if agent is not None:
+                agent.interrupt(_INTERRUPT_REASON_STOP)
+            return False
+
+        self._running_agents[session_key] = agent
+        return True
+
     def _bind_adapter_run_generation(
         self,
         adapter: Any,
@@ -19840,15 +19948,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key or "?",
                                 run_generation or 0,
                             )
-                            return {
-                                "final_response": "",
-                                "messages": [],
-                                "api_calls": 0,
-                                "tools": [],
-                                "history_offset": len(history),
-                                "session_id": session_id,
-                                "response_previewed": False,
-                            }
+                            return self._stale_generation_abort_result(
+                                history=history, session_id=session_id
+                            )
                         text = chunk.decode("utf-8", errors="replace")
                         buffer += text
 
@@ -19908,15 +20010,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key or "?",
                 run_generation or 0,
             )
-            return {
-                "final_response": "",
-                "messages": [],
-                "api_calls": 0,
-                "tools": [],
-                "history_offset": len(history),
-                "session_id": session_id,
-                "response_previewed": False,
-            }
+            return self._stale_generation_abort_result(
+                history=history, session_id=session_id
+            )
         logger.info(
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
@@ -19962,6 +20058,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        # Shared entry gate for local + proxy paths: a /stop during pending
+        # setup invalidates generation without interrupt(); do not start work.
+        abort = self._abort_result_if_stale_generation(
+            session_key,
+            run_generation,
+            history=history,
+            session_id=session_id,
+            log_label="agent run",
+        )
+        if abort is not None:
+            return abort
+
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
@@ -20135,7 +20243,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if run_generation is None or not session_key:
                 return True
             return self._is_session_run_current(session_key, run_generation)
-        
+
+        # Stale-generation abort already ran in ``_run_agent`` (covers local +
+        # proxy). Keep ``_run_still_current`` for mid-setup / run_conversation
+        # checks below; do not duplicate the entry gate here.
+
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
@@ -22192,7 +22304,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                # Secondary gate: generation may bump during agent build (still
+                # before track_agent promotes the real agent). Do not start
+                # tools/LLM work for a superseded turn.
+                abort = self._abort_result_if_stale_generation(
+                    session_key,
+                    run_generation,
+                    history=history,
+                    session_id=session_id,
+                    log_label="run_conversation",
+                )
+                if abort is not None:
+                    result = abort
+                else:
+                    result = agent.run_conversation(
+                        _api_run_message, **_conversation_kwargs
+                    )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -22522,22 +22649,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Wait for agent to be created
             while agent_holder[0] is None:
                 await asyncio.sleep(0.05)
-            if not session_key:
-                return
             # Only promote the sentinel to the real agent if this run is still
             # current.  If /stop or /new bumped the generation while we were
-            # spinning up, leave the newer run's slot alone — we'll be
-            # discarded by the stale-result check in _handle_message_with_agent.
-            if run_generation is not None and not self._is_session_run_current(
-                session_key, run_generation
+            # spinning up, interrupt the unpromoted agent and leave the newer
+            # run's slot alone.
+            if not self._promote_or_interrupt_stale_agent(
+                session_key, agent_holder[0], run_generation
             ):
-                logger.info(
-                    "Skipping stale agent promotion for %s — generation %s is no longer current",
-                    session_key or "",
-                    run_generation,
-                )
                 return
-            self._running_agents[session_key] = agent_holder[0]
             if self._draining:
                 self._update_runtime_status("draining")
         
