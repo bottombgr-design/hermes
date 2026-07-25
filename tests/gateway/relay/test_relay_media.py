@@ -269,7 +269,15 @@ def test_client_enabled_requires_full_credentials():
 def test_client_recognizes_rehost_urls():
     c = RelayMediaClient("https://c.example", "gw1", "sec")
     assert c.is_relay_media_url("https://c.example/relay/media/abc") is True
+    assert c.is_relay_media_url("https://evil.example/relay/media/abc") is False
+    assert c.is_relay_media_url("https://cdn.example/files/relay/media/photo.png") is False
     assert c.is_relay_media_url("https://cdn.discordapp.com/a/b.png") is False
+
+
+def test_client_recognizes_rehost_urls_under_connector_base_path():
+    c = RelayMediaClient("https://c.example/team-a", "gw1", "sec")
+    assert c.is_relay_media_url("https://c.example/team-a/relay/media/abc") is True
+    assert c.is_relay_media_url("https://c.example/relay/media/abc") is False
 
 
 @pytest.mark.asyncio
