@@ -7411,6 +7411,39 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
         ) from exc
 
 
+def _load_user_config_for_mutation(config_path: Path) -> Dict[str, Any]:
+    """Load raw user config after :func:`require_readable_config_before_write`.
+
+    Fail closed on parse / non-mapping (no bare-except → ``{}`` collapse).
+    Callers must invoke the require guard first; this re-check closes the
+    TOCTOU window between the guard and the mutation load.
+    """
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            loaded = fast_safe_load(f)
+    except Exception as exc:
+        _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
+        raise RuntimeError(
+            f"Refusing to overwrite {config_path}: existing config.yaml is not valid YAML "
+            f"({exc}). Fix the file or restore from a .corrupt.*.bak backup first."
+        ) from exc
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        exc = TypeError(
+            f"top-level YAML must be a mapping, got {type(loaded).__name__}"
+        )
+        _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
+        raise RuntimeError(
+            f"Refusing to overwrite {config_path}: top-level YAML must be a mapping, "
+            f"got {type(loaded).__name__}. Fix the file or restore from a "
+            f".corrupt.*.bak backup first."
+        ) from exc
+    return loaded
+
+
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """Fail-closed atomic write for ``config.yaml``.
 
@@ -9029,24 +9062,9 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Otherwise it goes to config.yaml
     # Read the raw user config (not merged with defaults) to avoid
     # dumping all default values back to the file.
-    # require_readable_config_before_write already refuses unreadable /
-    # unparseable / non-mapping files; load without a bare except so a
-    # TOCTOU parse failure cannot collapse to {} and wipe the file.
     config_path = get_config_path()
     require_readable_config_before_write(config_path)
-    user_config: Dict[str, Any] = {}
-    if config_path.exists():
-        with open(config_path, encoding="utf-8") as f:
-            loaded = fast_safe_load(f)
-        if loaded is None:
-            user_config = {}
-        elif not isinstance(loaded, dict):
-            raise RuntimeError(
-                f"Refusing to overwrite {config_path}: top-level YAML must be a mapping, "
-                f"got {type(loaded).__name__}. Fix the file or move it aside first."
-            )
-        else:
-            user_config = loaded
+    user_config = _load_user_config_for_mutation(config_path)
 
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
@@ -9180,19 +9198,7 @@ def unset_config_value(key: str):
 
     config_path = get_config_path()
     require_readable_config_before_write(config_path)
-    user_config: Dict[str, Any] = {}
-    if config_path.exists():
-        with open(config_path, encoding="utf-8") as f:
-            loaded = fast_safe_load(f)
-        if loaded is None:
-            user_config = {}
-        elif not isinstance(loaded, dict):
-            raise RuntimeError(
-                f"Refusing to overwrite {config_path}: top-level YAML must be a mapping, "
-                f"got {type(loaded).__name__}. Fix the file or move it aside first."
-            )
-        else:
-            user_config = loaded
+    user_config = _load_user_config_for_mutation(config_path)
 
     removed = _unset_nested(user_config, key)
 
