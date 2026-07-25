@@ -34,8 +34,13 @@ export const LOCALE_OPTIONS = [
     name: 'العربية',
     englishName: 'Arabic',
     configValue: 'ar'
-  }
-] as const satisfies readonly { configValue: string; englishName: string; id: Locale; name: string }[]
+  },
+  {
+    id: 'ru',
+    name: 'Русский',
+    englishName: 'Russian',
+    configValue: 'ru'
+  }] as const satisfies readonly { configValue: string; englishName: string; id: Locale; name: string }[]
 
 // `name` is the endonym (native name) shown in the picker so users recognize
 // their language regardless of the current UI language. No country flags:
@@ -79,7 +84,11 @@ const LOCALE_ALIASES: Record<string, Locale> = {
   'ar-eg': 'ar',
   ar_eg: 'ar',
   arabic: 'ar',
-  العربية: 'ar'
+  العربية: 'ar',
+  ru: 'ru',
+  'ru-ru': 'ru',
+  ru_ru: 'ru',
+  'русский': 'ru'
 }
 
 export function isLocale(value: unknown): value is Locale {
