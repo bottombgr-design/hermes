@@ -103,6 +103,35 @@ def _wait_for_touch(touch_calls: list[str], value: str, timeout: float = 1.0) ->
     pytest.fail(f"Timed out waiting for touch activity {value!r}; calls={touch_calls!r}")
 
 
+def test_lock_contender_does_not_announce_compaction_complete(tmp_path: Path) -> None:
+    """A lock loser must not claim that it completed a compaction."""
+    from agent.conversation_compression import COMPACTION_DONE_STATUS
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "LOCK_CONTENDER_STATUS_TEST"
+    db.create_session(session_id, source="discord")
+    assert db.try_acquire_compression_lock(session_id, "winner", ttl_seconds=60)
+
+    agent = _build_agent_with_db(db, session_id)
+    status_events: list[tuple[str, str]] = []
+    setattr(
+        agent,
+        "status_callback",
+        lambda event, message: status_events.append((event, message)),
+    )
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    returned, _system_prompt = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=120_000,
+    )
+
+    assert returned is messages
+    assert getattr(agent, "_compression_skipped_due_to_lock", None) == "winner"
+    assert ("compacted", COMPACTION_DONE_STATUS) not in status_events
+
+
 def test_compression_activity_heartbeat_touches_agent_during_long_compress(tmp_path: Path) -> None:
     """Long compression must refresh agent activity so gateway watchdogs do not fire."""
     db = SessionDB(db_path=tmp_path / "state.db")
