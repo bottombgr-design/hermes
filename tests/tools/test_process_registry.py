@@ -2588,7 +2588,7 @@ class TestSystemdCgroupIsolation:
         assert "--unit" in argv
         unit_idx = argv.index("--unit")
         assert argv[unit_idx + 1].startswith("hermes-worker-"), argv
-        assert argv[unit_idx + 1] == f"hermes-worker-{session.id}", argv
+        assert argv[unit_idx + 1] == f"hermes-worker-{session.id}", argv  # _build_systemd_scope_argv uses bare name
         # The original shell command must still be present at the tail,
         # after the ``--`` separator that prevents systemd-run from
         # interpreting command flags as its own.
@@ -2599,7 +2599,7 @@ class TestSystemdCgroupIsolation:
         # systemd-run owns session/cgroup creation — no start_new_session.
         assert captured["start_new_session"] is False
         # The session must record the unit name so kill_process can stop it.
-        assert session.systemd_unit == f"hermes-worker-{session.id}"
+        assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
     def test_falls_back_when_systemd_run_unavailable(
         self, registry, monkeypatch

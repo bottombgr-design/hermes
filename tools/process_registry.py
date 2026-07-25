@@ -187,8 +187,8 @@ def _stop_systemd_unit(unit_name: str) -> bool:
     SIGTERM to every process in the unit's cgroup and escalates to SIGKILL
     after the unit's ``TimeoutStopSec``.
 
-    Returns True if the command ran (regardless of exit code — the unit may
-    already be gone), False if ``systemctl`` is unavailable.
+    Returns True if the unit was successfully stopped (or was already gone),
+    False if ``systemctl`` is unavailable or the stop command failed.
     """
     import shutil
 
@@ -196,11 +196,18 @@ def _stop_systemd_unit(unit_name: str) -> bool:
     if binary is None:
         return False
     try:
-        subprocess.run(
+        result = subprocess.run(
             [binary, "--user", "stop", unit_name],
             capture_output=True,
             timeout=15,
         )
+        if result.returncode != 0:
+            logger.debug(
+                "systemctl --user stop %s exited %d: %s",
+                unit_name, result.returncode,
+                result.stderr.decode(errors="replace").strip(),
+            )
+            return False
         return True
     except Exception as exc:
         logger.debug("systemctl --user stop %s failed: %s", unit_name, exc)
@@ -887,7 +894,7 @@ class ProcessRegistry:
                     pty_argv = _build_systemd_scope_argv(
                         pty_argv, unit_suffix=session.id,
                     )
-                    session.systemd_unit = f"hermes-worker-{session.id}"
+                    session.systemd_unit = f"hermes-worker-{session.id}.scope"
                 elif not _IS_WINDOWS:
                     try:
                         from gateway.restart import is_gateway_supervisor_process as _sup
@@ -969,7 +976,7 @@ class ProcessRegistry:
             spawn_argv = _build_systemd_scope_argv(
                 shell_argv, unit_suffix=session.id,
             )
-            session.systemd_unit = f"hermes-worker-{session.id}"
+            session.systemd_unit = f"hermes-worker-{session.id}.scope"
             # systemd-run creates the new session/cgroup for us; do NOT also
             # set start_new_session (harmless, but redundant and it can mask
             # scope-creation failures in some systemd versions).
@@ -1799,6 +1806,12 @@ class ProcessRegistry:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         if session.exited:
+            # Even if the main process already exited, a double-forked
+            # descendant may still be alive in the systemd scope (#70716,
+            # reviewer gap #2 — the ``already_exited`` early return skipped
+            # unit cleanup).  Stop the scope to reap any survivors.
+            if session.systemd_unit:
+                _stop_systemd_unit(session.systemd_unit)
             with session._lock:
                 result = {
                     "status": "already_exited",
