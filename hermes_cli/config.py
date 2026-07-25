@@ -1457,6 +1457,13 @@ DEFAULT_CONFIG = {
         # the session (0 = off). Chat surfaces show no context meter, so a
         # 400k thread looks like a 40k one; a ratio of the context window is
         # useless here because 95% of a 1M model is 950k. Opt-in, cooldowned.
+        #
+        # Pick a value ABOVE where `threshold` compaction fires, not below it.
+        # The hint means "compaction has already engaged and this session is
+        # still large, so rotating is now your call" — firing earlier than the
+        # automation just nags about something already being handled. On a
+        # 500K-window model with threshold 0.5 (compacts at ~250K), ~300K is a
+        # sensible hint; ~150K produces regular noise.
         "rotate_hint_tokens": 0,
         "hygiene_timeout_seconds": 30,  # max seconds gateway waits for pre-agent hygiene compression
         "hygiene_failure_cooldown_seconds": 300,  # skip repeated failed hygiene attempts for this session
