@@ -16,7 +16,8 @@ import {
   setSelectedStoredSessionId,
   setSessionProfilesTruncated,
   setSessions,
-  setSessionsLoading
+  setSessionsLoading,
+  setWorkspaceCwdOwner
 } from '@/store/session'
 import { clearAllSessionStates } from '@/store/session-states'
 
@@ -58,6 +59,12 @@ export function wipeSessionListsForGatewaySwitch(): void {
 
   setActiveSessionId(null)
   setSelectedStoredSessionId(null)
+  // Hand the workspace back to the draft state this wipe lands in. The owner
+  // marker gates workspace-derived probes on "does the selected conversation own
+  // $currentCwd", so leaving it pointed at a conversation from the previous
+  // backend would strand the mismatch — and nothing here re-selects a
+  // conversation, so no later edge could ever clear it (#71254).
+  setWorkspaceCwdOwner(null)
   setMessages([])
   setFreshDraftReady(true)
 

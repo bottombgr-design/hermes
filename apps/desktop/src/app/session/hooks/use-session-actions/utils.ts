@@ -7,7 +7,10 @@ import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import {
   $currentCwd,
+  $selectedStoredSessionId,
   $sessions,
+  commitWorkspaceCwdForSelectedSession,
+  releaseWorkspaceCwdOwner,
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwd,
@@ -19,6 +22,7 @@ import {
   setCurrentServiceTier,
   setCurrentUsage,
   setSessions,
+  setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
 
@@ -658,7 +662,53 @@ type SessionRuntimeStatePatch = Partial<
   >
 >
 
-export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionRuntimeStatePatch | null {
+// `_session_info` (tui_gateway/server.py) emits `stored_session_id`, but it is not
+// declared on SessionRuntimeInfo, so read it structurally.
+//
+// `describedStoredSessionId` overrides that structural read for callers that know
+// which conversation the response describes. session.create reports its stored id
+// on the PAYLOAD, as a sibling of `info` (tui_gateway/server.py), so a create
+// response carries no id HERE at all — and a fork / split tile creates a child
+// while deliberately leaving the parent selected. Without the explicit id those
+// responses look like "no id ⇒ the selected one" and claim the child's workspace
+// under the parent (#71254). The parameter is how a create site says whose info
+// this is; resume/settle sites keep the structural read.
+//
+// Absent is NOT the same as different. The desktop's normal cold resume answers
+// with `_lazy_resume_info`, which carries a cwd but no stored id at all, so a
+// strict "no id ⇒ no claim" rule would never hand ownership back on the most
+// common switch and the coding rail would stay blank for the rest of the session.
+// An omitted id therefore means "the selected one"; only an id that names a
+// DIFFERENT conversation disqualifies the claim.
+//
+// "Different" is judged through the lineage, matching the session.info path in
+// use-message-stream/gateway-event.ts. The backend id is the live session_key,
+// which session.resume re-anchors to the compression continuation tip, while the
+// selection keeps the root id the switch was routed on. Comparing those literally
+// reads one conversation as two, refuses a legitimate claim, and leaves the rail
+// withheld for the rest of that chat — #71254 again on any rotated session.
+const runtimeInfoDescribesSelectedSession = (
+  info: SessionRuntimeInfo,
+  describedStoredSessionId?: null | string
+): boolean => {
+  const infoStoredSessionId =
+    describedStoredSessionId?.trim() || (info as { stored_session_id?: string }).stored_session_id?.trim() || null
+
+  const selected = $selectedStoredSessionId.get() ?? null
+
+  if (!infoStoredSessionId || !selected || infoStoredSessionId === selected) {
+    return true
+  }
+
+  const row = $sessions.get().find(session => session.id === infoStoredSessionId)
+
+  return !!row && sessionMatchesStoredId(row, selected)
+}
+
+export function applyRuntimeInfo(
+  info: SessionRuntimeInfo | undefined,
+  describedStoredSessionId?: null | string
+): SessionRuntimeStatePatch | null {
   if (!info) {
     return null
   }
@@ -685,9 +735,43 @@ export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionR
     sessionState.provider = info.provider
   }
 
+  // Ownership is only claimable for the conversation the user is actually looking
+  // at. This applier also runs for info that belongs elsewhere — a fork or split
+  // tile's create response leaves the previous chat selected — and claiming there
+  // would mark one conversation's path as owned under another's selection, which
+  // is the stale workspace/Git state #71254 is about. Those create responses reach
+  // the guard only because their call site passes `describedStoredSessionId`:
+  // session.create reports its stored id on the payload rather than inside `info`,
+  // so the structural read alone still sees them as the selected session.
+  const infoDescribesSelectedSession = runtimeInfoDescribesSelectedSession(info, describedStoredSessionId)
+
   if (info.cwd) {
-    setCurrentCwd(info.cwd)
+    // The caller folds this patch into the per-session cache of whichever
+    // conversation the info describes, so the path is recorded either way; only
+    // the live-workspace commitment is gated.
     sessionState.cwd = info.cwd
+
+    if (infoDescribesSelectedSession) {
+      commitWorkspaceCwdForSelectedSession(info.cwd)
+    }
+
+    // A report for a conversation the user is NOT looking at deliberately does
+    // not touch the live workspace. Forking or opening a tile creates a session
+    // in another folder while the parent stays selected; writing that folder to
+    // $currentCwd moved the visible workspace, and because the cwd subscription
+    // re-probes with an EXPLICIT target it bypasses the ownership gate entirely
+    // and republished the new session's Git facts under the parent chat — the
+    // #71254 symptom, from the other direction (and it persisted the wrong
+    // remembered workspace besides). The line above already records the path in
+    // that conversation's own cache, which is all a background session needs.
+  } else if (infoDescribesSelectedSession) {
+    // A settled report without a cwd (a detached session) deliberately leaves
+    // $currentCwd alone, so the path on screen is still the PREVIOUS
+    // conversation's. "Settled" is therefore not enough to claim it: the marker
+    // asserts that $currentCwd describes this conversation, and here it provably
+    // does not. Claiming would re-open #71254 at settle time — switch from a repo
+    // chat to a detached one and the old repo's branch would publish under it.
+    releaseWorkspaceCwdOwner()
   }
 
   if (info.branch !== undefined) {
@@ -728,7 +812,10 @@ export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionR
   return sessionState
 }
 
-export function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | string } | undefined) {
+export function applyStoredSessionPreviewRuntimeInfo(
+  stored: { cwd?: null | string; model?: null | string } | undefined,
+  storedSessionId: null | string
+) {
   setCurrentModel(stored?.model || '')
   setCurrentProvider('')
   setCurrentReasoningEffort('')
@@ -736,6 +823,33 @@ export function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | st
   setCurrentFastMode(false)
   setYoloActive(false)
   setCurrentPersonality('')
+
+  const storedCwd = stored?.cwd?.trim() || ''
+
+  if (storedCwd) {
+    // The stored row already knows this conversation's workspace, so seeding it
+    // at resume ENTRY closes the window #71254 lives in: the correct probe starts
+    // now instead of after session.resume settles. Persisting (rather than
+    // setCurrentCwdTransient) is right here because this is the workspace the
+    // user is switching INTO — the same commitment applyRuntimeInfo makes a
+    // moment later, so the remembered per-connection workspace ends up on the
+    // conversation actually in front of the user.
+    setCurrentCwd(storedCwd)
+    setWorkspaceCwdOwner(storedSessionId)
+  } else {
+    // A row with no cwd (the common shape for a bare ⌘N session, detached by
+    // design) says nothing about the workspace, while $currentCwd still holds the
+    // previous conversation's folder. Release so probes hold off until the resume
+    // reports the truth; clearing the path instead would collapse the
+    // workspace/review panes and drop file-tree state on every switch.
+    releaseWorkspaceCwdOwner()
+  }
+
+  // Stale-label guard for the same window: the branch is derived from the
+  // workspace, so carrying the previous conversation's label across a switch is
+  // never right. applyRuntimeInfo re-applies the real branch when the resume
+  // settles (the backend always sends the key), so this only governs the gap.
+  setCurrentBranch('')
 }
 
 // A "session genuinely doesn't exist" failure (deleted, or an id from a wiped /

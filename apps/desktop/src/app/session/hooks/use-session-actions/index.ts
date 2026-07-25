@@ -54,6 +54,7 @@ import {
   setSessions,
   setSessionStartedAt,
   setTurnStartedAt,
+  setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
 import {
@@ -268,6 +269,12 @@ export function useSessionActions({
 
     setSelectedStoredSessionId(nextId)
     selectedStoredSessionIdRef.current = nextId
+    // Compression re-keys the SAME conversation onto its continuation tip, so the
+    // workspace it owns is unchanged and only its id moved. Re-keying the owner
+    // with it keeps the two in agreement; leaving it on the rotated-out id would
+    // strand a mismatch mid-conversation, and workspace-derived surfaces would go
+    // blank for the rest of the session (#71254).
+    setWorkspaceCwdOwner(nextId)
 
     // A route overlay/page has no routed session id, but the underlying selected
     // chat still needs to follow the continuation. Update that selection in
@@ -339,6 +346,11 @@ export function useSessionActions({
         setCurrentCwd(workspaceTarget)
       }
 
+      // A fresh draft resolves its own workspace right here, so it owns it. The
+      // selected stored id is null for a draft, and so is the owner — they match,
+      // which is what keeps the coding rail live on a new chat instead of
+      // withholding it as an un-re-homed switch (#71254).
+      setWorkspaceCwdOwner(null)
       setCurrentBranch('')
       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
       setFreshDraftReady(true)
@@ -417,7 +429,19 @@ export function useSessionActions({
         setSelectedStoredSessionId(stored)
         setSessionStartedAt(Date.now())
         const yoloArmed = $yoloActive.get()
-        const runtimeInfo = applyRuntimeInfo(created.info)
+        // `stored` is the conversation this create response describes AND the one
+        // just selected above, so the claim below is for the chat on screen. The
+        // id has to be passed explicitly because session.create reports it beside
+        // `info`, not inside it (#71254).
+        const runtimeInfo = applyRuntimeInfo(created.info, stored)
+
+        // The draft's workspace carries over to the conversation it just became,
+        // so ownership moves with the selection. applyRuntimeInfo above claims it
+        // whenever the create response reports a cwd, but `info` is optional on
+        // the contract — an older backend that omits it would leave the marker on
+        // the draft while the selection names a real conversation, and the coding
+        // rail would sit withheld until the next heartbeat (#71254).
+        setWorkspaceCwdOwner(stored)
 
         if (runtimeInfo) {
           updateSessionState(created.session_id, state => ({ ...state, ...runtimeInfo }), stored)
@@ -503,7 +527,11 @@ export function useSessionActions({
           upsertOptimisticSession(created, stored, null, null)
         }
 
-        const runtimeInfo = applyRuntimeInfo(created.info)
+        // A split tile leaves the previous chat selected, so name the created
+        // session: its cwd (the resolved new-session workspace, which can be a
+        // different project entirely) must not be claimed as the still-selected
+        // conversation's workspace (#71254).
+        const runtimeInfo = applyRuntimeInfo(created.info, stored)
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
         openSessionTile(stored, dir)
@@ -675,6 +703,12 @@ export function useSessionActions({
           syncSessionStateToView(cachedRuntimeId, cachedViewState)
           setCurrentCwd(cachedViewState.cwd)
           setCurrentBranch(cachedViewState.branch)
+          // The warm cache IS this conversation's own workspace truth, so the
+          // switch is already re-homed here and probes may run immediately. Note
+          // this claim cannot wait for session.activate: its missing-RPC compat
+          // branch returns before applyRuntimeInfo, which would otherwise leave
+          // the rail withheld for the life of the session (#71254).
+          setWorkspaceCwdOwner(storedSessionId)
           setSessionStartedAt(Date.now())
 
           try {
@@ -816,7 +850,7 @@ export function useSessionActions({
       const stored =
         $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
 
-      applyStoredSessionPreviewRuntimeInfo(stored)
+      applyStoredSessionPreviewRuntimeInfo(stored, storedSessionId)
 
       if (stored) {
         applyStoredUsage(stored)
@@ -1161,7 +1195,11 @@ export function useSessionActions({
           routedSessionId
         )
 
-        const runtimeInfo = applyRuntimeInfo(branched.info)
+        // The parent chat stays selected through a fork, so name the branch: its
+        // cwd can be another repo entirely (branchStoredSession passes the target
+        // row's own cwd) and claiming it for the parent is exactly the stale
+        // workspace/Git state of #71254.
+        const runtimeInfo = applyRuntimeInfo(branched.info, routedSessionId)
         patchSessionWorkspace(routedSessionId, runtimeInfo?.cwd)
 
         if (runtimeInfo) {
@@ -1335,6 +1373,11 @@ export function useSessionActions({
           setFreshDraftReady(false)
           setSelectedStoredSessionId(storedSessionId)
           selectedStoredSessionIdRef.current = storedSessionId
+          // The draft this rollback undoes released the workspace; restoring the
+          // selection has to restore its owner too, or the marker stays on the
+          // draft while a real conversation is selected and the coding rail sits
+          // withheld with nothing left to re-arm it (#71254).
+          setWorkspaceCwdOwner(storedSessionId)
           const stored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
 
           if (stored) {
