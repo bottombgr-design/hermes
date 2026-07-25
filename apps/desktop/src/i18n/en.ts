@@ -2322,6 +2322,7 @@ export const en: Translations = {
       xhigh: 'Extra High',
       max: 'Max',
       ultra: 'Ultra',
+      none: 'Off',
       updateFailed: 'Model option update failed',
       fastFailed: 'Fast mode update failed'
     },
