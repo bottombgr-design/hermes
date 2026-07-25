@@ -1213,6 +1213,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    record_session: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1257,6 +1258,12 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        record_session: When False, skip recording this job's execution as a
+                session in state.db. The agent still runs the full LLM
+                pipeline and delivers output, but no session entry is created.
+                Useful for high-frequency monitoring or alerting jobs where
+                session history is not needed. Defaults to True (session is
+                recorded).
 
     Returns:
         The created job dict
@@ -1289,6 +1296,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_record_session = record_session  # None = default True
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1384,6 +1392,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_record_session is not None:
+        job["record_session"] = normalized_record_session
 
     with _jobs_lock():
         jobs = load_jobs()
