@@ -767,6 +767,11 @@ def init_agent(
     agent._model_request_active = threading.Event()
     agent._supports_active_turn_redirect = True
 
+    # Stream timeout without data delivery tracker — set by the streaming
+    # layer when a timeout occurs before any chunks were received. The
+    # outer retry loop uses this to skip retries for deterministic failures.
+    agent._last_stream_timeout_no_deltas = False
+
     # /steer mechanism — inject a user note into the next tool result
     # without interrupting the agent. Unlike interrupt(), steer() does
     # NOT set _interrupt_requested; it waits for the current tool batch

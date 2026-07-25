@@ -3646,6 +3646,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # richer recovery: credential rotation, provider fallback,
                     # backoff, and — for "stream not supported" — will switch
                     # to non-streaming on the next attempt via _disable_streaming.
+                    # Signal to the outer loop when a timeout occurs
+                    # without ANY data delivered — the failure is likely
+                    # deterministic (server-side processing timeout, not
+                    # a transient network issue) and retrying with the
+                    # same payload will just burn the retry budget.
+                    from openai import APITimeoutError as _APITimeoutError
+                    if isinstance(e, _APITimeoutError) and not deltas_were_sent["yes"]:
+                        agent._last_stream_timeout_no_deltas = True
+                        # Surface an actionable hint alongside the timeout so
+                        # the user sees it even if retries exhaust.
+                        _hint = (
+                            " — provider timed out before delivering "
+                            "any response (payload may be too large for "
+                            "this provider, e.g., too many tools)"
+                        )
+                        try:
+                            e._message = getattr(e, "_message", str(e)) + _hint
+                        except Exception:
+                            pass
                     result["error"] = e
                     return
         except InterruptedError as e:
