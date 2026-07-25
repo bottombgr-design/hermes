@@ -740,6 +740,13 @@ def run_doctor(args):
         try:
             import yaml as _yaml
             cfg = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            # Normalize scalar model: → nested form so doctor's checks work
+            # the same way the runtime does (every other config reader calls
+            # _normalize_root_model_keys; doctor was the only one that didn't,
+            # so a scalar model: key caused AttributeError → 184-line blanket
+            # except swallowed it → entire model/provider block skipped (#71019).
+            from hermes_cli.config import _normalize_root_model_keys
+            cfg = _normalize_root_model_keys(cfg)
             model_section = cfg.get("model") or {}
             provider_raw = (model_section.get("provider") or "").strip()
             provider = provider_raw.lower()
