@@ -2085,7 +2085,7 @@ def test_recreate_container_failure_redacts_env_values_from_logs(monkeypatch, ca
     monkeypatch.setattr(
         docker_env.DockerEnvironment,
         "_find_reusable_container",
-        lambda self, task_label, profile_label: None,
+        lambda self, task_label, profile_label, egress_mode: None,
     )
 
     def _run(cmd, **kwargs):
