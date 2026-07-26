@@ -146,8 +146,43 @@ export function cleanStaleAppOutDir(appOutDir) {
   }
 }
 
+/**
+ * Windows rollback material (#69179): before wiping the previous unpacked
+ * tree, preserve it as `<appOutDir>.bak` — but ONLY when it holds the product
+ * exe (i.e. it is a previously-working build, not the corrupted partial state
+ * cleanStaleAppOutDir exists to remove). If the fresh pack then produces a
+ * Hermes.exe that Windows can't load (truncated PE from a corrupt cached
+ * Electron zip, wrong arch), the updater's integrity gate in
+ * `hermes desktop --build-only` (hermes_cli/main.py
+ * `_ensure_desktop_exe_launchable`) restores this .bak instead of leaving the
+ * user with "This app can't run on your computer".
+ *
+ * Returns true when the tree was preserved (appOutDir no longer exists), false
+ * when there was nothing worth preserving (caller falls through to the wipe).
+ * A rename failure (AV holding a handle) also returns false — the wipe is the
+ * safe fallback and matches pre-#69179 behavior exactly.
+ */
+export function preserveRollbackBackup(appOutDir, productExeName = 'Hermes.exe') {
+  if (!appOutDir || typeof appOutDir !== 'string' || !existsSync(appOutDir)) {
+    return false
+  }
+  if (!existsSync(path.join(appOutDir, productExeName))) {
+    // Partial/corrupt tree (interrupted prior pack) — not rollback material.
+    return false
+  }
+  const backupDir = `${appOutDir}.bak`
+  try {
+    rmSync(backupDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    renameSync(appOutDir, backupDir)
+    return true
+  } catch {
+    return false
+  }
+}
+
 export default async function beforePack(context) {
   const appOutDir = context && context.appOutDir
+  const platformName = context && context.electronPlatformName
   try {
     const { removed } = cleanStaleAppOutDir(appOutDir)
     if (removed) {
