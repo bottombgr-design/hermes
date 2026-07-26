@@ -4,6 +4,7 @@ import { createRef } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { composerPlainText, renderComposerContents, RICH_INPUT_SLOT } from '../rich-editor'
+import { textBeforeCaret } from '../text-utils'
 
 import { useComposerTrigger } from './use-composer-trigger'
 
@@ -81,6 +82,32 @@ describe('useComposerTrigger — slash anywhere in the prompt', () => {
     // The `/cle` the user typed is replaced by the full command; "please run"
     // in front of it survives untouched.
     expect(composerPlainText(editor)).toBe('please run /clean ')
+  })
+
+  it('reopens immediately after inserting a slash chip', () => {
+    const editor = mountEditor('/austin-code')
+    const choices = [item('/austin-code'), item('/auto-skill-router')]
+    const { hook } = mountTrigger(editor, choices)
+
+    act(() => hook.result.current.refreshTrigger())
+    act(() => hook.result.current.replaceTriggerWithChip(choices[0]))
+
+    const tail = editor.lastChild
+    expect(tail?.nodeType).toBe(Node.TEXT_NODE)
+    tail!.textContent = ' /'
+
+    const range = document.createRange()
+    range.setStart(tail!, 2)
+    range.collapse(true)
+    const selection = window.getSelection()!
+    selection.removeAllRanges()
+    selection.addRange(range)
+
+    expect(textBeforeCaret(editor)).toBe('/austin-code /')
+    act(() => hook.result.current.refreshTrigger())
+
+    expect(hook.result.current.trigger).toMatchObject({ kind: '/', inline: true, query: '' })
+    expect(hook.result.current.triggerItems.map(i => i.label)).toContain('auto-skill-router')
   })
 
   it('offers only skills mid-message, not app commands', () => {

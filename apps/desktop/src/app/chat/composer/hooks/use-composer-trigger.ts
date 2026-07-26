@@ -18,7 +18,7 @@ import {
   renderComposerContents,
   slashChipElement
 } from '../rich-editor'
-import { detectTrigger, textBeforeCaret, type TriggerState } from '../text-utils'
+import { composerContextBeforeCaret, detectTrigger, type TriggerState } from '../text-utils'
 
 interface CompletionSource {
   adapter: (Unstable_TriggerAdapter & { reset?: () => void }) | null
@@ -96,8 +96,12 @@ export function useComposerTrigger({
       return
     }
 
-    const before = textBeforeCaret(editor)
-    const found = detectTrigger(before ?? composerPlainText(editor))
+    const caretContext = composerContextBeforeCaret(editor)
+
+    const found = detectTrigger(
+      caretContext?.text ?? composerPlainText(editor),
+      caretContext?.hasReferenceChip ?? false
+    )
 
     // The arg-stage popover is only useful for commands with an options screen.
     // For a no-arg command it would dead-end on "No matches", so drop it — the
