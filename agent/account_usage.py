@@ -881,7 +881,22 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     )
 
 
+def _normalize_endpoint(url: Optional[str]) -> Optional[tuple[str, str, str]]:
+    if not url:
+        return None
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        return (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"))
+    except Exception:
+        return None
+
+
 def _fetch_custom_account_usage(
+    provider: Optional[str],
     base_url: Optional[str],
     api_key: Optional[str],
 ) -> Optional[AccountUsageSnapshot]:
@@ -891,20 +906,41 @@ def _fetch_custom_account_usage(
 
             cfg = load_config() or {}
             custom_list = cfg.get("custom_providers") or []
-            for cp in custom_list:
-                cp_base = cp.get("base_url")
-                cp_key = cp.get("api_key")
-                if base_url and cp_base and (
-                    base_url.rstrip("/").startswith(cp_base.rstrip("/"))
-                    or cp_base.rstrip("/").startswith(base_url.rstrip("/"))
-                    or (":8091" in base_url and ":8091" in cp_base)
-                ):
-                    if not api_key:
-                        api_key = cp_key
-                elif not base_url and cp_base:
-                    base_url = cp_base
-                    if not api_key:
-                        api_key = cp_key
+
+            provider_slug = ""
+            if provider and ":" in provider:
+                provider_slug = provider.split(":", 1)[1].strip().lower()
+            elif provider and provider.strip().lower() != "custom":
+                provider_slug = provider.strip().lower()
+
+            target_cp = None
+
+            # 1. Prefer explicit provider name/slug match (e.g. "custom:antigravity-proxy")
+            if provider_slug:
+                for cp in custom_list:
+                    cp_name = str(cp.get("name") or "").strip().lower()
+                    if cp_name == provider_slug:
+                        target_cp = cp
+                        break
+
+            # 2. Match by normalized base_url / origin (scheme + host:port + path prefix)
+            if not target_cp and base_url:
+                norm_base = _normalize_endpoint(base_url)
+                if norm_base:
+                    for cp in custom_list:
+                        norm_cp = _normalize_endpoint(cp.get("base_url"))
+                        if norm_cp and norm_base[0] == norm_cp[0] and norm_base[1] == norm_cp[1]:
+                            if not norm_cp[2] or norm_base[2].startswith(norm_cp[2]) or norm_cp[2].startswith(norm_base[2]):
+                                target_cp = cp
+                                break
+
+            if target_cp:
+                if not base_url and target_cp.get("base_url"):
+                    base_url = target_cp.get("base_url")
+                if not api_key and target_cp.get("api_key"):
+                    api_key = target_cp.get("api_key")
+
+            # 3. Global model fallback if still unpopulated
             if not api_key or not base_url:
                 model_cfg = cfg.get("model") or {}
                 if not api_key:
@@ -997,7 +1033,7 @@ def fetch_account_usage(
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
         if normalized == "custom" or normalized.startswith("custom:"):
-            return _fetch_custom_account_usage(base_url=base_url, api_key=api_key)
+            return _fetch_custom_account_usage(provider=provider, base_url=base_url, api_key=api_key)
     except Exception:
         return None
     return None

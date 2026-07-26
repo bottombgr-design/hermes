@@ -472,3 +472,72 @@ def test_fetch_account_usage_custom_provider(monkeypatch):
     assert calls[0]["url"] == "http://127.0.0.1:8091/v1/usage"
     assert calls[0]["headers"]["x-api-key"] == "agy-key"
 
+
+def test_fetch_account_usage_custom_provider_prevents_credential_leak_between_same_port(monkeypatch):
+    """Regression test: verify two custom providers on the same port (:8091) resolve unique credentials without cross-contamination."""
+    calls = []
+
+    class _MultiPortClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, headers):
+            calls.append({"url": url, "headers": headers})
+            return _FakeResponse(
+                {
+                    "provider": "proxy-b",
+                    "windows": [{"label": "Quota B", "used_percent": 10.0}],
+                }
+            )
+
+    monkeypatch.setattr(account_usage.httpx, "Client", _MultiPortClient)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "custom_providers": [
+                {
+                    "name": "proxy-a",
+                    "base_url": "http://127.0.0.1:8091/proxy-a",
+                    "api_key": "key-for-a",
+                },
+                {
+                    "name": "proxy-b",
+                    "base_url": "http://127.0.0.1:8091/proxy-b",
+                    "api_key": "key-for-b",
+                },
+            ]
+        },
+    )
+
+    # 1. Query proxy-b by provider slug without explicit key -> must pick key-for-b, not key-for-a
+    snapshot = account_usage.fetch_account_usage(
+        "custom:proxy-b",
+        base_url="http://127.0.0.1:8091/proxy-b",
+        api_key=None,
+    )
+
+    assert snapshot is not None
+    assert snapshot.provider == "proxy-b"
+    assert len(calls) == 1
+    assert calls[0]["headers"]["x-api-key"] == "key-for-b"
+
+    # 2. Query proxy-b by base_url alone (generic "custom" provider string) -> must match path prefix /proxy-b and pick key-for-b
+    calls.clear()
+    snapshot2 = account_usage.fetch_account_usage(
+        "custom",
+        base_url="http://127.0.0.1:8091/proxy-b",
+        api_key=None,
+    )
+
+    assert snapshot2 is not None
+    assert len(calls) == 1
+    assert calls[0]["headers"]["x-api-key"] == "key-for-b"
+    assert calls[0]["headers"]["x-api-key"] != "key-for-a"
+
+
