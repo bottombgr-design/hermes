@@ -10,6 +10,7 @@
 import { useState, useEffect, useRef } from "react";
 import { api, HERMES_BASE_PATH } from "@/lib/api";
 import type { PluginManifest, RegisteredPlugin } from "./types";
+import { pluginAssetUrl } from "./plugin-assets";
 import {
   getPluginComponent,
   onPluginRegistered,
@@ -43,7 +44,7 @@ export function usePlugins() {
     for (const manifest of manifests) {
       // Inject CSS if specified.
       if (manifest.css) {
-        const cssUrl = `${HERMES_BASE_PATH}/dashboard-plugins/${manifest.name}/${manifest.css}`;
+        const cssUrl = pluginAssetUrl(HERMES_BASE_PATH, manifest, manifest.css);
         if (!document.querySelector(`link[href="${cssUrl}"]`)) {
           const link = document.createElement("link");
           link.rel = "stylesheet";
@@ -55,9 +56,9 @@ export function usePlugins() {
       // Load JS bundle. In dev, cache-bust so Vite HMR can clear the
       // in-memory registry while the browser would otherwise never
       // re-execute a previously cached <script> URL.
-      const baseUrl = `${HERMES_BASE_PATH}/dashboard-plugins/${manifest.name}/${manifest.entry}`;
+      const baseUrl = pluginAssetUrl(HERMES_BASE_PATH, manifest, manifest.entry);
       const scriptSrc = import.meta.env.DEV
-        ? `${baseUrl}?hermes_dv=${Date.now()}`
+        ? `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}hermes_dv=${Date.now()}`
         : baseUrl;
       if (!import.meta.env.DEV) {
         if (loadedScripts.current.has(baseUrl)) continue;
