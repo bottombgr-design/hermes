@@ -10254,11 +10254,14 @@ def _(rid, params: dict) -> dict:
         sid = str(params.get("session_id") or "")
         # Host pipe/respawn failure can leave `running` stuck when no turn.end
         # will arrive. Mirror in-process dead-thread recovery, but only when
-        # this sid has no pending host completion AND the dead turn's inflight
-        # snapshot is still present — otherwise the crash waiter / drain may
-        # already own teardown or a successor turn.
+        # this sid has no pending host completion AND the inflight snapshot is
+        # still the same object observed before interrupt() — a replaced
+        # inflight means a successor submit already claimed the session.
         host_unreachable = False
+        inflight_at_interrupt = None
         if session.get("running"):
+            with session["history_lock"]:
+                inflight_at_interrupt = session.get("inflight_turn")
             try:
                 _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
             except Exception as exc:
@@ -10273,14 +10276,18 @@ def _(rid, params: dict) -> dict:
             session["queued_prompt"] = None
             if host_unreachable and session.get("running"):
                 # Recheck under the session lock. Pending may already have been
-                # popped by _fail_pending_turns; a successor drain may own running.
-                # Force-clear only when no host completion remains AND the dead
-                # turn's inflight snapshot is still present (teardown never ran).
+                # popped by _fail_pending_turns; a successor drain/submit may
+                # own running with a replaced inflight dict.
                 try:
                     pending_for_sid = _get_compute_host_supervisor().has_pending_turn(sid)
                 except Exception:
                     pending_for_sid = True  # fail closed: prefer waiter teardown
-                if not pending_for_sid and session.get("inflight_turn"):
+                inflight_now = session.get("inflight_turn")
+                if (
+                    not pending_for_sid
+                    and inflight_now is not None
+                    and inflight_now is inflight_at_interrupt
+                ):
                     session["running"] = False
                     _clear_inflight_turn(session)
         _clear_pending(sid)
