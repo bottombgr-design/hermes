@@ -1,5 +1,6 @@
 """Tests for /restart notification — the gateway notifies the requester on comeback."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -27,7 +28,7 @@ def test_restart_notification_pending_false_without_marker(tmp_path, monkeypatch
 
 def test_restart_notification_pending_true_with_marker(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    (tmp_path / ".restart_notify.json").write_text("{}")
+    (tmp_path / ".restart_notify.json").write_text("{}", encoding="utf-8")
 
     assert gateway_run._restart_notification_pending() is True
 
@@ -37,7 +38,7 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     marker = tmp_path / ".restart_pending.json"
 
     assert gateway_run._planned_restart_notification_pending() is False
-    marker.write_text("{}")
+    marker.write_text("{}", encoding="utf-8")
     assert gateway_run._planned_restart_notification_pending() is True
 
     gateway_run._clear_planned_restart_notification()
@@ -69,12 +70,41 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
 
     notify_path = tmp_path / ".restart_notify.json"
     assert notify_path.exists()
-    data = json.loads(notify_path.read_text())
+    data = json.loads(notify_path.read_text(encoding="utf-8"))
     assert data["platform"] == "telegram"
     assert data["chat_id"] == "42"
     assert data["chat_type"] == "dm"
     assert data["message_id"] == "m1"
+    assert len(data["request_id"]) == 32
     assert "thread_id" not in data  # no thread → omitted
+
+
+@pytest.mark.asyncio
+async def test_restart_command_gives_identical_route_a_unique_request_id(
+    tmp_path, monkeypatch
+):
+    """Consecutive markers from the same route must remain distinguishable."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="42"),
+    )
+
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    await runner._handle_restart_command(event)
+    first = json.loads((tmp_path / ".restart_notify.json").read_text(encoding="utf-8"))
+
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    await runner._handle_restart_command(event)
+    second = json.loads((tmp_path / ".restart_notify.json").read_text(encoding="utf-8"))
+
+    assert first["request_id"] != second["request_id"]
+    assert {k: v for k, v in first.items() if k != "request_id"} == {
+        k: v for k, v in second.items() if k != "request_id"
+    }
 
 
 @pytest.mark.asyncio
@@ -99,7 +129,7 @@ async def test_relay_restart_command_persists_authenticated_routing_provenance(
 
     await runner._handle_restart_command(event)
 
-    data = json.loads((tmp_path / ".restart_notify.json").read_text())
+    data = json.loads((tmp_path / ".restart_notify.json").read_text(encoding="utf-8"))
     assert data["platform"] == "slack"
     assert data["user_id"] == "U123"
     assert data["scope_id"] == "T123"
@@ -167,7 +197,7 @@ async def test_restart_command_preserves_thread_id(tmp_path, monkeypatch):
 
     await runner._handle_restart_command(event)
 
-    data = json.loads((tmp_path / ".restart_notify.json").read_text())
+    data = json.loads((tmp_path / ".restart_notify.json").read_text(encoding="utf-8"))
     assert data["chat_type"] == "dm"
     assert data["thread_id"] == "777"
     assert data["message_id"] == "m2"
@@ -510,7 +540,7 @@ async def test_send_restart_notification_delivers_and_cleans_up(tmp_path, monkey
     notify_path.write_text(json.dumps({
         "platform": "telegram",
         "chat_id": "42",
-    }))
+    }), encoding="utf-8")
 
     runner, adapter = make_restart_runner()
     adapter.send = AsyncMock()
@@ -540,7 +570,8 @@ async def test_relay_restart_notification_uses_logical_platform_and_owner(tmp_pa
                 "scope_id": "T123",
                 "delivered_via_upstream_relay": True,
             }
-        )
+        ),
+        encoding="utf-8",
     )
 
     runner, _native = make_restart_runner()
@@ -578,7 +609,7 @@ async def test_send_restart_notification_with_thread(tmp_path, monkeypatch):
         "chat_type": "dm",
         "thread_id": "777",
         "message_id": "m2",
-    }))
+    }), encoding="utf-8")
 
     runner, adapter = make_restart_runner()
     adapter.send = AsyncMock()
@@ -610,22 +641,242 @@ async def test_send_restart_notification_noop_when_no_file(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_send_restart_notification_skips_when_adapter_missing(tmp_path, monkeypatch):
-    """If the requester's platform isn't connected, clean up without crashing."""
+async def test_send_restart_notification_retries_when_adapter_appears(
+    tmp_path, monkeypatch
+):
+    """A platform reconnect during startup must not lose the notification."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     notify_path = tmp_path / ".restart_notify.json"
     notify_path.write_text(json.dumps({
-        "platform": "discord",  # runner only has telegram adapter
+        "platform": "telegram",
         "chat_id": "42",
-    }))
+    }), encoding="utf-8")
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
+    send = AsyncMock(return_value=SendResult(success=True, message_id="m-1"))
+    adapter.send = send
+    runner.adapters = {}
+
+    async def _restore_adapter(_delay):
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _restore_adapter)
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("telegram", "42", None)
+    send.assert_awaited_once()
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_retries_retryable_refusal(
+    tmp_path, monkeypatch
+):
+    """A safe pre-send refusal is retried instead of consuming the marker."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }), encoding="utf-8")
+
+    runner, adapter = make_restart_runner()
+    send = AsyncMock(side_effect=[
+        SendResult(
+            success=False,
+            error="send_path_degraded",
+            retryable=True,
+        ),
+        SendResult(success=True, message_id="m-1"),
+    ])
+    adapter.send = send
+    sleep = AsyncMock()
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", sleep)
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("telegram", "42", None)
+    assert send.await_count == 2
+    sleep.assert_awaited_once_with(1.0)
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_honors_retry_after(
+    tmp_path, monkeypatch
+):
+    """Provider-requested retry delays take precedence over local backoff."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }), encoding="utf-8")
+
+    runner, adapter = make_restart_runner()
+    send = AsyncMock(side_effect=[
+        SendResult(
+            success=False,
+            error="rate limited",
+            retryable=True,
+            retry_after=5.0,
+        ),
+        SendResult(success=True, message_id="m-1"),
+    ])
+    adapter.send = send
+    sleep = AsyncMock()
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", sleep)
 
     await runner._send_restart_notification()
 
-    # File cleaned up even though we couldn't send
+    sleep.assert_awaited_once_with(5.0)
+    assert send.await_count == 2
     assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_retry_budget_is_bounded(
+    tmp_path, monkeypatch
+):
+    """Persistent retryable failures consume the bounded budget, then clean up."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_RESTART_NOTIFICATION_RETRY_TIMEOUT_SECS",
+        3.0,
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_RESTART_NOTIFICATION_RETRY_MAX_DELAY_SECS",
+        2.0,
+    )
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }), encoding="utf-8")
+
+    runner, adapter = make_restart_runner()
+    send = AsyncMock(return_value=SendResult(
+        success=False,
+        error="send_path_degraded",
+        retryable=True,
+    ))
+    adapter.send = send
+    clock = {"now": 0.0}
+    sleeps = []
+
+    async def _advance_clock(delay):
+        sleeps.append(delay)
+        clock["now"] += delay
+
+    monkeypatch.setattr(gateway_run.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _advance_clock)
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target is None
+    assert sleeps == [1.0, 2.0]
+    assert send.await_count == 3
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_cancellation_preserves_marker(
+    tmp_path, monkeypatch
+):
+    """Shutdown during safe backoff leaves the marker for the next process."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }), encoding="utf-8")
+
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(return_value=SendResult(
+        success=False,
+        error="send_path_degraded",
+        retryable=True,
+    ))
+    sleeping = asyncio.Event()
+
+    async def _block_in_backoff(_delay):
+        sleeping.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _block_in_backoff)
+
+    task = asyncio.create_task(runner._send_restart_notification())
+    await asyncio.wait_for(sleeping.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_shutdown_preserves_marker(
+    tmp_path, monkeypatch
+):
+    """Once teardown starts, leave delivery to the replacement process."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }), encoding="utf-8")
+
+    runner, adapter = make_restart_runner()
+    runner._running = False
+    send = AsyncMock()
+    adapter.send = send
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target is None
+    send.assert_not_awaited()
+    assert notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_preserves_replacement_marker(
+    tmp_path, monkeypatch
+):
+    """A second /restart marker must not be consumed by the older delivery."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+        "request_id": "old",
+    }), encoding="utf-8")
+
+    runner, adapter = make_restart_runner()
+
+    async def _send_while_marker_is_replaced(*_args, **_kwargs):
+        notify_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "42",
+            "request_id": "new",
+        }), encoding="utf-8")
+        return SendResult(success=True, message_id="sent")
+
+    adapter.send = AsyncMock(side_effect=_send_while_marker_is_replaced)
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("telegram", "42", None)
+    assert json.loads(notify_path.read_text(encoding="utf-8"))["request_id"] == "new"
 
 
 @pytest.mark.asyncio
@@ -639,15 +890,17 @@ async def test_send_restart_notification_cleans_up_on_send_failure(
     notify_path.write_text(json.dumps({
         "platform": "telegram",
         "chat_id": "42",
-    }))
+    }), encoding="utf-8")
 
     runner, adapter = make_restart_runner()
-    adapter.send = AsyncMock(side_effect=RuntimeError("network down"))
+    send = AsyncMock(side_effect=RuntimeError("network down"))
+    adapter.send = send
 
     delivered_target = await runner._send_restart_notification()
 
     # File cleaned up even though send raised.
     assert delivered_target is None
+    send.assert_awaited_once()
     assert not notify_path.exists()
 
 
@@ -671,12 +924,13 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
     notify_path.write_text(json.dumps({
         "platform": "telegram",
         "chat_id": "42",
-    }))
+    }), encoding="utf-8")
 
     runner, adapter = make_restart_runner()
-    adapter.send = AsyncMock(
+    send = AsyncMock(
         return_value=SendResult(success=False, error="Chat not found"),
     )
+    adapter.send = send
 
     with caplog.at_level("DEBUG", logger="gateway.run"):
         delivered_target = await runner._send_restart_notification()
@@ -692,6 +946,7 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
         and "Chat not found" in r.getMessage()
     ]
     assert delivered_target is None
+    send.assert_awaited_once()
     assert not success_lines, (
         "Expected no INFO 'Sent restart notification' line when send failed, "
         f"got: {[r.getMessage() for r in success_lines]}"
@@ -767,7 +1022,7 @@ async def test_send_restart_notification_skipped_when_flag_disabled(
     notify_path.write_text(json.dumps({
         "platform": "telegram",
         "chat_id": "42",
-    }))
+    }), encoding="utf-8")
 
     runner, adapter = make_restart_runner()
     runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = False
@@ -793,7 +1048,7 @@ async def test_send_restart_notification_logs_info_on_sendresult_success(
     notify_path.write_text(json.dumps({
         "platform": "telegram",
         "chat_id": "42",
-    }))
+    }), encoding="utf-8")
 
     runner, adapter = make_restart_runner()
     adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m-1"))
