@@ -7920,6 +7920,19 @@ def call_llm(
                     # The stale client is cached under the route label
                     # (e.g. "auto"), not the concrete backend we refreshed.
                     _evict_cached_clients(resolved_provider)
+                if auth_refresh_provider == "anthropic":
+                    # _refresh_provider_credentials() rotated the on-disk
+                    # credential, but resolved_api_key still holds the exact
+                    # token that just 401'd ("revoked"). _get_cached_client()
+                    # treats an explicit api_key as authoritative and never
+                    # re-derives it, so the retry below would rebuild a
+                    # client with the same dead token and 401 again forever
+                    # (observed: title_generation/compression stuck 401ing
+                    # for hours while the main conversation loop's
+                    # credential_pool kept rotating fine). Re-resolve so the
+                    # retry actually picks up the refreshed token.
+                    from agent.anthropic_adapter import resolve_anthropic_token
+                    resolved_api_key = resolve_anthropic_token() or resolved_api_key
                 logger.info(
                     "Auxiliary %s: refreshed %s credentials after auth error, retrying",
                     task or "call", auth_refresh_provider,
@@ -8499,6 +8512,13 @@ async def async_call_llm(
                     # The stale client is cached under the route label
                     # (e.g. "auto"), not the concrete backend we refreshed.
                     _evict_cached_clients(resolved_provider)
+                if auth_refresh_provider == "anthropic":
+                    # See sync call_llm's identical fix: resolved_api_key
+                    # still holds the token that just 401'd ("revoked").
+                    # Re-resolve so the retry doesn't rebuild a client with
+                    # the same dead token (#stuck-aux-401-loop).
+                    from agent.anthropic_adapter import resolve_anthropic_token
+                    resolved_api_key = resolve_anthropic_token() or resolved_api_key
                 logger.info(
                     "Auxiliary %s (async): refreshed %s credentials after auth error, retrying",
                     task or "call", auth_refresh_provider,
