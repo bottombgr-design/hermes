@@ -449,6 +449,8 @@ export interface Translations {
       invalidJson: string
       keepAwakeTitle: string
       keepAwakeDesc: string
+      debugTraceTitle: string
+      debugTraceDesc: string
     }
     credentials: {
       pasteKey: string
