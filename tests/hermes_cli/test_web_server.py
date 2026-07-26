@@ -9928,6 +9928,153 @@ class TestValidateProviderCredential:
         )
         assert captured["headers"] is None
 
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://169.254.169.254",
+            "http://169.254.169.254/latest/meta-data",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "file:///etc/passwd",
+            "gopher://127.0.0.1:70/x",
+        ],
+    )
+    def test_openai_base_url_blocks_ssrf_targets(self, monkeypatch, base_url):
+        """Server-side OPENAI_BASE_URL probes must not fetch metadata / non-http."""
+        called = []
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, *a, **k):
+                called.append((a, k))
+                raise AssertionError("SSRF target must not be fetched")
+
+        monkeypatch.setattr("httpx.Client", _Client)
+        data = self._post("OPENAI_BASE_URL", base_url).json()
+        assert data["ok"] is False
+        assert data["reachable"] is False
+        assert data["message"]
+        assert called == []
+
+    def test_openai_base_url_still_allows_loopback(self, monkeypatch):
+        """Local LLM endpoints remain probeable (feature must not be killed)."""
+        called = []
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "local-model"}]}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url, *a, **k):
+                called.append(url)
+                return _Resp()
+
+        monkeypatch.setattr("httpx.Client", _Client)
+        data = self._post("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1").json()
+        assert data["ok"] is True
+        assert data["models"] == ["local-model"]
+        assert called == ["http://127.0.0.1:11434/v1/models"]
+
+
+class TestValidateCustomEndpointSsrf:
+    """SSRF floor for POST /api/providers/custom-endpoints/validate."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        self.client = TestClient(app)
+        self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    def _post(self, base_url: str):
+        return self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={"name": "probe", "base_url": base_url, "model": "m"},
+        )
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://169.254.169.254",
+            "http://[::ffff:169.254.169.254]",
+            "file:///etc/passwd",
+        ],
+    )
+    def test_blocks_ssrf_targets_without_fetch(self, monkeypatch, base_url):
+        called = []
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, *a, **k):
+                called.append(True)
+                raise AssertionError("SSRF target must not be fetched")
+
+        monkeypatch.setattr("httpx.Client", _Client)
+        data = self._post(base_url).json()
+        assert data["ok"] is False
+        assert data["reachable"] is False
+        assert data["models"] == []
+        assert called == []
+
+    def test_allows_public_https_endpoint(self, monkeypatch):
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "gpt-test"}]}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                assert k.get("follow_redirects") is False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url, *a, **k):
+                assert url == "https://api.example.com/v1/models"
+                return _Resp()
+
+        monkeypatch.setattr("httpx.Client", _Client)
+        data = self._post("https://api.example.com/v1").json()
+        assert data["ok"] is True
+        assert data["models"] == ["gpt-test"]
+
 
 class TestDesktopCronTicker:
     """The dashboard backend fires cron jobs itself only when desktop-spawned."""

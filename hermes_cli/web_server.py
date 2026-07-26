@@ -7574,6 +7574,27 @@ def _parse_model_ids(resp: "Any") -> List[str]:
     return ids
 
 
+def _endpoint_probe_blocked_reason(url: str) -> Optional[str]:
+    """Return a user-facing reason when *url* must not be fetched server-side.
+
+    Custom-endpoint / ``OPENAI_BASE_URL`` validation intentionally allows
+    loopback and private LAN targets (local Ollama, vLLM, llama.cpp). The
+    security floor is http(s) only plus the shared always-blocked cloud
+    metadata policy from ``tools.url_safety`` (CWE-918).
+    """
+    from tools.url_safety import is_always_blocked_url
+
+    parsed = urllib.parse.urlparse(url)
+    scheme = (parsed.scheme or "").strip().lower()
+    if scheme not in {"http", "https"}:
+        return "Only http:// and https:// endpoint URLs are allowed."
+    if not (parsed.hostname or "").strip():
+        return "Enter a valid endpoint URL with a hostname."
+    if is_always_blocked_url(url):
+        return "That URL targets a blocked internal address."
+    return None
+
+
 def _custom_endpoint_id(raw: str, fallback: str = "custom") -> str:
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", (raw or "").strip()).strip("-_").lower()
     return slug or fallback
@@ -7897,12 +7918,17 @@ async def validate_custom_endpoint(body: CustomEndpointUpdate):
         return {"ok": False, "reachable": True, "message": "Enter an endpoint URL first.", "models": []}
 
     url = base_url + "/models"
+    blocked = _endpoint_probe_blocked_reason(url)
+    if blocked:
+        return {"ok": False, "reachable": False, "message": blocked, "models": []}
+
     headers = {"Accept": "application/json"}
     if body.api_key and body.api_key.strip():
         headers["Authorization"] = f"Bearer {body.api_key.strip()}"
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(8.0)) as client:
+        # follow_redirects=False: a public URL must not bounce into metadata.
+        with httpx.Client(timeout=httpx.Timeout(8.0), follow_redirects=False) as client:
             resp = client.get(url, headers=headers)
     except Exception:
         return {"ok": False, "reachable": False, "message": f"Could not reach {url}.", "models": []}
@@ -7938,13 +7964,16 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
     # auto-pick a default without asking the user to type a model name.
     if key == "OPENAI_BASE_URL":
         url = value.rstrip("/") + "/models"
+        blocked = _endpoint_probe_blocked_reason(url)
+        if blocked:
+            return {"ok": False, "reachable": False, "message": blocked, "models": []}
         # Send the optional API key so endpoints that require auth on
         # ``/v1/models`` (many hosted OpenAI-compatible servers) still enumerate
         # their models instead of returning an empty list behind a 401.
         api_key = (body.api_key or "").strip()
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         try:
-            with httpx.Client(timeout=httpx.Timeout(8.0)) as client:
+            with httpx.Client(timeout=httpx.Timeout(8.0), follow_redirects=False) as client:
                 resp = client.get(url, headers=headers)
             return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
         except Exception:
