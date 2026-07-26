@@ -10252,10 +10252,13 @@ def _(rid, params: dict) -> dict:
         return err
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
-        # Host pipe/respawn failure means no turn.end will clear `running`.
-        # Mirror the in-process dead-thread recovery below so Stop cannot
-        # permanently brick the session into forever-queued prompt.submit.
+        # Host pipe/respawn failure can leave `running` stuck when no turn.end
+        # will arrive. Mirror in-process dead-thread recovery, but only when
+        # this sid has no pending host completion — otherwise the crash waiter
+        # still owns teardown via `_fail_pending_turns`, and force-clearing
+        # would let a successor prompt.submit race that snapshot.
         host_unreachable = False
+        pending_for_sid = False
         if session.get("running"):
             try:
                 _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
@@ -10266,10 +10269,14 @@ def _(rid, params: dict) -> dict:
                     f"{type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
+                try:
+                    pending_for_sid = _get_compute_host_supervisor().has_pending_turn(sid)
+                except Exception:
+                    pending_for_sid = False
         with session["history_lock"]:
             session["_turn_cancel_requested"] = True
             session["queued_prompt"] = None
-            if host_unreachable and session.get("running"):
+            if host_unreachable and session.get("running") and not pending_for_sid:
                 session["running"] = False
                 _clear_inflight_turn(session)
         _clear_pending(sid)
