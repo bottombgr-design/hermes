@@ -50,6 +50,10 @@ function commandText(value: string): string {
 /** How many recent sessions to surface inline before the "Browse all…" entry. */
 const SESSION_INLINE_LIMIT = 7
 
+export function slashCompletionGroup(command: string, fallback?: string): string | undefined {
+  return isDesktopSlashExtensionCommand(command) ? 'Skills' : fallback
+}
+
 /** Live `/` completions backed by the gateway's `complete.slash` RPC. */
 export function useSlashCompletions(options: {
   gateway: HermesGateway | null
@@ -144,7 +148,7 @@ export function useSlashCompletions(options: {
             section.pairs.map(([command, meta]) => ({
               text: command,
               display: command,
-              group: section.name || undefined,
+              group: slashCompletionGroup(command, section.name || undefined),
               meta
             }))
           )
