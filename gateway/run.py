@@ -11373,9 +11373,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the tool-progress display mode for the ongoing stream.
             # Both modify session state without needing agent interaction
             # and must not be queued (the safety net would discard them).
-            # /fast and /reasoning are config-only and take effect next
-            # message, so they fall through to the catch-all busy response
-            # below — users should wait and set them between turns.
+            # /fast is config-only and takes effect next message, so it falls
+            # through to the catch-all busy response below.
             if _cmd_def_inner and _cmd_def_inner.name in {"yolo", "verbose", "footer"}:
                 if _cmd_def_inner.name == "yolo":
                     return await self._handle_yolo_command(event)
@@ -11398,10 +11397,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _cmd_def_inner.name == "version":
                     return await self._handle_version_command(event)
 
+            # Keep reasoning semantics in the slash-command mixin; the active
+            # session guard only supplies the session's running agent.
+            if _cmd_def_inner and _cmd_def_inner.name == "reasoning":
+                return await self._handle_reasoning_command(
+                    event, running_agent=self._running_agents.get(_quick_key),
+                    session_key=_quick_key,
+                )
+
             # Catch-all: any other recognized slash command reached the
             # running-agent guard. Reject gracefully rather than falling
             # through to interrupt + discard. Without this, commands
-            # like /model, /reasoning, /voice, /insights, /title,
+            # like /model, /voice, /insights, /title,
             # /resume, /retry, /undo, /compress, /usage,
             # /reload-mcp, /sethome, /reset (all registered as Discord
             # slash commands) would interrupt the agent AND get
