@@ -7449,8 +7449,12 @@ def _catalog_provider_env_metadata() -> dict:
 
 @app.get("/api/env")
 async def get_env_vars(profile: Optional[str] = None):
-    with _profile_scope(profile):
+    from hermes_cli.context_usage import compute_context_last_used
+
+    with _profile_scope(profile) as scoped_dir:
         env_on_disk = load_env()
+        home = scoped_dir or get_hermes_home()
+    keys_last_used = compute_context_last_used(home=home)["keys"]
     channel_keys = _channel_managed_env_keys()
     catalog_meta = _catalog_provider_env_metadata()
 
@@ -7483,6 +7487,10 @@ async def get_env_vars(profile: Optional[str] = None):
             # Keys page can list (and let the user manage) them instead of
             # hiding everything it doesn't recognise.
             "custom": custom,
+            # Best-effort real last-used time from state.db tool calls —
+            # only set when this key is the sole provider of its tool(s), so
+            # it's never a guess among several configured alternatives.
+            "last_used_at": keys_last_used.get(var_name),
         }
 
     result = {}
@@ -8592,6 +8600,7 @@ def _messaging_platform_payload(
     env_on_disk: dict[str, str],
     runtime: dict | None,
     scoped: bool = False,
+    last_used_at: Optional[float] = None,
 ) -> dict[str, Any]:
     platform_id = entry["id"]
     runtime_platforms = runtime.get("platforms") if runtime else {}
@@ -8731,6 +8740,9 @@ def _messaging_platform_payload(
         ),
         "home_channel": home_channel,
         "env_vars": env_vars,
+        # Real last-used time derived from state.db sessions for this
+        # platform's source id, or None when never used — never fabricated.
+        "last_used_at": last_used_at,
     }
     if whatsapp_setup is not None:
         payload["whatsapp_setup"] = whatsapp_setup
@@ -9603,6 +9615,8 @@ async def cancel_telegram_onboarding(pairing_id: str):
 
 @app.get("/api/messaging/platforms")
 async def get_messaging_platforms(profile: Optional[str] = None):
+    from hermes_cli.context_usage import compute_context_last_used
+
     # Profile-scoped so the dashboard's global profile switcher shows the
     # TARGET profile's channel credentials/state, not the root install's.
     # Inside _profile_scope, load_env()/read_runtime_status()/get_running_pid()
@@ -9610,12 +9624,18 @@ async def get_messaging_platforms(profile: Optional[str] = None):
     with _profile_scope(profile) as scoped_dir:
         env_on_disk = load_env()
         runtime = read_runtime_status()
+        home = scoped_dir or get_hermes_home()
+        channels_last_used = compute_context_last_used(home=home)["channels"]
         return {
             "env_path": str(get_env_path()),
             "gateway_start_command": _gateway_display_command(profile, "start"),
             "platforms": [
                 _messaging_platform_payload(
-                    entry, env_on_disk, runtime, scoped=scoped_dir is not None
+                    entry,
+                    env_on_disk,
+                    runtime,
+                    scoped=scoped_dir is not None,
+                    last_used_at=channels_last_used.get(entry["id"]),
                 )
                 for entry in _messaging_platform_catalog()
             ]
@@ -12783,7 +12803,9 @@ def _redact_mcp_env(env: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 
-def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _mcp_server_summary(
+    name: str, cfg: Dict[str, Any], *, last_used_at: Optional[float] = None
+) -> Dict[str, Any]:
     transport = "http" if cfg.get("url") else ("stdio" if cfg.get("command") else "unknown")
     auth = cfg.get("auth")
     headers = cfg.get("headers") or {}
@@ -12802,20 +12824,47 @@ def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         "enabled": cfg.get("enabled", True) is not False,
         # Tool selection: list of enabled tool names, or None = all.
         "tools": cfg.get("tools"),
+        # Real last-used time derived from state.db tool_calls, or None when
+        # the server has never been called (or history doesn't reach it) —
+        # never fabricated. See hermes_cli/context_usage.py.
+        "last_used_at": last_used_at,
     }
 
 
 @app.get("/api/mcp/servers")
 async def list_mcp_servers(profile: Optional[str] = None):
+    from hermes_cli.context_usage import compute_context_last_used
     from hermes_cli.mcp_config import _get_mcp_servers
 
-    with _profile_scope(profile):
+    with _profile_scope(profile) as scoped_dir:
         servers = _get_mcp_servers()
+        home = scoped_dir or get_hermes_home()
+    usage = compute_context_last_used(home=home, mcp_server_names=servers.keys())
+    mcp_last_used = usage["mcp"]
     return {
         "servers": [
-            _mcp_server_summary(name, cfg) for name, cfg in sorted(servers.items())
+            _mcp_server_summary(name, cfg, last_used_at=mcp_last_used.get(name))
+            for name, cfg in sorted(servers.items())
         ]
     }
+
+
+@app.get("/api/context/last-used")
+async def get_context_last_used(profile: Optional[str] = None):
+    """One-shot batch of real last-used times, for mobile pull-to-refresh.
+
+    Wraps :func:`hermes_cli.context_usage.compute_context_last_used` so a
+    client can fetch MCP/channel/key recency in a single round trip instead
+    of hitting ``/api/mcp/servers`` + ``/api/messaging/platforms`` + ``/api/env``
+    separately. Same data, same "never fabricate a timestamp" contract.
+    """
+    from hermes_cli.context_usage import compute_context_last_used
+    from hermes_cli.mcp_config import _get_mcp_servers
+
+    with _profile_scope(profile) as scoped_dir:
+        servers = _get_mcp_servers()
+        home = scoped_dir or get_hermes_home()
+    return compute_context_last_used(home=home, mcp_server_names=servers.keys())
 
 
 @app.post("/api/mcp/servers")
