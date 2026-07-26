@@ -2576,9 +2576,13 @@ def test_sync_turn_captures_session_id_before_worker_runs():
     finally:
         _mod._VikingClient = real_client_cls
 
-    # The whole turn must target the OLD session id as a single ordered batch.
-    assert captured_paths == ["/api/v1/sessions/old-sid/messages/batch"]
-    assert captured_payloads == [{
+    # The whole turn must target the OLD session id: registration first,
+    # then the single ordered batch.
+    assert captured_paths == [
+        "/api/v1/sessions",
+        "/api/v1/sessions/old-sid/messages/batch",
+    ]
+    assert captured_payloads == [{"session_id": "old-sid"}, {
         "messages": [
             {"role": "user", "parts": [{"type": "text", "text": "u"}]},
             {"role": "assistant", "parts": [{"type": "text", "text": "a"}], "peer_id": "hermes"},
@@ -2620,7 +2624,8 @@ def test_sync_turn_retries_batch_write_with_fresh_client():
         _mod._VikingClient = real_client_cls
 
     assert len(clients) == 2
-    assert captured == [(
+    assert captured[0] == ("/api/v1/sessions", {"session_id": "sid-1"})
+    assert captured[1:] == [(
         "/api/v1/sessions/sid-1/messages/batch",
         {
             "messages": [
@@ -2629,6 +2634,81 @@ def test_sync_turn_retries_batch_write_with_fresh_client():
             ]
         },
     )]
+
+
+def _registration_provider(sid):
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._endpoint = "http://test"
+    provider._api_key = ""
+    provider._account = "acct"
+    provider._user = "usr"
+    provider._agent = "hermes"
+    provider._session_id = sid
+    return provider
+
+
+def test_sync_turn_registers_session_once_per_sid():
+    """The sid is registered with POST /api/v1/sessions before its first
+    batch and never re-registered on later turns."""
+    provider = _registration_provider("sid-reg")
+    captured = []
+
+    class StubClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def post(self, path, payload=None, **kwargs):
+            captured.append(path)
+            return {}
+
+    import plugins.memory.openviking as _mod
+    real_client_cls = _mod._VikingClient
+    _mod._VikingClient = StubClient
+    try:
+        provider.sync_turn("u1", "a1")
+        assert provider._drain_writers("sid-reg", timeout=2.0)
+        provider.sync_turn("u2", "a2")
+        assert provider._drain_writers("sid-reg", timeout=2.0)
+    finally:
+        _mod._VikingClient = real_client_cls
+
+    assert captured[0] == "/api/v1/sessions"
+    assert captured.count("/api/v1/sessions") == 1
+    assert captured.count("/api/v1/sessions/sid-reg/messages/batch") == 2
+
+
+def test_sync_turn_treats_already_exists_registration_as_registered():
+    """An ALREADY_EXISTS answer (racing writer / previous run) counts as
+    registered: the batch proceeds and the sid is not re-registered."""
+    provider = _registration_provider("sid-exists")
+    captured = []
+
+    class StubClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def post(self, path, payload=None, **kwargs):
+            captured.append(path)
+            if path == "/api/v1/sessions":
+                raise RuntimeError(
+                    "ALREADY_EXISTS: Session 'sid-exists' already exists"
+                )
+            return {}
+
+    import plugins.memory.openviking as _mod
+    real_client_cls = _mod._VikingClient
+    _mod._VikingClient = StubClient
+    try:
+        provider.sync_turn("u1", "a1")
+        assert provider._drain_writers("sid-exists", timeout=2.0)
+        provider.sync_turn("u2", "a2")
+        assert provider._drain_writers("sid-exists", timeout=2.0)
+    finally:
+        _mod._VikingClient = real_client_cls
+
+    assert captured.count("/api/v1/sessions") == 1
+    assert captured.count("/api/v1/sessions/sid-exists/messages/batch") == 2
 
 
 def _long_structured_turn(assistant_count=204):
@@ -2679,6 +2759,9 @@ def test_sync_turn_chunks_structured_messages_to_openviking_limit(
     provider.sync_turn("u", f"assistant-{assistant_count - 1}", messages=messages)
     assert provider._drain_writers("sid-chunked", timeout=2.0)
 
+    assert captured[0] == ("/api/v1/sessions", {"session_id": "sid-chunked"})
+    captured = captured[1:]
+
     assert [
         len(payload["messages"])
         for _path, payload in captured
@@ -2711,6 +2794,8 @@ def test_sync_turn_retries_only_unsent_chunks_with_fresh_client(monkeypatch):
             clients.append(self)
 
         def post(self, path, payload=None, **kwargs):
+            if path == "/api/v1/sessions":
+                return {}
             attempts.append((self.index, path, payload))
             if self.index == 0 and len([item for item in attempts if item[0] == 0]) == 2:
                 raise RuntimeError("transient second chunk failure")
@@ -2753,6 +2838,8 @@ def test_sync_turn_falls_back_to_individual_writes_for_unsent_chunks(monkeypatch
             clients.append(self)
 
         def post(self, path, payload=None, **kwargs):
+            if path == "/api/v1/sessions":
+                return {}
             if path.endswith("/messages/batch"):
                 if self.index == 0 and not accepted:
                     accepted.extend(payload["messages"])
@@ -2821,7 +2908,8 @@ def test_sync_turn_structured_messages_include_assistant_peer_id():
     finally:
         _mod._VikingClient = real_client_cls
 
-    assert captured == [(
+    assert captured[0] == ("/api/v1/sessions", {"session_id": "sid-structured"})
+    assert captured[1:] == [(
         "/api/v1/sessions/sid-structured/messages/batch",
         {
             "messages": [
