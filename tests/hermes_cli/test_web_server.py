@@ -9976,7 +9976,7 @@ class TestValidateProviderCredential:
 
         class _Client:
             def __init__(self, *a, **k):
-                pass
+                assert k.get("follow_redirects") is False
 
             def __enter__(self):
                 return self
