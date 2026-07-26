@@ -4410,7 +4410,11 @@ class GatewaySlashCommandsMixin:
         try:
             from agent.account_usage import nous_credits_lines
 
-            credits_lines = await asyncio.to_thread(nous_credits_lines, markdown=True)
+            norm_p = str(provider or "").strip().lower()
+            if (not provider or norm_p == "nous" or not account_lines) and norm_p != "custom" and not norm_p.startswith("custom:"):
+                credits_lines = await asyncio.to_thread(nous_credits_lines, markdown=True)
+            else:
+                credits_lines = []
         except Exception:
             credits_lines = []  # fail-open: never break /usage
 

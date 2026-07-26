@@ -35,6 +35,14 @@ class CLIBillingMixin:
         """
         from cli import _cprint, _b, _d
 
+        agent_obj = getattr(self, "agent", None)
+        provider = getattr(self, "provider", None) or (
+            getattr(agent_obj, "provider", None) if agent_obj else None
+        )
+        norm_p = str(provider or "").strip().lower()
+        if norm_p and norm_p != "nous" and (norm_p == "custom" or norm_p.startswith("custom:")):
+            return False
+
         try:
             from agent.billing_usage import build_usage_model, format_renews
 

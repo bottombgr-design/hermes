@@ -6,8 +6,9 @@ from agent import account_usage
 
 
 class _FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self):
         return None
@@ -436,3 +437,38 @@ def test_redeem_missing_credentials_reports_unavailable(monkeypatch):
 
     assert result.status == "unavailable"
     assert "hermes auth" in result.message
+
+
+def test_fetch_account_usage_custom_provider(monkeypatch):
+    custom_payload = {
+        "provider": "antigravity-proxy",
+        "source": "cloudcode.fetchAvailableModels",
+        "windows": [
+            {
+                "label": "Gemini quota",
+                "remaining_fraction": 0.95,
+                "used_percent": 5.0,
+                "reset_at": "2026-07-26T15:26:20Z",
+            }
+        ],
+    }
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda *a, **kw: _FakeClient(calls, custom_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "custom:antigravity-proxy",
+        base_url="http://127.0.0.1:8091/anthropic",
+        api_key="agy-key",
+    )
+
+    assert snapshot is not None
+    assert snapshot.provider == "antigravity-proxy"
+    assert snapshot.windows[0].label == "Gemini quota"
+    assert snapshot.windows[0].used_percent == 5.0
+    assert calls[0]["url"] == "http://127.0.0.1:8091/v1/usage"
+    assert calls[0]["headers"]["x-api-key"] == "agy-key"
+
