@@ -3458,11 +3458,12 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
 
 
 def test_resolve_hermes_argv_prefers_path_shim(monkeypatch):
-    """When `hermes` is on PATH, use the shim — preserves familiar ps output."""
+    """A PATH-resolved shim is preferred and normalized to an absolute path."""
     import shutil
     import hermes_cli.kanban_db as kb
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(sys, "executable", "/opt/python/bin/python3")
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/hermes")
     argv = kb._resolve_hermes_argv()
     assert argv == ["/usr/local/bin/hermes"]
@@ -3507,6 +3508,23 @@ def test_resolve_hermes_argv_honors_hermes_bin_path_override(monkeypatch, tmp_pa
     monkeypatch.setattr(shutil, "which", lambda name: None)
 
     assert kb._resolve_hermes_argv() == [str(shim)]
+
+
+def test_resolve_hermes_argv_avoids_current_venv_shell_shim(monkeypatch, tmp_path):
+    """The current venv shim must not make worker startup depend on PATH."""
+    import hermes_cli.kanban_db as kb
+
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    python = bin_dir / "python3"
+    python.touch()
+    shim = bin_dir / "hermes"
+    shim.write_text("#!/bin/sh\nrealpath -- $0\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setenv("HERMES_BIN", str(shim))
+    monkeypatch.setenv("PATH", "/opt/homebrew/bin:$PATH:/opt/homebrew/sbin")
+
+    assert kb._resolve_hermes_argv() == [str(python), "-m", "hermes_cli.main"]
 
 
 def test_resolve_hermes_argv_hermes_bin_bare_name_uses_path(monkeypatch, tmp_path):
