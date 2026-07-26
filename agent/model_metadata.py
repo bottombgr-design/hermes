@@ -2809,14 +2809,42 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
 
 
 def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
-    """Token estimate for a message shadow with image payloads stripped."""
+    """Token estimate for a message shadow with image payloads stripped.
+
+    When an assistant message carries ``anthropic_content_blocks`` (Anthropic's
+    interleaved-thinking replay channel -- the raw provider content array
+    stashed onto the message so ``_convert_assistant_message`` in
+    ``agent/anthropic_adapter.py`` can replay it verbatim on the next API
+    call), the ``content`` string and the ``reasoning`` / ``reasoning_content``
+    / ``reasoning_details`` fields are all pure duplicates of the same
+    thinking text already inside ``anthropic_content_blocks`` -- the replay
+    path reads ``anthropic_content_blocks`` alone for these turns and never
+    touches the other four. Counting all of them inflates a single thinking
+    block's token cost by up to ~4-5x, which is the dominant driver of a
+    preflight/compaction-trigger estimate running far ahead of the real
+    provider-reported ``prompt_tokens`` on any session with interleaved
+    thinking enabled.
+    """
     if not isinstance(msg, dict):
         return estimate_tokens_rough(str(msg))
+    has_anthropic_blocks = bool(msg.get("anthropic_content_blocks"))
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k == "_anthropic_content_blocks":
+        if k == "anthropic_content_blocks":
+            shadow[k] = v
+            continue
+        if k in ("reasoning", "reasoning_content", "reasoning_details"):
+            # Skip the reasoning-field duplicates when blocks already carry
+            # the same thinking text for the provider (see docstring).
+            if has_anthropic_blocks:
+                continue
+            shadow[k] = v
             continue
         if k == "content":
+            if has_anthropic_blocks:
+                # Skip the text-extracted duplicate when blocks already
+                # represent the same content for the provider.
+                continue
             if isinstance(v, list):
                 cleaned = []
                 for part in v:
