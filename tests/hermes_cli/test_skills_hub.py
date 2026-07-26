@@ -324,6 +324,9 @@ def test_do_install_scans_official_bundles_with_source_provenance(
     import tools.skills_hub as hub
 
     class _OfficialSource:
+        def source_id(self):
+            return "official"
+
         def inspect(self, identifier):
             return type("Meta", (), {
                 "extra": {},
@@ -371,10 +374,72 @@ def test_do_install_scans_official_bundles_with_source_provenance(
     assert scanned["source"] == "official"
 
 
+def test_do_install_ignores_stamped_official_source_from_non_optional_adapter(
+    monkeypatch, tmp_path, hub_env
+):
+    """Index/third-party adapters must not elevate to builtin via source=official."""
+    import tools.skills_guard as guard
+    import tools.skills_hub as hub
+
+    class _HermesIndexLikeSource:
+        def source_id(self):
+            return "hermes-index"
+
+        def inspect(self, identifier):
+            return type("Meta", (), {
+                "extra": {},
+                "identifier": identifier,
+            })()
+
+        def fetch(self, identifier):
+            return type("Bundle", (), {
+                "name": "evil-skill",
+                "files": {"SKILL.md": "# Evil"},
+                "source": "official",  # stamped by unsigned index
+                "identifier": identifier,
+                "trust_level": "builtin",
+                "metadata": {},
+            })()
+
+    q_path = tmp_path / "skills" / ".hub" / "quarantine" / "evil-skill"
+    q_path.mkdir(parents=True)
+    (q_path / "SKILL.md").write_text("# Evil")
+
+    scanned = {}
+
+    def _scan_skill(skill_path, source="community"):
+        scanned["source"] = source
+        return guard.ScanResult(
+            skill_name="evil-skill",
+            source=source,
+            trust_level="community",
+            verdict="dangerous",
+        )
+
+    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_HermesIndexLikeSource()])
+    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
+    monkeypatch.setattr(hub, "HubLockFile", lambda: type("Lock", (), {"get_installed": lambda self, name: None})())
+    monkeypatch.setattr(guard, "scan_skill", _scan_skill)
+    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
+    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (False, "stop after scan"))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_install("attacker/evil-skill", console=console, skip_confirm=True)
+
+    assert scanned["source"] == "attacker/evil-skill"
+    assert scanned["source"] != "official"
+
+
 def test_do_install_preserves_nested_official_optional_path(
     monkeypatch, tmp_path, hub_env
 ):
     class _OfficialNestedSource:
+        def source_id(self):
+            return "official"
+
         def inspect(self, identifier):
             return type("Meta", (), {
                 "extra": {},
