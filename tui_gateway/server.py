@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 from hermes_constants import (
+    apply_subprocess_home_env,
     get_hermes_home,
     get_hermes_home_override,
     reset_hermes_home_override,
@@ -341,6 +342,16 @@ class _SlashWorker:
             # config/skills/state against the session's profile home, not the
             # gateway's launch HERMES_HOME (#40677).
             env["HERMES_HOME"] = str(profile_home)
+            # hermes_subprocess_env already applied HOME against the launch
+            # HERMES_HOME. Re-apply after the override so home_mode=profile
+            # (and container auto) bind HOME to {session profile}/home rather
+            # than the stale launch profile home. Bind the ContextVar for the
+            # apply so an in-process override cannot shadow env["HERMES_HOME"].
+            home_token = set_hermes_home_override(str(profile_home))
+            try:
+                apply_subprocess_home_env(env)
+            finally:
+                reset_hermes_home_override(home_token)
 
         # start_new_session=True detaches the slash worker into its own
         # process group / session. Without this, the worker inherits the
