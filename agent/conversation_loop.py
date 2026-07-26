@@ -437,25 +437,54 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
-        # Continuing session — reuse the exact system prompt from the
-        # previous turn so the Anthropic cache prefix matches.
-        agent._cached_system_prompt = stored_prompt
-        # Reconstruct the cross-session-stable prefix for the early cache
-        # breakpoint. The static prefix is not persisted (only the full
-        # prompt is), so gateway surfaces that build a fresh AIAgent per
-        # turn would otherwise lose the two-block system layout after the
-        # first turn — flip-flopping the wire shape mid-conversation and
-        # silently degrading to the legacy single-breakpoint layout.
+        # ``_stored_prompt_matches_runtime`` only rejects Model/Provider/cwd/
+        # Platform drift, so identity CONTENT drift — SOUL.md edited, created
+        # or deleted since the prompt was persisted — was reused verbatim for
+        # the rest of the session (issue #68563). Check the identity block
+        # against the same resolver a fresh build would use. The comparison
+        # is anchored: identity is slot #1 and ``HERMES_AGENT_HELP_GUIDANCE``
+        # always follows it in the stable tier, so requiring the pair as the
+        # prompt prefix supplies the boundary a bare substring check lacks
+        # (deleting the TAIL of SOUL.md would otherwise still "match").
+        # Cost is one file read + truncation — no probes, no tier assembly.
         #
-        # ``reconstruct_static_prefix`` gates on ``_use_prompt_caching`` (so
-        # non-Anthropic routes skip the rebuild), applies the startswith
-        # safety gate (stored prompt bytes are never rewritten), and
-        # fails open to the legacy cache layout.
-        from agent.system_prompt import reconstruct_static_prefix
+        # Fail-open direction is reuse: ``checkable=False`` (SOUL.md exists
+        # but is temporarily unreadable) or a resolver crash is no basis to
+        # call the stored identity stale — rebuilding then would persist a
+        # DEFAULT_AGENT_IDENTITY downgrade over a healthy custom identity.
+        identity_stale = False
+        try:
+            from agent.prompt_builder import HERMES_AGENT_HELP_GUIDANCE as _help
+            from agent.system_prompt import resolve_identity_block as _resolve_identity
 
-        reconstruct_static_prefix(agent, system_message=system_message)
-        return
-    if stored_prompt:
+            _identity = _resolve_identity(agent)
+            if _identity["checkable"] and _identity["text"]:
+                _anchored = _identity["text"].strip() + "\n\n" + _help.strip()
+                identity_stale = not stored_prompt.startswith(_anchored)
+        except Exception:
+            logger.debug(
+                "identity staleness check failed on restore", exc_info=True
+            )
+        if identity_stale:
+            stored_state = "stale_identity"
+            logger.info(
+                "Stored system prompt for session %s has a stale identity "
+                "block (SOUL.md changed since it was persisted); rebuilding.",
+                agent.session_id,
+            )
+        else:
+            # Reuse the exact system prompt from the previous turn so the
+            # Anthropic cache prefix matches.
+            agent._cached_system_prompt = stored_prompt
+            # ``reconstruct_static_prefix`` gates on ``_use_prompt_caching``
+            # (so non-Anthropic routes skip the rebuild), applies the
+            # startswith safety gate (stored prompt bytes are never
+            # rewritten), and fails open to the legacy cache layout.
+            from agent.system_prompt import reconstruct_static_prefix
+
+            reconstruct_static_prefix(agent, system_message=system_message)
+            return
+    elif stored_prompt:
         stored_state = "stale_runtime"
         logger.info(
             "Stored system prompt for session %s has stale runtime identity; "
@@ -485,16 +514,20 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    # A stale-prompt fallthrough (runtime identity or SOUL.md drift) is a
+    # CONTINUING session getting its prompt rebuilt — firing here again
+    # would duplicate session-scoped plugin work, so those states skip it.
+    if stored_state not in ("stale_runtime", "stale_identity"):
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
