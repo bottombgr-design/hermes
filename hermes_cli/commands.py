@@ -157,6 +157,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("on", "off", "status")),
     CommandDef("yolo", "Toggle YOLO mode (skip all dangerous command approvals)",
                "Configuration"),
+    CommandDef("auto", "Auto Mode: a safety classifier approves/declines "
+               "flagged commands instead of prompting you", "Configuration",
+               args_hint="[on|off|status]", subcommands=("on", "off", "status")),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
                args_hint="[level|show|hide|full|clamp] [--global]",
                subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp", "--global")),
@@ -1171,8 +1174,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
+#   - version: a low-frequency info command; reached via /hermes version on
+#     Slack. Freed up its slot for /auto, which landed at the cap.
 #   - egress: Docker-only proxy status; reachable as /hermes egress on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "version", "egress"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
