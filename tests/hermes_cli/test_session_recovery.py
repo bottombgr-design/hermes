@@ -934,6 +934,7 @@ def test_partial_recovery_removes_messages_for_unreadable_sessions(
     assert report["source_unchanged"] is True
     assert _sha256(source) == source_hash
     assert report["copy"]["sessions"]["status"] == "partial"
+    assert report["copy"]["system_prompts"]["status"] == "complete"
     assert report["copy"]["messages"]["status"] == "complete"
     removed_messages = report["orphan_cleanup"]["messages_removed"]
     assert removed_messages > 0
@@ -959,6 +960,81 @@ def test_partial_recovery_removes_messages_for_unreadable_sessions(
         )
         assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == len(
             recovered_sessions
+        )
+        recovered_prompts = {
+            str(row[0]): str(row[1])
+            for row in conn.execute(
+                "SELECT s.id, p.prompt FROM sessions AS s "
+                "JOIN system_prompts AS p ON p.hash = s.system_prompt_hash"
+            )
+        }
+        original_sessions = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT id FROM sessions WHERE source != 'recovered'"
+            )
+        }
+        assert recovered_prompts.keys() == original_sessions
+        assert recovered_prompts["partial-session-0000"].startswith(
+            "session payload 0000 "
+        )
+        assert recovered_prompts[f"partial-session-{session_count - 1:04d}"].startswith(
+            f"session payload {session_count - 1:04d} "
+        )
+    finally:
+        conn.close()
+
+
+def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "corrupt-system-prompts.db"
+    output = tmp_path / "partial-system-prompts.db"
+    session_count = 180
+    _make_many_sessions_source(source, session_count)
+
+    conn = sqlite3.connect(str(source), isolation_level=None)
+    try:
+        row = conn.execute(
+            "SELECT rootpage FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'system_prompts'"
+        ).fetchone()
+        assert row is not None
+        prompt_root = int(row[0])
+    finally:
+        conn.close()
+    _corrupt_middle_table_leaf(source, prompt_root)
+
+    report = recover_session_database(
+        source,
+        output,
+        work_dir=tmp_path,
+        chunk_size=8,
+        allow_partial=True,
+    )
+
+    assert report["verified"] is True
+    assert report["partial"] is True
+    assert report["copy"]["sessions"]["status"] == "complete"
+    assert report["copy"]["messages"]["status"] == "complete"
+    assert report["copy"]["system_prompts"]["status"] == "partial"
+    cleared = report["orphan_cleanup"]["session_prompt_refs_cleared"]
+    assert 0 < cleared < session_count
+    assert report["verification"]["foreign_key_check"] == []
+
+    conn = sqlite3.connect(str(output))
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == session_count
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == session_count
+        retained = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE system_prompt_hash IS NOT NULL"
+        ).fetchone()[0]
+        assert retained == session_count - cleared
+        assert (
+            conn.execute("SELECT COUNT(*) FROM system_prompts").fetchone()[0]
+            == retained
         )
     finally:
         conn.close()
