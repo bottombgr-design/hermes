@@ -15918,6 +15918,54 @@ def _details_completions(text: str) -> list[dict] | None:
     return []
 
 
+@method("complete.suggest")
+def _(rid, params: dict) -> dict:
+    """Ghost-text reply suggestions for an empty composer (slice 1).
+
+    Deterministic only: runs ``extract_suggestions`` over the session's last
+    assistant message and returns up to three ranked candidates. The
+    renderer shows the first as dim ghost text (Tab accepts, Esc/typing
+    dismisses). ``history_version`` echoes the transcript version the
+    candidates were computed from so the client can drop stale responses
+    after the conversation moves on. Empty candidates is a normal outcome
+    and must never surface an error in the composer.
+    """
+    session = _sessions.get(params.get("session_id") or "")
+    if session is None:
+        return _ok(rid, {"candidates": [], "history_version": 0})
+    if not bool(
+        (_load_cfg().get("display") or {}).get("composer_suggestions", True)
+    ):
+        return _ok(rid, {"candidates": [], "history_version": 0})
+
+    lock = session.get("history_lock")
+    try:
+        if lock is not None:
+            with lock:
+                history = list(session.get("history", []))
+                version = int(session.get("history_version", 0))
+        else:
+            history = list(session.get("history", []))
+            version = int(session.get("history_version", 0))
+
+        assistant_text = ""
+        for msg in reversed(history):
+            if msg.get("role") == "assistant":
+                assistant_text = _coerce_message_text(msg.get("content")) or ""
+                break
+
+        from tui_gateway.suggest import extract_suggestions
+
+        candidates = [
+            {"text": c.text, "kind": c.kind}
+            for c in extract_suggestions(assistant_text)
+        ]
+        return _ok(rid, {"candidates": candidates, "history_version": version})
+    except Exception:
+        # Suggestions are decorative; a failure must never break the composer.
+        return _ok(rid, {"candidates": [], "history_version": 0})
+
+
 @method("complete.slash")
 def _(rid, params: dict) -> dict:
     text = params.get("text", "")
