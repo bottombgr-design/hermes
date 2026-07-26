@@ -1614,8 +1614,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # empty, not a degrade. Only a MISSING fts object disables
                 # search: a transient error (e.g. "database is locked"
                 # during a checkpoint) must not latch a silent false-empty
-                # for the handle's lifetime — leave enabled and let the
-                # query surface the error visibly.
+                # for the handle's lifetime. Leaving enabled doesn't make
+                # the error visible — search_messages() swallows a per-query
+                # OperationalError into [] — it bounds the damage to the one
+                # query that hit it: the transient no longer latches, and the
+                # next query on this handle works.
                 try:
                     self._conn.execute("SELECT 1 FROM messages_fts LIMIT 1")
                     self._fts_enabled = True
