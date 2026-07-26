@@ -102,8 +102,39 @@ class TestSignalAdapterInit:
         assert adapter._account_normalized == "+15551234567"
 
 
+class TestSignalReceivePolling:
+    @pytest.mark.asyncio
+    async def test_receive_loop_polls_and_dispatches_envelope(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, account="+15551234567")
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+15550000000",
+                "dataMessage": {"message": "hello", "timestamp": 1},
+            }
+        }
+        response = MagicMock(status_code=200)
+        response.json.return_value = [envelope]
+        calls = []
+
+        async def get(url, **kwargs):
+            calls.append((url, kwargs))
+            adapter._running = False
+            return response
+
+        adapter.client = MagicMock(get=AsyncMock(side_effect=get))
+        adapter._handle_envelope = AsyncMock()
+        adapter._running = True
+        await adapter._receive_loop()
+
+        assert calls[0][0] == "http://localhost:8080/v1/receive/%2B15551234567"
+        adapter._handle_envelope.assert_awaited_once_with(envelope)
+
+    def test_poll_interval_is_clamped_to_one_second(self, monkeypatch):
+        assert _make_signal_adapter(monkeypatch, poll_interval=0.1).poll_interval == 1.0
+        assert _make_signal_adapter(monkeypatch, poll_interval=2.5).poll_interval == 2.5
+
+
 class TestSignalConnectCleanup:
-    """Regression coverage for failed connect() cleanup."""
 
     @pytest.mark.asyncio
     async def test_releases_lock_and_closes_client_on_healthcheck_failure(self, monkeypatch):
