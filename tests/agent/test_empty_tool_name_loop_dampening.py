@@ -312,3 +312,41 @@ def test_mixed_batch_invalid_call_with_broken_json_does_not_retry_turn(agent_env
     # retry would add a third identical request.
     chat_calls = [r for r in handler.captured_requests if "messages" in r]
     assert len(chat_calls) == 2
+
+
+def test_mixed_batch_strict_mode_voids_batch_when_permissive_disabled(agent_env):
+    """#68339: when agent.tool_use_enforcement_permissive_batches=False, mixed
+    batches must restore the pre-#348e9912f behavior of voiding the whole
+    batch (every valid sibling gets a "Skipped" negative-reinforcement
+    message), instead of executing the valid calls alongside the error
+    results for the invalid ones. This gives enforcement-gated models
+    (deepseek/qwen) the same brake on over-emitting tool calls that they
+    had before permissive batching was introduced.
+    """
+    agent, handler = agent_env
+    agent.valid_tool_names = agent.valid_tool_names | {"todo"}
+    # Per-config opt-out: pretend the operator set the strict toggle.
+    agent.tool_use_enforcement_permissive_batches = False
+    try:
+        handler.response_queue.append(_batch_tc_resp([("todo", "{}"), ("", "{}")]))
+        handler.response_queue.append(_text_resp("done"))
+
+        result = agent.run_conversation(
+            "track work", conversation_history=[], task_id="t"
+        )
+
+        joined = " ".join(_tool_results(handler))
+        # In strict mode, the WHOLE batch is voided: even the valid "todo"
+        # call gets the pre-#348e9912f "Skipped" negative-reinforcement
+        # message, NOT a real todo result.
+        assert "Skipped: another tool call" in joined
+        # And the blank-name call still gets its own terse anti-priming
+        # error (that contract is independent of the batch-level toggle).
+        assert "tool name was empty" in joined
+        # The model re-prompts and the queued "done" response is returned,
+        # so the turn still completes.
+        assert result.get("completed", False)
+    finally:
+        # Reset so other tests in the file get the default permissive
+        # behavior (matches the unpatched main).
+        agent.tool_use_enforcement_permissive_batches = True
