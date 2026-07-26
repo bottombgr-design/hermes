@@ -384,14 +384,12 @@ class TestSlackFullManifest:
             assert event in bot_events
 
     def test_reaction_scope_and_event_included(self):
-        """reaction_added/removed events + reactions:read scope must be in the
-        manifest so the adapter can forward reactions into the message
-        pipeline and gateway hooks."""
+        """The manifest must support both inbound events and outbound markers."""
         manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
 
         bot_scopes = manifest["oauth_config"]["scopes"]["bot"]
         bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
-        assert "reactions:read" in bot_scopes
+        assert {"reactions:read", "reactions:write"} <= set(bot_scopes)
         assert "reaction_added" in bot_events
         assert "reaction_removed" in bot_events
 
@@ -401,5 +399,5 @@ class TestSlackFullManifest:
         )
         bot_scopes = manifest["oauth_config"]["scopes"]["bot"]
         bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
-        assert "reactions:read" in bot_scopes
+        assert {"reactions:read", "reactions:write"} <= set(bot_scopes)
         assert "reaction_added" in bot_events
