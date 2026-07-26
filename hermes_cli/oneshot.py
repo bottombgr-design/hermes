@@ -218,7 +218,11 @@ def run_oneshot(
         sys.stderr.write(toolsets_error)
         return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
-    effective_ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+    effective_ignore_rules = (
+        ignore_rules
+        or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        or os.environ.get("HERMES_SAFE_MODE") == "1"
+    )
 
     # Auto-approve any shell / tool approvals.  Non-interactive by
     # definition — a prompt would hang forever.
@@ -403,7 +407,9 @@ def _run_agent(
 
     session_db = _create_session_db_for_oneshot()
     effective_ignore_rules = (
-        ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        ignore_rules
+        or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        or os.environ.get("HERMES_SAFE_MODE") == "1"
     )
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
