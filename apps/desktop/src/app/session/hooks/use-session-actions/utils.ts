@@ -664,6 +664,7 @@ type SessionRuntimeStatePatch = Partial<
     | 'serviceTier'
     | 'yolo'
     | 'turnOrigin'
+    | 'turnGeneration'
   >
 >
 
@@ -739,6 +740,10 @@ export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionR
       info.turn_origin === 'user' || info.turn_origin === 'notification' || info.turn_origin === 'goal'
         ? info.turn_origin
         : null
+  }
+
+  if (typeof info.turn_generation === 'number' && Number.isSafeInteger(info.turn_generation) && info.turn_generation >= 0) {
+    sessionState.turnGeneration = info.turn_generation
   }
 
   return sessionState
