@@ -7177,7 +7177,7 @@ def _claim_or_reuse_live(
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key)
+        live = _find_live_session_by_key(session_key, record.get("profile_home"))
         if live is not None:
             if lease is not None:
                 lease.release()
@@ -7291,7 +7291,10 @@ def _(rid, params: dict) -> dict:
 
     # Fast path: if the session is already live, reuse it under the lock.
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(
+            target,
+            str(profile_home) if profile_home is not None else None,
+        )
         if live is not None:
             return _ok(rid, _reuse_live_payload(*live))
 
@@ -7520,7 +7523,10 @@ def _(rid, params: dict) -> dict:
     # live session while we were building. Re-check under the lock; if it won,
     # discard our just-built agent and reuse theirs (no worker/poller wired yet).
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(
+            target,
+            str(profile_home) if profile_home is not None else None,
+        )
         if live is not None:
             try:
                 if hasattr(agent, "close"):
@@ -7701,10 +7707,15 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+def _find_live_session_by_key(
+    session_key: str, profile_home: str | None = None
+) -> tuple[str, dict] | None:
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
             continue
+        if profile_home is not None:
+            if str(session.get("profile_home") or "") != str(profile_home):
+                continue
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session
     return None
