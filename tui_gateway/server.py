@@ -10252,14 +10252,26 @@ def _(rid, params: dict) -> dict:
         return err
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
+        # Host pipe/respawn failure means no turn.end will clear `running`.
+        # Mirror the in-process dead-thread recovery below so Stop cannot
+        # permanently brick the session into forever-queued prompt.submit.
+        host_unreachable = False
         if session.get("running"):
             try:
                 _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
             except Exception as exc:
-                return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
+                host_unreachable = True
+                print(
+                    f"[tui_gateway] compute-host interrupt failed for {sid}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
         with session["history_lock"]:
             session["_turn_cancel_requested"] = True
             session["queued_prompt"] = None
+            if host_unreachable and session.get("running"):
+                session["running"] = False
+                _clear_inflight_turn(session)
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
