@@ -3,6 +3,8 @@ import { forceRedraw, type MouseTrackingMode } from '@hermes/ink'
 import { DASHBOARD_TUI_MODE, NO_CONFIRM_DESTRUCTIVE } from '../../../config/env.js'
 import { dailyFortune, randomFortune } from '../../../content/fortunes.js'
 import { HOTKEYS } from '../../../content/hotkeys.js'
+import type { CopyBloxFence } from '../../../domain/codeFence.js'
+import { parseCodeFences } from '../../../domain/codeFence.js'
 import { isSectionName, nextDetailsMode, parseDetailsMode, SECTION_NAMES } from '../../../domain/details.js'
 import type {
   ConfigGetValueResponse,
@@ -14,8 +16,7 @@ import type {
   SessionUndoResponse,
   SystemBatteryResponse
 } from '../../../gatewayTypes.js'
-import { writeClipboardText } from '../../../lib/clipboard.js'
-import { writeOsc52Clipboard } from '../../../lib/osc52.js'
+import { copyText } from '../../../lib/copyText.js'
 import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } from '../../../lib/terminalSetup.js'
 import type { Msg, PanelSection } from '../../../types.js'
 import type { StatusBarMode } from '../../interfaces.js'
@@ -403,24 +404,100 @@ export const coreCommands: SlashCommand[] = [
         return sys('nothing to copy — start a conversation first')
       }
 
-      void writeClipboardText(target.text)
-        .then(nativeOk => {
+      const result = await copyText(target.text)
+
+      if (ctx.stale()) {
+        return
+      }
+
+      if (result.success) {
+        sys('copied to clipboard')
+      } else {
+        sys('clipboard copy failed — try HERMES_TUI_FORCE_OSC52=1 to force the escape sequence')
+      }
+    }
+  },
+
+  {
+    aliases: ['cc', 'copyblock'],
+    help: 'copy a specific fenced code block from the latest assistant response (e.g. /copy-code 2)',
+    name: 'copy-code',
+    run: async (arg, ctx) => {
+      const { sys } = ctx.transcript
+      const all = ctx.local.getHistoryItems().filter(m => m.role === 'assistant')
+
+      if (!all.length) {
+        return sys('nothing to copy — start a conversation first')
+      }
+
+      // Strict integer validation: reject things like "/cc 2abc"
+      const trimmed = arg?.trim() ?? ''
+
+      if (trimmed.length > 0 && !/^[1-9]\d*$/.test(trimmed)) {
+        return sys('usage: /cc [block_number] — block_number must be a positive integer')
+      }
+
+      // Search backward for the latest assistant message containing closed fences
+      let fences: CopyBloxFence[] = []
+      let searchStart = all.length - 1
+
+      for (let i = searchStart; i >= 0; i--) {
+        const msg = all[i]!
+        const text = typeof msg.text === 'string' ? msg.text : ''
+        fences = parseCodeFences(text).filter(f => f.closed)
+
+        if (fences.length > 0) {
+          break
+        }
+      }
+
+      if (!fences.length) {
+        return sys('no code blocks found — nothing to copy')
+      }
+
+      // Single block without index → copy immediately
+      // Multiple blocks without index → show numbered list
+      if (!trimmed) {
+        if (fences.length === 1) {
+          const result = await copyText(fences[0]!.rawContent)
+
           if (ctx.stale()) {
             return
           }
 
-          if (nativeOk) {
-            sys('copied to clipboard')
+          if (result.success) {
+            sys(`copied ${fences[0]!.language || 'text'} block (${fences[0]!.rawContent.length} chars)`)
           } else {
-            writeOsc52Clipboard(target.text)
-            sys('sent OSC52 copy sequence (terminal support required)')
+            sys('clipboard copy failed — try HERMES_TUI_FORCE_OSC52=1 to force the escape sequence')
           }
-        })
-        .catch(error => {
-          if (!ctx.stale()) {
-            sys(`copy failed: ${String(error)}`)
-          }
-        })
+        } else {
+          const lines = fences.map((f, i) => `${i + 1}. [${f.language || 'text'}] ${f.rawContent.slice(0, 60)}${f.rawContent.length > 60 ? '…' : ''}`)
+          ctx.transcript.sys(`Code blocks in the last response (${fences.length} found):`)
+          ctx.transcript.sys(lines.join('\n'))
+          ctx.transcript.sys(`Run /cc <1-${fences.length}> to copy a specific block`)
+        }
+
+        return
+      }
+
+      const blockIdx = Number.parseInt(trimmed, 10)
+
+      if (blockIdx > fences.length) {
+        return sys(`only ${fences.length} block(s) found — /cc 1${fences.length > 1 ? `-${fences.length}` : ''}`)
+      }
+
+      const result = await copyText(fences[blockIdx - 1]!.rawContent)
+
+      if (ctx.stale()) {
+        return
+      }
+
+      if (result.success) {
+        const lang = fences[blockIdx - 1]!.language
+        sys(`copied ${lang || 'text'} block #${blockIdx} (${fences[blockIdx - 1]!.rawContent.length} chars)`)
+      } else {
+        sys('clipboard copy failed — try HERMES_TUI_FORCE_OSC52=1 to force the escape sequence')
+      }
     }
   },
 

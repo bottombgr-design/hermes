@@ -2838,3 +2838,110 @@ class CLICommandsMixin:
         else:
             _cprint(f"Unknown voice subcommand: {subcommand}")
             _cprint("Usage: /voice [on|off|tts|status]")
+
+    def _handle_copy_code_command(self, cmd_original: str) -> None:
+        """Handle /copy-code [block_index] — pick or copy a fenced code block.
+
+        One block: copies immediately.
+        Multiple blocks: prints numbered list with language and preview.
+        With index (e.g. /copy-code 2): copies that block directly.
+
+        Searches backward through assistant messages for the most recent
+        response containing fenced code.
+        """
+        from cli import _cprint, _assistant_content_as_text
+        from hermes_cli.code_fences import parse_code_fences
+
+        parts = cmd_original.split(maxsplit=1)
+        raw_arg = parts[1].strip() if len(parts) > 1 else ""
+
+        assistant_messages = [
+            m for m in self.conversation_history if m.get("role") == "assistant"
+        ]
+        if not assistant_messages:
+            _cprint("  Nothing to copy yet — no assistant responses.")
+            return
+
+        # Search backward for the most recent message with code blocks
+        last = assistant_messages[-1].get("content", "")
+        if isinstance(last, list):
+            last = _assistant_content_as_text(last) if last else ""
+        elif last is None:
+            last = ""
+
+        fences = parse_code_fences(last)
+        closed_fences = [f for f in fences if f["closed"]]
+
+        if not closed_fences:
+            # Search earlier assistant messages
+            for msg in reversed(assistant_messages):
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = _assistant_content_as_text(content) if content else ""
+                elif content is None:
+                    content = ""
+                fences = parse_code_fences(content)
+                closed_fences = [f for f in fences if f["closed"]]
+                if closed_fences:
+                    last = content
+                    break
+
+        if not closed_fences:
+            _cprint("  No code blocks found in the last assistant response.")
+            return
+
+        # If a block index was supplied, copy directly.
+        if raw_arg:
+            try:
+                block_index = int(raw_arg) - 1  # 1-based → 0-based
+            except ValueError:
+                _cprint("  Usage: /copy-code [block_number]")
+                return
+            if block_index < 0 or block_index >= len(closed_fences):
+                _cprint(f"  Invalid block number. Use 1-{len(closed_fences)}.")
+                return
+            fence = closed_fences[block_index]
+            self._copy_fence(fence, block_index + 1)
+            return
+
+        # --- No argument: one-block immediate copy, multi-block numbered list ---
+        if len(closed_fences) == 1:
+            self._copy_fence(closed_fences[0], 1)
+            return
+
+        # Multiple blocks: show numbered preview list
+        self._code_block_preview(closed_fences)
+
+    def _copy_fence(self, fence: dict, block_num: int) -> None:
+        """Copy a single fence's raw content to clipboard with confirmation."""
+        from cli import _cprint
+
+        try:
+            self._write_osc52_clipboard(fence["raw_content"])
+            _cprint(
+                f"  Copied code block #{block_num} "
+                f"({fence['language']}) to clipboard"
+            )
+        except Exception as e:
+            _cprint(
+                f"  Failed to copy code block #{block_num} to clipboard: {e}"
+            )
+
+    def _code_block_preview(self, fences: list[dict]) -> None:
+        """Print numbered list of code blocks with language and first-line preview."""
+        from cli import _cprint, _DIM, _RST
+
+        lines: list[str] = []
+        for i, f in enumerate(fences, start=1):
+            raw = f["raw_content"]
+            # First line as preview
+            first_line = raw.split("\n")[0].strip() if raw else ""
+            if len(first_line) > 50:
+                first_line = first_line[:47] + "..."
+            lines.append(f"  {i}  {f['language']:12s} {first_line}")
+
+        _cprint("  Code blocks in the last response:")
+        for line in lines:
+            _cprint(line)
+        _cprint(f"\n  {_DIM}Run /cc <1-{len(fences)}> to copy a block{_RST}")
+
