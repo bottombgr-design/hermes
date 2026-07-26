@@ -311,6 +311,20 @@ export function ChatBar({
     triggerLoading
   } = useComposerTrigger({ at, draftRef, editorRef, requestMainFocus, setComposerText, slash })
 
+  // Sending is a lifecycle boundary for live completions. Exact backend matches
+  // disappear from the result list, so Enter can submit while the trigger still
+  // owns a cached query. Reset before every send surface (keyboard and form) so
+  // the next `/` starts a fresh catalog request.
+  const submitCurrentDraft = () => {
+    closeTrigger()
+    submitDraft()
+  }
+
+  const queueDraftAndResetTrigger = () => {
+    closeTrigger()
+    queueDraft()
+  }
+
   // Pull the live contentEditable text into draftRef + the AUI composer state
   // (which drives `hasComposerPayload` → the send button). Shared by the input
   // and compositionend paths so committed IME text reaches state through either.
@@ -671,7 +685,7 @@ export function ChatBar({
           setComposerText(editorText)
         }
 
-        queueDraft()
+        queueDraftAndResetTrigger()
       }
 
       return
@@ -708,7 +722,7 @@ export function ChatBar({
         return
       }
 
-      submitDraft()
+      submitCurrentDraft()
 
       return
     }
@@ -955,7 +969,7 @@ export function ChatBar({
               return
             }
 
-            submitDraft()
+            submitCurrentDraft()
           }}
           ref={composerRef}
           style={
