@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from gateway.config import Platform, PlatformConfig, HomeChannel
+from gateway.config import GatewayConfig, Platform, PlatformConfig, HomeChannel
 from plugins.teams_pipeline.models import TeamsMeetingRef, TeamsMeetingSummaryPayload
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
@@ -324,6 +324,20 @@ class TestTeamsAdapterInit:
     def test_platform_value(self):
         adapter = TeamsAdapter(_make_config(client_id="id", client_secret="secret", tenant_id="tenant"))
         assert adapter.platform.value == "teams"
+
+    def test_reads_reply_context_setting_from_yaml_config(self):
+        config = GatewayConfig.from_dict({
+            "platforms": {
+                "teams": {
+                    "enabled": True,
+                    "extra": {"fetch_reply_context": True},
+                },
+            },
+        })
+
+        adapter = TeamsAdapter(config.platforms[Platform("teams")])
+
+        assert adapter._fetch_reply_context is True
 
 
 # ---------------------------------------------------------------------------
@@ -707,20 +721,18 @@ class TestTeamsMessageHandling:
         assert event.source.message_id == "reply-message-1"
 
     @pytest.mark.anyio
-    async def test_channel_message_uses_recent_cron_context_when_reply_id_missing(self, monkeypatch):
+    async def test_channel_message_without_reply_id_does_not_use_cron_context(self, monkeypatch):
         adapter = TeamsAdapter(_make_config(
             client_id="bot-id", client_secret="secret", tenant_id="tenant",
         ))
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
         adapter.handle_message = AsyncMock()
+        cron_context = MagicMock()
         monkeypatch.setattr(
             TeamsAdapter,
             "_cron_reply_context",
-            staticmethod(lambda _conversation_id, _thread_id: {
-                "thread_id": "cron-message-id",
-                "content": "Cron message body",
-            }),
+            staticmethod(cron_context),
         )
 
         activity = self._make_activity(
@@ -730,9 +742,10 @@ class TestTeamsMessageHandling:
         await adapter._on_message(self._make_ctx(activity))
 
         event = adapter.handle_message.call_args[0][0]
-        assert event.source.thread_id == "cron-message-id"
-        assert event.reply_to_message_id == "cron-message-id"
-        assert event.reply_to_text == "Cron message body"
+        assert event.source.thread_id is None
+        assert event.reply_to_message_id is None
+        assert event.reply_to_text is None
+        cron_context.assert_not_called()
 
     @pytest.mark.anyio
     async def test_channel_message_uses_messageid_conversation_as_thread_id(self, monkeypatch):
