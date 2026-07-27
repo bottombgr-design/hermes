@@ -4670,6 +4670,75 @@ def test_protocol_violation_respects_max_retries_precedence(kanban_home):
         conn.close()
 
 
+def test_explicit_max_retries_counts_mixed_failure_kinds(kanban_home):
+    """Issue #72174 — an explicit per-task ``max_retries`` must bound the
+    TOTAL number of failures, not just a same-kind streak.
+
+    Without an override, protocol violations are deliberately tracked on
+    their own dedicated streak (see ``_protocol_violation_streak``) so an
+    earlier crash/timeout doesn't consume the bounded violation retry
+    budget — that's the intentional, independent-budgets behavior from
+    PR #64353 and it must survive untouched (see
+    ``test_protocol_violation_budget_not_consumed_by_other_failures``).
+
+    But once a task sets an EXPLICIT ``max_retries``, that cap is a
+    contract on the task's TOTAL retry budget regardless of failure kind.
+    Reported repro: an ordinary nonzero-exit crash, then two protocol
+    violations, with ``max_retries=3`` — the third run must block even
+    though only two of the three failures were violations and neither
+    violation alone reached the default violation-only bound. Pre-fix,
+    an explicit override on the violation path was resolved only against
+    ``_protocol_violation_streak`` (which the crash reset to 0), so the
+    two violations looked like "first" and "second" occurrences under the
+    default budget of 3 and neither tripped the breaker.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="mixed-explicit-cap", assignee="worker", max_retries=3,
+        )
+
+        # Run 1: ordinary nonzero-exit crash. 1 of 3 — retries.
+        _drive_nonzero_crash(conn, tid, 994000)
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Run 2: protocol violation. 2 of 3 — still retries (this would also
+        # be within the violation-only streak's own budget, so it doesn't
+        # distinguish the bug on its own).
+        _drive_protocol_violation(conn, tid, 994001)
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Run 3: second protocol violation. Under the explicit cap this is
+        # the task's 3rd total failure and must block — even though it's
+        # only the violation streak's 2nd consecutive violation (crash reset
+        # the streak), which is below the default violation bound of 3.
+        _drive_protocol_violation(conn, tid, 994002)
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            "explicit max_retries=3 must block on the 3rd total failure "
+            f"even when failure kinds are mixed, got {task.status}"
+        )
+        assert task.consecutive_failures == 3, (
+            "explicit override must count every failure kind into the "
+            f"unified counter, got consecutive_failures={task.consecutive_failures}"
+        )
+
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1, f"expected exactly one gave_up event, got {gave_up}"
+        payload = gave_up[0].payload or {}
+        assert payload.get("limit_source") == "task", (
+            f"gave_up payload should attribute the trip to the task override, got {payload}"
+        )
+        assert payload.get("effective_limit") == 3
+
+        # A blocked task must not be claimable again.
+        assert kb.claim_task(conn, tid) is None, (
+            "a blocked task must refuse a further claim"
+        )
+    finally:
+        conn.close()
+
+
 def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
     """A worker that exited non-zero (real error / crash) uses the
     normal counter path — one failure doesn't trip the breaker.
