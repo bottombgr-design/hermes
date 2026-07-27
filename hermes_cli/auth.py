@@ -171,6 +171,13 @@ class ProviderConfig:
     api_key_env_vars: tuple = ()
     # Optional env var for base URL override
     base_url_env_var: str = ""
+    # For external-process providers: command/args and optional legacy env overrides.
+    process_command_env_vars: tuple = ()
+    process_default_command: str = ""
+    process_args_env_var: str = ""
+    process_default_args: tuple = ()
+    process_model_arg: str = ""
+    process_install_hint: str = ""
 
 
 PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
@@ -231,6 +238,35 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+        process_command_env_vars=(
+            "HERMES_COPILOT_ACP_COMMAND",
+            "COPILOT_CLI_PATH",
+        ),
+        process_default_command="copilot",
+        process_args_env_var="HERMES_COPILOT_ACP_ARGS",
+        process_default_args=("--acp", "--stdio"),
+        process_install_hint=(
+            "Install GitHub Copilot CLI or set "
+            "HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+        ),
+    ),
+    "qoder-acp": ProviderConfig(
+        id="qoder-acp",
+        name="Qoder CLI ACP",
+        auth_type="external_process",
+        inference_base_url="acp://qoder",
+        base_url_env_var="QODER_ACP_BASE_URL",
+        process_command_env_vars=("HERMES_QODER_ACP_COMMAND", "QODER_CLI_PATH"),
+        process_default_command="qodercli",
+        process_args_env_var="HERMES_QODER_ACP_ARGS",
+        # ACP is non-interactive, so use Qoder's fail-closed autonomous mode:
+        # safe workspace reads/edits may proceed without a prompt while risky
+        # actions are denied or classified instead of waiting forever.
+        process_default_args=("--acp", "--permission-mode", "auto"),
+        process_model_arg="--model",
+        process_install_hint=(
+            "Install Qoder CLI or set HERMES_QODER_ACP_COMMAND/QODER_CLI_PATH."
+        ),
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -6715,34 +6751,57 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _resolve_external_process_settings(
+    pconfig: ProviderConfig,
+) -> tuple[str, list[str], str]:
+    """Resolve command, arguments, and base URL for a process provider."""
+    command = ""
+    for env_var in pconfig.process_command_env_vars:
+        command = os.getenv(env_var, "").strip()
+        if command:
+            break
+    if not command:
+        command = pconfig.process_default_command
+
+    raw_args = (
+        os.getenv(pconfig.process_args_env_var, "").strip()
+        if pconfig.process_args_env_var
+        else ""
+    )
+    args = shlex.split(raw_args) if raw_args else list(pconfig.process_default_args)
+    base_url = (
+        os.getenv(pconfig.base_url_env_var, "").strip()
+        if pconfig.base_url_env_var
+        else ""
+    )
+    if not base_url:
+        base_url = pconfig.inference_base_url
+    return command, args, base_url
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
+    command, args, base_url = _resolve_external_process_settings(pconfig)
 
     resolved_command = shutil.which(command) if command else None
-    return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+    unsupported_transport = base_url.lower().startswith("acp+tcp://")
+    status = {
+        "configured": bool(resolved_command) and not unsupported_transport,
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "logged_in": bool(resolved_command) and not unsupported_transport,
     }
+    if unsupported_transport:
+        status["error"] = "unsupported_transport"
+    return status
 
 
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
@@ -6762,7 +6821,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "qoder-acp"}:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -6931,7 +6990,11 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     }
 
 
-def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
+def resolve_external_process_provider_credentials(
+    provider_id: str,
+    *,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
     """Resolve runtime details for local subprocess-backed providers."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
@@ -6941,29 +7004,38 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             code="invalid_provider",
         )
 
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
+    command, args, base_url = _resolve_external_process_settings(pconfig)
+    if base_url.lower().startswith("acp+tcp://"):
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            "ACP TCP transport is not supported. Configure a local ACP command "
+            "and an acp:// marker URL instead.",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="unsupported_transport",
+        )
+    requested_model = str(target_model or "").strip()
+    if (
+        requested_model
+        and pconfig.process_model_arg
+        and pconfig.process_model_arg not in args
+        and "-m" not in args
+    ):
+        args.extend([pconfig.process_model_arg, requested_model])
+    resolved_command = shutil.which(command) if command else None
+    if not resolved_command:
+        raise AuthError(
+            f"Could not find the {pconfig.name} command '{command}'. "
+            f"{pconfig.process_install_hint}".strip(),
+            provider=provider_id,
+            code=(
+                "missing_copilot_cli"
+                if provider_id == "copilot-acp"
+                else "missing_external_process"
+            ),
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": provider_id,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

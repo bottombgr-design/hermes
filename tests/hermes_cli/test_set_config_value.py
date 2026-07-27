@@ -590,6 +590,8 @@ class TestValidateConfigKey:
         "platforms.discord.enabled",
         "gateway.platforms.my_platform.extra.token",
         "approvals.mode",
+        "delegation.route_default",
+        "delegation.routes.qoder.provider",
     ])
     def test_known_keys_pass(self, key):
         from hermes_cli.config import _validate_config_key
@@ -600,6 +602,8 @@ class TestValidateConfigKey:
         ("gateway.discord.gateway_restart_notification", None),  # no close suggestion
         ("disco", "discord"),
         ("agent.max_turn", "agent.max_turns"),
+        ("delegation.routes.qoder.args", None),
+        ("delegation.routes.custom-route.reasoning_effort", None),
     ])
     def test_unknown_keys_with_suggestion(self, key, expected_in_suggestion):
         from hermes_cli.config import _validate_config_key
@@ -608,6 +612,33 @@ class TestValidateConfigKey:
         if expected_in_suggestion is not None:
             assert suggestion is not None and expected_in_suggestion in suggestion, \
                 f"Expected suggestion to contain {expected_in_suggestion!r}, got {suggestion!r}"
+
+    @pytest.mark.parametrize("key,value", [
+        ("delegation.route_default", "custom-route"),
+        ("delegation.routes.custom-route.provider", "openrouter"),
+        ("delegation.routes.auto.provider", "openrouter"),
+    ])
+    def test_unsupported_delegation_routes_are_rejected(
+        self, key, value, _isolated_hermes_home, capsys
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            set_config_value(key, value)
+
+        assert exc_info.value.code == 1
+        assert "Unsupported delegation route" in capsys.readouterr().err
+        assert _read_config(_isolated_hermes_home) == ""
+
+    def test_supported_delegation_route_is_saved(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value("delegation.route_default", "QODER")
+        set_config_value("delegation.routes.qoder.provider", "qoder-acp")
+
+        content = _read_config(_isolated_hermes_home)
+        assert "route_default: qoder" in content
+        assert "qoder:" in content
+        assert "provider: qoder-acp" in content
+        assert "Unsupported delegation route" not in capsys.readouterr().err
 
     @pytest.mark.parametrize("key", [
         "_test.shim_marker",

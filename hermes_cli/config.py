@@ -2409,6 +2409,12 @@ DEFAULT_CONFIG = {
                            # "codex_responses", or "anthropic_messages". Empty = auto-detect
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the heuristic can't detect.
+        "route_default": "auto",  # one of: auto, kimi, luna, qoder
+        # Executor definitions keyed by a supported concrete route name
+        # (kimi, luna, or qoder). Each value may pin provider/model/endpoint/
+        # reasoning settings. ``auto`` is a classifier, not a configurable
+        # executor entry.
+        "routes": {},
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
@@ -2459,6 +2465,18 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Optional per-child native Docker isolation for Hermes-routed workers.
+        # When enabled, only a narrow standard Git checkout is bind-mounted at
+        # /workspace; Qoder ACP keeps its own isolation/permission policy.
+        # auto_approve is fail-closed and becomes active only after runtime
+        # attestation confirms the dedicated container and restricted mounts.
+        "sandbox": {
+            "enabled": False,
+            "backend": "docker",
+            "image": "nikolaik/python-nodejs:python3.11-nodejs20",
+            "network": True,
+            "auto_approve": False,
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -8890,6 +8908,17 @@ _DYNAMIC_TOP_LEVEL_KEYS = frozenset({
 # accepted because ``PlatformConfig`` carries an open ``extra`` mapping.
 _PLATFORM_CONTAINER_KEYS = frozenset({"platforms"})
 
+_DELEGATION_ROUTE_FIELDS = frozenset({
+    "model",
+    "provider",
+    "base_url",
+    "api_key",
+    "api_mode",
+    "reasoning_effort",
+})
+_DELEGATION_ROUTE_NAMES = frozenset({"auto", "kimi", "luna", "qoder"})
+_DELEGATION_CONFIG_ROUTE_NAMES = _DELEGATION_ROUTE_NAMES - {"auto"}
+
 
 def _known_top_level_keys() -> set[str]:
     """Return the union of known top-level config keys for validation.
@@ -8975,6 +9004,30 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
 
         return False, None
 
+    # Delegation routes are a closed executor set shared with delegate_task's
+    # JSON schema and runtime. ``auto`` is only a classifier and therefore is
+    # valid for route_default but not as a configured route entry.
+    if segments[:2] == ["delegation", "routes"]:
+        if len(segments) <= 2:
+            return True, None
+        if segments[2] not in _DELEGATION_CONFIG_ROUTE_NAMES:
+            suggestion = _suggest_closest_key(
+                segments[2], set(_DELEGATION_CONFIG_ROUTE_NAMES)
+            )
+            if suggestion is not None:
+                return False, ".".join(segments[:2] + [suggestion])
+            return False, None
+        if len(segments) == 3:
+            return True, None
+        if len(segments) == 4 and segments[3] in _DELEGATION_ROUTE_FIELDS:
+            return True, None
+        suggestion = _suggest_closest_key(
+            segments[3], set(_DELEGATION_ROUTE_FIELDS)
+        )
+        if suggestion is not None:
+            return False, ".".join(segments[:3] + [suggestion])
+        return False, None
+
     # ── Deeper validation ────────────────────────────────────────────
     # Walk DEFAULT_CONFIG along the user's segments. Stop at:
     #   - An open-dict container (user-defined inner keys are OK below it)
@@ -9045,6 +9098,32 @@ def set_config_value(key: str, value: str, force: bool = False):
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # Route names are a closed contract shared by config, the model-facing
+    # delegate_task schema, and tools.delegate_tool. Reject unusable names
+    # before touching config.yaml rather than merely warning after the write.
+    if key == "delegation.route_default":
+        normalized_route = value.strip().lower()
+        if normalized_route not in _DELEGATION_ROUTE_NAMES:
+            allowed = ", ".join(sorted(_DELEGATION_ROUTE_NAMES))
+            print(
+                f"Unsupported delegation route {value!r}. Allowed routes: {allowed}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        value = normalized_route
+    else:
+        route_segments = key.split(".")
+        if route_segments[:2] == ["delegation", "routes"] and len(route_segments) >= 3:
+            route_name = route_segments[2]
+            if route_name not in _DELEGATION_CONFIG_ROUTE_NAMES:
+                allowed = ", ".join(sorted(_DELEGATION_CONFIG_ROUTE_NAMES))
+                print(
+                    f"Unsupported delegation route {route_name!r}. "
+                    f"Configurable routes: {allowed}.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
     # Check if it's an API key (goes to .env)
     if _is_env_config_key(key):
         # Unified lifecycle: also rotates any config.yaml mirror of the old

@@ -1,9 +1,9 @@
-"""OpenAI-compatible shim that forwards Hermes requests to `copilot --acp`.
+"""OpenAI-compatible shim that forwards Hermes requests to an ACP CLI.
 
-This adapter lets Hermes treat the GitHub Copilot ACP server as a chat-style
-backend. Each request starts a short-lived ACP session, sends the formatted
-conversation as a single prompt, collects text chunks, and converts the result
-back into the minimal shape Hermes expects from an OpenAI client.
+This adapter lets Hermes treat ACP servers such as GitHub Copilot and Qoder CLI
+as chat-style backends. Each request starts a short-lived ACP session, sends the
+formatted conversation as a single prompt, collects text chunks, and converts
+the result back into the minimal shape Hermes expects from an OpenAI client.
 """
 
 from __future__ import annotations
@@ -13,7 +13,9 @@ import os
 import queue
 import re
 import shlex
+import stat
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -31,6 +33,7 @@ from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
+ACP_PROCESS_PROVIDERS = frozenset({"copilot-acp", "qoder-acp"})
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
@@ -74,6 +77,15 @@ def _resolve_args() -> list[str]:
     return shlex.split(raw)
 
 
+def is_acp_process_runtime(provider: str | None, base_url: str | None) -> bool:
+    """Return whether a runtime should use the local ACP client facade."""
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_base = str(base_url or "").strip().lower()
+    if normalized_base.startswith("acp+tcp://"):
+        return False
+    return normalized_provider in ACP_PROCESS_PROVIDERS or normalized_base.startswith("acp://")
+
+
 def _resolve_home_dir() -> str:
     """Return a stable HOME for child ACP processes."""
     home = os.environ.get("HOME", "").strip()
@@ -100,10 +112,9 @@ def _resolve_home_dir() -> str:
 
 
 def _build_subprocess_env() -> dict[str, str]:
-    # Copilot ACP is a model-driving CLI executor: it legitimately needs LLM
-    # provider credentials. Route through the central helper so Tier-1 secrets
-    # (gateway bot tokens, GitHub auth, infra) are still stripped (#29157).
-    env = hermes_subprocess_env(inherit_credentials=True)
+    # ACP CLIs authenticate from their own profile under HOME. They must not
+    # inherit unrelated provider credentials from the parent Hermes process.
+    env = hermes_subprocess_env(inherit_credentials=False)
     home = _resolve_home_dir()
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
@@ -380,6 +391,161 @@ def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
     return resolved
 
 
+def _require_secure_posix_fs() -> None:
+    required_flags = ("O_NOFOLLOW", "O_DIRECTORY")
+    if (
+        os.name != "posix"
+        or any(not hasattr(os, name) for name in required_flags)
+        or os.open not in os.supports_dir_fd
+    ):
+        raise PermissionError("Secure ACP filesystem operations are unavailable on this platform.")
+
+
+def _open_directory_chain(directory: Path) -> int:
+    """Open an absolute directory without following any symlink component."""
+    _require_secure_posix_fs()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    current_fd = os.open(directory.anchor, flags)
+    try:
+        for component in directory.parts[1:]:
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _open_parent_directory(path: Path, cwd: str) -> tuple[int, str]:
+    root = Path(cwd).resolve()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise PermissionError(f"Path '{path}' is outside the session cwd '{root}'.") from exc
+    if not relative.parts:
+        raise PermissionError("ACP filesystem operations require a file path, not the session cwd.")
+
+    current_fd = _open_directory_chain(root)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        for component in relative.parts[:-1]:
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd, relative.parts[-1]
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _read_text_file_secure_posix(path: Path, cwd: str) -> str:
+    """Read a regular, single-link file through a symlink-safe descriptor chain."""
+    parent_fd, name = _open_parent_directory(path, cwd)
+    fd = -1
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(name, flags, dir_fd=parent_fd)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise PermissionError("ACP filesystem reads require a regular, single-link file.")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            return handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
+
+
+def _win32_file_api() -> tuple[Any, Any, Any]:
+    try:
+        import pywintypes  # ty: ignore[unresolved-import]
+        import win32con  # ty: ignore[unresolved-import]
+        import win32file  # ty: ignore[unresolved-import]
+    except ImportError as exc:  # pragma: no cover - dependency is Windows-only
+        raise PermissionError("Secure ACP filesystem reads require pywin32 on Windows.") from exc
+    return pywintypes, win32con, win32file
+
+
+def _normalize_windows_handle_path(path_text: str) -> str:
+    if path_text.startswith("\\\\?\\UNC\\"):
+        path_text = "\\\\" + path_text[8:]
+    elif path_text.startswith("\\\\?\\"):
+        path_text = path_text[4:]
+    return os.path.normcase(os.path.normpath(path_text))
+
+
+def _read_text_file_secure_windows(path: Path, cwd: str) -> str:
+    """Read only the exact non-reparse Windows file validated by its open handle."""
+    root = Path(cwd).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise PermissionError(f"Path '{path}' is outside the session cwd '{root}'.") from exc
+
+    pywintypes, win32con, win32file = _win32_file_api()
+    open_reparse_point = 0x00200000
+    share = (
+        win32con.FILE_SHARE_READ
+        | win32con.FILE_SHARE_WRITE
+        | win32con.FILE_SHARE_DELETE
+    )
+    try:
+        handle = win32file.CreateFile(
+            str(path),
+            win32con.GENERIC_READ,
+            share,
+            None,
+            win32con.OPEN_EXISTING,
+            win32con.FILE_ATTRIBUTE_NORMAL | open_reparse_point,
+            None,
+        )
+    except pywintypes.error as exc:
+        if getattr(exc, "winerror", None) in (2, 3):
+            raise FileNotFoundError(str(path)) from exc
+        raise
+
+    try:
+        actual = _normalize_windows_handle_path(
+            win32file.GetFinalPathNameByHandle(handle, 0)
+        )
+        expected = _normalize_windows_handle_path(os.path.abspath(str(path)))
+        if actual != expected:
+            raise PermissionError("ACP filesystem read handle escaped its validated path.")
+
+        file_info = win32file.GetFileInformationByHandle(handle)
+        attributes = file_info[0]
+        number_of_links = file_info[7]
+        if (
+            attributes & win32con.FILE_ATTRIBUTE_DIRECTORY
+            or attributes & 0x400
+            or number_of_links != 1
+        ):
+            raise PermissionError("ACP filesystem reads require a regular, single-link file.")
+
+        chunks: list[bytes] = []
+        while True:
+            try:
+                _, chunk = win32file.ReadFile(handle, 64 * 1024)
+            except pywintypes.error as exc:
+                if getattr(exc, "winerror", None) == 38:
+                    break
+                raise
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+    finally:
+        win32file.CloseHandle(handle)
+
+
+def _read_text_file_secure(path: Path, cwd: str) -> str:
+    if sys.platform == "win32":
+        return _read_text_file_secure_windows(path, cwd)
+    return _read_text_file_secure_posix(path, cwd)
+
+
 class _ACPChatCompletions:
     def __init__(self, client: "CopilotACPClient"):
         self._client = client
@@ -394,7 +560,7 @@ class _ACPChatNamespace:
 
 
 class CopilotACPClient:
-    """Minimal OpenAI-client-compatible facade for Copilot ACP."""
+    """Minimal OpenAI-client-compatible facade for a local ACP process."""
 
     def __init__(
         self,
@@ -411,6 +577,11 @@ class CopilotACPClient:
     ):
         self.api_key = api_key or "copilot-acp"
         self.base_url = base_url or ACP_MARKER_BASE_URL
+        self._backend_name = (
+            "Qoder ACP"
+            if self.api_key == "qoder-acp" or self.base_url.startswith("acp://qoder")
+            else "Copilot ACP"
+        )
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
@@ -495,7 +666,7 @@ class CopilotACPClient:
         completion = SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or "copilot-acp",
+            model=model or self.api_key,
         )
         if stream:
             return _completion_to_stream_chunks(completion)
@@ -520,13 +691,15 @@ class CopilotACPClient:
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
-                f"Could not start Copilot ACP command '{self._acp_command}'. "
-                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+                f"Could not start {self._backend_name} command "
+                f"'{self._acp_command}'. Check the configured ACP command."
             ) from exc
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
-            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
+            raise RuntimeError(
+                f"{self._backend_name} process did not expose stdin/stdout pipes."
+            )
 
         self.is_closed = False
         with self._active_process_lock:
@@ -567,8 +740,13 @@ class CopilotACPClient:
                 "method": method,
                 "params": params,
             }
-            proc.stdin.write(json.dumps(payload) + "\n")
-            proc.stdin.flush()
+            stdin = proc.stdin
+            if stdin is None:
+                raise RuntimeError(
+                    f"{self._backend_name} process has no stdin pipe"
+                )
+            stdin.write(json.dumps(payload) + "\n")
+            stdin.flush()
 
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
@@ -593,7 +771,8 @@ class CopilotACPClient:
                 if "error" in msg:
                     err = msg.get("error") or {}
                     raise RuntimeError(
-                        f"Copilot ACP {method} failed: {err.get('message') or err}"
+                        f"{self._backend_name} {method} failed: "
+                        f"{err.get('message') or err}"
                     )
                 return msg.get("result")
 
@@ -614,8 +793,12 @@ class CopilotACPClient:
                         "directly with a Copilot subscription token) via `hermes setup`.\n\n"
                         f"Original error:\n{stderr_text}"
                     )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
+                raise RuntimeError(
+                    f"{self._backend_name} process exited early: {stderr_text}"
+                )
+            raise TimeoutError(
+                f"Timed out waiting for {self._backend_name} response to {method}."
+            )
 
         try:
             _request(
@@ -644,7 +827,7 @@ class CopilotACPClient:
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
             if not session_id:
-                raise RuntimeError("Copilot ACP did not return a sessionId.")
+                raise RuntimeError(f"{self._backend_name} did not return a sessionId.")
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
@@ -708,7 +891,7 @@ class CopilotACPClient:
                 if block_error:
                     raise PermissionError(block_error)
                 try:
-                    content = path.read_text(encoding="utf-8")
+                    content = _read_text_file_secure(path, cwd)
                 except FileNotFoundError:
                     content = ""
                 line = params.get("line")
