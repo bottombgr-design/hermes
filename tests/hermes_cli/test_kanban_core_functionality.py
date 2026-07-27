@@ -4654,7 +4654,15 @@ def test_protocol_violation_respects_max_retries_precedence(kanban_home):
         assert len(gave_up) == 1
         payload = gave_up[0].payload or {}
         assert payload.get("protocol_violations") == 1
-        assert payload.get("protocol_violation_limit") == 1
+        assert payload.get("effective_limit") == 1, (
+            f"gave_up payload should report the task override as the "
+            f"governing cap, got {payload}"
+        )
+        assert payload.get("limit_source") == "task"
+        assert "protocol_violation_limit" not in payload, (
+            "an explicit override has no separate violation-only limit — "
+            f"effective_limit already reports it, got {payload}"
+        )
 
         lenient = kb.create_task(
             conn, title="lenient", assignee="worker", max_retries=5,
@@ -4706,7 +4714,12 @@ def test_explicit_max_retries_counts_mixed_failure_kinds(kanban_home):
         # be within the violation-only streak's own budget, so it doesn't
         # distinguish the bug on its own).
         _drive_protocol_violation(conn, tid, 994001)
-        assert kb.get_task(conn, tid).status == "ready"
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 2, (
+            "explicit override must count the violation into the unified "
+            f"counter, got consecutive_failures={task.consecutive_failures}"
+        )
 
         # Run 3: second protocol violation. Under the explicit cap this is
         # the task's 3rd total failure and must block — even though it's
@@ -4730,6 +4743,14 @@ def test_explicit_max_retries_counts_mixed_failure_kinds(kanban_home):
             f"gave_up payload should attribute the trip to the task override, got {payload}"
         )
         assert payload.get("effective_limit") == 3
+        assert payload.get("protocol_violation") is True, (
+            f"gave_up payload should flag the triggering run as a violation, got {payload}"
+        )
+        assert "protocol_violation_limit" not in payload, (
+            "the override branch has no violation-only limit — "
+            "effective_limit/limit_source already report the governing "
+            f"total-failure cap, got {payload}"
+        )
 
         # A blocked task must not be claimable again.
         assert kb.claim_task(conn, tid) is None, (
