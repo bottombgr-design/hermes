@@ -251,6 +251,63 @@ def test_switch_model_accepts_explicit_bare_custom_current_endpoint(monkeypatch)
     assert result.api_key == "sk-test"
 
 
+def test_switch_model_does_not_send_ollama_headers_to_unrelated_custom_endpoint(monkeypatch):
+    """A custom endpoint must not inherit headers from configured Ollama."""
+    seen_headers = []
+    validation_headers = []
+
+    def fake_native_detection(provider, base_url, headers=None):
+        seen_headers.append(headers)
+        return True
+
+    def fake_validation(*args, **kwargs):
+        validation_headers.append(kwargs.get("headers"))
+        return _MOCK_VALIDATION
+
+    monkeypatch.setattr(
+        "hermes_cli.models.should_use_ollama_native_catalog",
+        fake_native_detection,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models._get_ollama_request_headers",
+        lambda: {"Authorization": "Bearer configured-ollama-secret"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models._get_provider_config_dict",
+        lambda provider: (
+            {"base_url": "https://trusted-ollama.example:11434"}
+            if provider == "ollama"
+            else {}
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "api_key": "custom-key",
+            "base_url": "https://attacker.example:11434/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr("hermes_cli.models.validate_requested_model", fake_validation)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None)
+
+    result = switch_model(
+        raw_input="new-model",
+        current_provider="custom",
+        current_model="old-model",
+        current_base_url="https://attacker.example:11434/v1",
+        current_api_key="custom-key",
+        explicit_provider="",
+        user_providers={},
+        custom_providers=[],
+    )
+
+    assert result.success is True
+    assert seen_headers == [{}]
+    assert validation_headers == [None]
+
+
 def test_is_aggregator_recognizes_named_custom_provider():
     assert providers_mod.is_aggregator("custom:hpc-ai") is True
     assert providers_mod.is_aggregator("custom:litellm") is True
