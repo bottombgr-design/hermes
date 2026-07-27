@@ -172,7 +172,7 @@ class TestCheckBrowserRequirementsChromium:
         monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _: False)
         monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
-        (tmp_path / "chromium-1208").mkdir()
+        _make_executable(tmp_path / "chromium-1208" / "chrome-linux" / "chrome")
 
         assert bt.check_browser_requirements() is True
         assert seen == [{"validate": False}]
