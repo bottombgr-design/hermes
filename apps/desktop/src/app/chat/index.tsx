@@ -7,6 +7,7 @@ import { Suspense, useCallback, useEffect, useMemo, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
+import type { CancelRunOptions } from '@/app/types'
 import { Thread } from '@/components/assistant-ui/thread'
 import { Backdrop } from '@/components/Backdrop'
 import { COMPOSER_HEART_CONFIG, HeartField } from '@/components/chat/vibe-hearts'
@@ -68,7 +69,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   modelMenuContent?: React.ReactNode
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
-  onCancel: () => Promise<void> | void
+  onCancel: (options?: CancelRunOptions) => Promise<void> | void
   onAddContextRef: (refText: string, label?: string, detail?: string) => void
   onAddUrl: (url: string) => void
   onBranchInNewChat?: (messageId: string) => void
@@ -165,7 +166,7 @@ function ChatHeader({
 interface ChatRuntimeBoundaryProps {
   busy: boolean
   children: React.ReactNode
-  onCancel: () => Promise<void> | void
+  onCancel: (options?: CancelRunOptions) => Promise<void> | void
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void

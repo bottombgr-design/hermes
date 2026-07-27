@@ -2268,6 +2268,7 @@ export interface Translations {
       loadingSession: string
       showEarlier: string
       loadingResponse: string
+      processingBackgroundResult: string
       resumeWhenBackgroundDone: (count: number) => string
       thinking: string
       today: (time: string) => string
