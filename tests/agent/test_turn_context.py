@@ -430,6 +430,50 @@ def test_between_turns_refresh_skipped_when_no_servers():
     gtd.assert_not_called()
 
 
+def test_between_turns_refresh_removes_last_mcp_bridge_when_mcp_generation_advanced():
+    """A 1→0 MCP transition must refresh after the live MCP map becomes empty."""
+    from tools.tool_search import bridge_tool_schemas
+
+    agent = _FakeAgent()
+    original_defs = bridge_tool_schemas(
+        1,
+        listing="mcp-demo tools (1):\n- alpha: First capability",
+        listing_form="full",
+    )
+    agent.tools = original_defs
+    agent.valid_tool_names = {
+        tool["function"]["name"] for tool in original_defs
+    }
+    agent._mcp_tool_snapshot_generation = 1
+
+    import model_tools
+
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=False), \
+         patch("tools.mcp_tool.get_mcp_tool_generation", return_value=2), \
+         patch.object(model_tools, "get_tool_definitions", return_value=[]):
+        _build(agent)
+
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+    assert agent._mcp_tool_snapshot_generation == 2
+
+
+def test_between_turns_ignores_unrelated_registry_generation_change():
+    """A non-MCP registry mutation must not rebuild a no-MCP conversation."""
+    agent = _FakeAgent()
+    agent._tool_snapshot_generation = -1
+    agent._mcp_tool_snapshot_generation = 3
+
+    import model_tools
+
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=False), \
+         patch("tools.mcp_tool.get_mcp_tool_generation", return_value=3), \
+         patch.object(model_tools, "get_tool_definitions") as gtd:
+        _build(agent)
+
+    gtd.assert_not_called()
+
+
 def test_between_turns_refresh_skipped_when_skip_flag_set():
     """Internal forks (background_review) set _skip_mcp_refresh to keep tools[]
     byte-identical to the parent for cache parity — the hook must honor it even

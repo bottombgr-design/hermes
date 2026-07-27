@@ -4,8 +4,8 @@
 ``reload.mcp`` RPC, the gateway reload, and the late-binding refresh thread —
 so a slow MCP server that connects after the agent's one-time tool snapshot is
 picked up everywhere identically.  These assert the *contracts* those callers
-rely on (name-based diff, in-place mutation, agent-scoped filtering) rather than
-freezing any particular tool list.
+rely on (schema-aware diff, atomic replacement, agent-scoped filtering) rather
+than freezing any particular tool list.
 """
 
 import threading
@@ -59,6 +59,50 @@ def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch)
 
     assert added == set()
     assert agent.tools is original_tools  # not replaced → no churn / no cache thrash
+
+
+def test_refresh_publishes_changed_tool_search_bridge_schema(monkeypatch):
+    """A live catalog change must publish updated same-name bridge schemas."""
+    from tools.tool_search import bridge_tool_schemas
+
+    original_defs = bridge_tool_schemas(
+        1,
+        listing="mcp-demo tools (1):\n- alpha: First capability",
+        listing_form="full",
+    )
+    updated_defs = bridge_tool_schemas(
+        2,
+        listing=(
+            "mcp-demo tools (2):\n"
+            "- alpha: First capability\n"
+            "- beta: Newly available capability"
+        ),
+        listing_form="full",
+    )
+    agent = _agent([])
+    agent.tools = original_defs
+    agent.valid_tool_names = {
+        tool["function"]["name"] for tool in original_defs
+    }
+
+    import model_tools
+
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: updated_defs,
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.tools == updated_defs
+    assert agent.tools is not original_defs
+    search_schema = next(
+        tool for tool in agent.tools
+        if tool["function"]["name"] == "tool_search"
+    )
+    assert "beta" in search_schema["function"]["description"]
 
 
 def test_refresh_detects_equal_size_swap(monkeypatch):
