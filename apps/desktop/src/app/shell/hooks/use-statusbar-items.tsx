@@ -339,7 +339,12 @@ export function useStatusbarItems({
         ? copy.connectionSsh(connection.remoteHost)
         : cloud
           ? copy.connectionCloud(connection.remoteHost)
-          : copy.connectionRemote(connection.remoteHost),
+          : copy.connectionRemote(
+              // Strip the default Hermes serve port so the label stays compact
+              // and doesn't push action items (agents/cron/webhooks) out of
+              // the overflow-clipped status bar on narrower windows.
+              connection.remoteHost.replace(/:9119$/, '')
+            ),
       title: ssh
         ? copy.connectionSshTooltip(connection.remoteHost)
         : cloud
