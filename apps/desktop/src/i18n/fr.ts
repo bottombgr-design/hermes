@@ -132,6 +132,7 @@ export const fr: Translations = {
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT nécessite ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'ElevenLabs a rejeté la clé API (401).',
+      gatewayAuthFailed: 'Échec d\'authentification de la passerelle — vérifiez votre API_SERVER_KEY.',
       methodNotAllowed:
         'Le backend a rejeté cette requête (405 Method Not Allowed). Essayez de redémarrer Hermes Desktop.',
       microphonePermission: 'Permission du microphone refusée.',
@@ -168,7 +169,8 @@ export const fr: Translations = {
       turnDoneBody: 'La réponse est prête.',
       turnErrorTitle: 'Échec du tour',
       backgroundDoneTitle: 'Tâche d\'arrière-plan terminée',
-      backgroundFailedTitle: 'Tâche d\'arrière-plan échouée'
+      backgroundFailedTitle: 'Tâche d\'arrière-plan échouée',
+      creditsTitle: 'Crédits'
     }
   },
 
@@ -359,6 +361,10 @@ export const fr: Translations = {
         backgroundDone: {
           label: 'Tâche d\'arrière-plan terminée',
           description: 'Une commande terminal en arrière-plan est terminée.'
+        },
+        credits: {
+          label: 'Alertes de crédits',
+          description: 'L\'accès aux crédits est suspendu ou rétabli.'
         }
       },
       test: 'Envoyer une notification de test',
@@ -421,7 +427,6 @@ export const fr: Translations = {
       technicalDesc: 'Inclure les arguments/résultats bruts et les détails de bas niveau.',
       themeTitle: 'Thème',
       themeDesc: 'Palettes du bureau uniquement. Le mode sélectionné est appliqué par-dessus.',
-      themeSearchPlaceholder: 'Rechercher parmi vos thèmes ou le marketplace VS Code…',
       themeProfileNote: profile => `Enregistré pour le profil ${profile} — chaque profil conserve son propre thème.`,
       installTitle: 'Installer depuis VS Code',
       installDesc:
@@ -785,6 +790,15 @@ export const fr: Translations = {
       keepAwakeTitle: 'Empêcher la mise en veille',
       keepAwakeDesc: 'Empêche cette machine de se mettre en veille pour que les exécutions longues ou nocturnes continuent. L\'écran peut toujours s\'assombrir.'
     },
+    quickEntry: {
+      enabledTitle: 'Saisie rapide',
+      enabledDesc: 'Invoquez un petit composeur depuis n\'importe où avec un raccourci global et lancez un prompt sans ouvrir Hermes.',
+      shortcutTitle: 'Raccourci de saisie rapide',
+      shortcutDesc: 'Nécessite au moins un modificateur, ex. CommandOrControl+Shift+Space.',
+      active: 'Le raccourci est actif.',
+      takenBy: 'Une autre application utilise déjà ce raccourci — choisissez-en un autre.',
+      invalidShortcut: 'Raccourci invalide. Incluez au moins une touche modificatrice.'
+    },
     credentials: {
       pasteKey: 'Coller la clé',
       pasteLabelKey: label => `Coller la clé ${label}`,
@@ -824,6 +838,8 @@ export const fr: Translations = {
         'Désactivez HERMES_DESKTOP_REMOTE_URL et HERMES_DESKTOP_REMOTE_TOKEN pour utiliser le paramètre enregistré ci-dessous.',
       localTitle: 'Passerelle locale',
       localDesc: 'Démarrer un backend Hermes privé sur localhost. C\'est le mode par défaut et fonctionne hors ligne.',
+      inheritTitle: 'Utiliser la passerelle par défaut',
+      inheritDesc: 'Retirer le remplacement de ce profil et utiliser la connexion par défaut.',
       remoteTitle: 'Passerelle distante',
       remoteDesc: 'Connecter cette interface de bureau à un backend Hermes distant.',
       modeTitle: 'Mode de connexion',
@@ -1025,7 +1041,6 @@ export const fr: Translations = {
       defaultsFailed: 'Échec de l\'enregistrement des défauts du modèle',
       auxiliaryTitle: 'Modèles auxiliaires',
       resetAllToMain: 'Tout réinitialiser au principal',
-      staleAuxWarning: (count, names, provider) => `${count} tâche${count === 1 ? '' : 's'} auxiliaire${count === 1 ? '' : 's'} (${names}) tourne${count === 1 ? '' : ''} encore sur ${provider}, pas sur ton modèle principal.`,
       auxiliaryDesc: 'Les tâches auxiliaires utilisent le modèle principal par défaut. Attribuez un modèle dédié à une tâche pour le remplacer.',
       setToMain: 'Définir sur principal',
       change: 'Modifier',
@@ -1034,19 +1049,6 @@ export const fr: Translations = {
       fallbackAdd: 'Ajouter un fallback',
       fallbackEmpty: 'Aucun modèle de fallback — le modèle par défaut est utilisé sauf en cas d\'échec.',
       notInCatalog: 'n\'est pas dans la liste des modèles de ce fournisseur — les appels peuvent basculer sur un fallback.',
-      moa: {
-        sectionTitle: 'Mixture of Agents',
-        description: 'Configurez des presets nommés qui apparaissent comme modèles sous le fournisseur Mixture of Agents. L\'agrégateur est le modèle actif.',
-        presetPlaceholder: 'Preset',
-        setDefault: 'Définir par défaut',
-        deletePreset: 'Supprimer',
-        newPresetPlaceholder: 'nouveau preset',
-        addPreset: 'Ajouter un preset',
-        defaultLabel: 'Défaut :',
-        referenceLabel: (n) => `Référence ${n}`,
-        addReferenceModel: 'Ajouter un modèle de référence',
-        aggregatorTitle: 'Agrégateur'
-      },
       tasks: {
         vision: { label: 'Vision', hint: 'Analyse d\'image' },
         web_extract: { label: 'Extraction web', hint: 'Résumé de page' },
@@ -1099,6 +1101,12 @@ export const fr: Translations = {
       messages: count => `${count} message${count === 1 ? '' : 's'}`,
       restored: 'Restauré',
       deleteConfirm: title => `Supprimer définitivement « ${title} » ? Cette action est irréversible.`,
+      autoArchiveTitle: 'Archivage automatique des conversations inactives',
+      autoArchiveDesc:
+        'Archive automatiquement les conversations que vous n\'avez pas touchées depuis un moment. Les conversations épinglées ne sont jamais archivées, et rien n\'est supprimé — les conversations archivées sont simplement déplacées ici.',
+      autoArchiveDaysLabel: 'Archiver après',
+      autoArchiveDaysUnit: 'jours d\'inactivité',
+      autoArchiveFailed: 'Impossible de mettre à jour l\'archivage automatique',
       defaultDirTitle: 'Répertoire de projet par défaut',
       defaultDirDesc:
         'Les nouvelles sessions démarrent dans ce dossier sauf si vous en choisissez un autre. Laissez vide pour utiliser votre répertoire personnel.',
@@ -1852,6 +1860,7 @@ export const fr: Translations = {
     promptPlaceholder: 'Résume mes fils Slack non lus et envoie-moi les 5 plus importants par email...',
     frequencyLabel: 'Fréquence',
     deliverLabel: 'Livrer à',
+    deliverNeedsHomeChannel: 'définissez d\'abord un canal d\'accueil',
     modelLabel: 'Modèle',
     modelDefault: 'par défaut',
     customScheduleLabel: 'Planification personnalisée',
@@ -1863,7 +1872,25 @@ export const fr: Translations = {
     scheduleRequired: 'La planification est requise.',
     scriptOnlyEditHint: 'Tâche script seul (pas de prompt IA). ID tâche :',
     saveChanges: 'Enregistrer les modifications',
-    createAction: 'Créer la tâche'
+    createAction: 'Créer la tâche',
+    tabs: {
+      jobs: 'Tâches',
+      blueprints: 'Plans préconçus'
+    },
+    blueprints: {
+      tab: 'Plans préconçus',
+      startFrom: 'Partir de',
+      custom: 'Personnalisé',
+      subtitle: 'Automatisations prêtes à l\'emploi',
+      dialogDesc: 'Remplissez les détails et planifiez-la.',
+      scheduleIt: 'Planifier',
+      scheduling: 'Planification…',
+      scheduled: 'Plan préconçu planifié',
+      loading: 'Chargement des plans préconçus…',
+      failedLoad: 'Échec du chargement des plans préconçus',
+      emptyTitle: 'Aucun plan préconçu disponible',
+      emptyDesc: 'Aucun plan d\'automatisation préconçu n\'est disponible sur ce backend.'
+    }
   },
 
   artifacts: {
@@ -2026,6 +2053,13 @@ export const fr: Translations = {
       ageDay: 'j',
       ageHour: 'h',
       ageMin: 'min'
+    },
+    dateDivider: {
+      today: 'Plus tôt aujourd\'hui',
+      yesterday: 'Hier',
+      thisWeek: 'Plus tôt cette semaine',
+      lastWeek: 'La semaine dernière',
+      thisMonth: 'Plus tôt ce mois-ci'
     }
   },
 
@@ -2210,6 +2244,10 @@ export const fr: Translations = {
     },
     agents: 'Agents',
     background: count => `${count} Arrière-plan`,
+    goalActive: 'Objectif actif',
+    goalDone: 'Objectif terminé',
+    goalPaused: 'Objectif en pause',
+    goalWaiting: 'Objectif en attente',
     subagents: count => `${count} Sous-agent${count === 1 ? '' : 's'}`,
     todos: (done, total) => `Tâches ${done}/${total}`,
     running: 'En cours',
@@ -2292,6 +2330,39 @@ export const fr: Translations = {
     viewDocs: 'Voir la documentation d\'installation',
     installTo: 'Sera installé dans',
     retryAfterRun: 'Je l\'ai exécutée -- réessayer',
+    setupChoiceTitle: 'Configurer Hermes Desktop',
+    setupChoiceDesc: 'Connectez cette application à une passerelle Hermes que vous utilisez déjà, ou installez Hermes localement sur cet ordinateur.',
+    connectExistingTitle: 'Se connecter à un Hermes existant',
+    connectExistingShort: 'Connecter existant',
+    connectExistingDesc: 'Utilisez un backend distant avec un jeton de session ou une connexion navigateur. Aucune installation locale ne sera lancée.',
+    installLocalTitle: 'Installer Hermes localement',
+    installLocalDesc: 'Téléchargez Hermes, créez son environnement Python et exécutez le backend sur cet ordinateur.',
+    localStartUnavailable: 'L\'installation locale n\'a pas pu démarrer. Redémarrez Hermes Desktop et réessayez.',
+    remoteSetupTitle: 'Se connecter à un Hermes existant',
+    remoteSetupDesc: 'Saisissez l\'URL de votre passerelle. Hermes Desktop détectera si un jeton ou une connexion navigateur est nécessaire.',
+    remoteUrlTitle: 'URL de la passerelle',
+    remoteUrlDesc: 'Utilisez l\'URL de base de la passerelle Hermes, en incluant https:// pour les passerelles distantes.',
+    remoteUrlPlaceholder: 'https://passerelle.exemple.com/hermes',
+    probing: 'Détection de l\'authentification de la passerelle...',
+    probeError: 'Impossible de contacter cette passerelle Hermes.',
+    identityProvider: 'votre fournisseur d\'identité',
+    authTitle: 'Authentification',
+    authNeedsOauth: provider => `Connectez-vous avec ${provider} avant de tester cette passerelle.`,
+    authSignedIn: 'Connexion navigateur terminée.',
+    connected: 'Connecté',
+    signIn: 'Se connecter',
+    signInWith: provider => `Se connecter avec ${provider}`,
+    enterUrlFirst: 'Saisissez d\'abord une URL de passerelle.',
+    signInIncomplete: 'La fenêtre de connexion s\'est fermée avant la fin de l\'authentification.',
+    tokenTitle: 'Jeton de session',
+    tokenDesc: 'Collez le jeton de session du fichier .env de la passerelle distante.',
+    pasteSessionToken: 'Coller le jeton de session',
+    incompleteSignInTest: 'Connectez-vous avant de tester cette passerelle protégée par OAuth.',
+    incompleteTokenTest: 'Saisissez un jeton de session avant de tester cette passerelle.',
+    testConnection: 'Tester la connexion',
+    testSucceeded: (baseUrl, version) => `Connecté à ${baseUrl}${version ? ` (${version})` : ''}.`,
+    applyRemote: 'Appliquer et reconnecter',
+    backToSetup: 'Retour',
     failedTitle: 'Échec de l\'installation',
     settingUpTitle: 'Configuration de Hermes Agent',
     finishingTitle: 'Finalisation',
@@ -2406,7 +2477,8 @@ export const fr: Translations = {
     proNeedsSubscription: 'Les modèles Pro nécessitent un abonnement Nous payant.',
     free: 'Gratuit',
     freeTier: 'Niveau gratuit',
-    priceTitle: 'Prix entrée / sortie par million de tokens'
+    priceTitle: 'Prix entrée / sortie par million de tokens',
+    wasPrice: 'était'
   },
 
   modelVisibility: {
@@ -2425,8 +2497,7 @@ export const fr: Translations = {
       noModels: 'Aucun modèle trouvé',
       editModels: 'Modifier les modèles…',
       refreshModels: 'Actualiser les modèles',
-      fast: 'Rapide',
-      medium: 'Moyen'
+      fast: 'Rapide'
     },
     modelOptions: {
       noOptions: 'Aucune option pour ce modèle',
@@ -2499,6 +2570,16 @@ export const fr: Translations = {
       gatewayOffline: 'hors ligne',
       gatewayRestarting: 'redémarrage…',
       gatewayTitle: 'Statut de la passerelle d\'inférence Hermes',
+      customizeTitle: 'Afficher dans la barre d\'état',
+      toggleApprovalMode: 'Approbations',
+      toggleBackendVersion: 'Version du backend',
+      toggleCommandCenter: 'Centre de commande',
+      toggleContextUsage: 'Jauge de contexte',
+      toggleRunningTimer: 'Chrono du tour',
+      toggleSessionTimer: 'Chrono de session',
+      toggleTerminal: 'Terminal',
+      toggleVersion: 'Version et mises à jour',
+      toggleWorkspace: 'Espace de travail',
       agents: 'Agents',
       closeAgents: 'Fermer les agents',
       openAgents: 'Ouvrir les agents',
@@ -2507,6 +2588,8 @@ export const fr: Translations = {
       running: count => `${count} en cours`,
       cron: 'Tâches',
       openCron: 'Ouvrir les tâches planifiées',
+      webhooks: 'Webhooks',
+      openWebhooks: 'Ouvrir les webhooks',
       starmap: 'Graphe mémoire',
       openStarmap: 'Ouvrir le graphe mémoire',
       turnRunning: 'En cours',
@@ -2679,7 +2762,6 @@ export const fr: Translations = {
     hideHeader: 'Masquer l\'en-tête',
     minimize: 'Réduire',
     restore: 'Restaurer',
-    toggleLayoutEditMode: 'Basculer le mode édition de disposition',
     closeRunningTitle: 'Fermer l\'onglet en cours ?',
     closeRunningBody:
       'Ce chat est encore actif (ou attend votre saisie). Fermer l\'onglet le masque — la session conserve sa progression et peut être rouverte depuis la barre latérale.',
@@ -2687,6 +2769,7 @@ export const fr: Translations = {
     closeOthers: 'Fermer les autres',
     closeToRight: 'Fermer à droite',
     closeAll: 'Tout fermer',
+    newSessionTab: 'Nouvel onglet de session',
     split: dir => `Diviser ${dir}`,
     move: dir => `Déplacer ${dir}`,
     dirUp: 'haut',
@@ -2778,7 +2861,10 @@ export const fr: Translations = {
       placeholder: 'Tapez votre réponse…',
       continueLabel: 'Continuer',
       skip: 'Passer',
-      skipped: 'Ignoré'
+      skipped: 'Ignoré',
+      lateAnswer: (question, choice) => `Re: "${question}" — ma réponse : ${choice}`,
+      lateAnswerTip: 'Rédiger cette réponse comme message de suivi',
+      lateAnswerHint: 'Cette question n\'est plus en attente. Choisissez une option pour la rédiger comme message de suivi.'
     },
     tool: {
       code: 'Code',
@@ -2840,6 +2926,7 @@ export const fr: Translations = {
         execute_code: { done: 'Code exécuté', pending: 'Script en cours', pendingAction: 'Script' },
         image_generate: { done: 'Image générée', pending: 'Génération', pendingAction: 'Génération' },
         list_files: { done: 'Fichiers listés', pending: 'Listage', pendingAction: 'Listage' },
+        memory: { done: 'Enregistré en mémoire', pending: 'Enregistrement en mémoire', pendingAction: 'Enregistrement' },
         patch: { done: 'Fichier patché', pending: 'Patch en cours', pendingAction: 'Patch' },
         read_file: { done: 'Fichier lu', pending: 'Lecture', pendingAction: 'Lecture' },
         search_files: { done: 'Recherche effectuée', pending: 'Recherche', pendingAction: 'Recherche' },
@@ -2964,52 +3051,105 @@ export const fr: Translations = {
     }
   },
 
-  billing: {
-    autoRefill: 'Rechargement auto',
-    balance: 'Solde',
-    plan: 'Forfait',
-    connectTitle: 'Connectez votre compte Nous',
-    connectMessage: 'Lancez /portal dans le TUI ou ouvrez le portail Nous pour connecter votre compte.',
-    openPortal: 'Ouvrir le portail',
-    openPortalArrow: 'Ouvrir le portail ↗',
-    autoRefillUpdated: 'Rechargement auto mis à jour.',
-    autoRefillTurnedOff: 'Rechargement auto désactivé.',
-    autoRefillThreshold: 'Seuil de rechargement auto',
-    autoRefillReloadTo: 'Montant de rechargement auto',
-    autoRefillCaption: cardLabel => `Le rechargement auto débite ${cardLabel} — réconcilier sur le portail`
+  billingBlock: {
+    titleNous: 'Plus de crédits Nous',
+    titleProvider: provider => `Plus de crédits — ${provider}`,
+    fallbackMessage: 'Votre compte n\'a plus de crédits. Ajoutez des crédits pour continuer.',
+    openBilling: 'Ouvrir la facturation',
+    addCredits: 'Ajouter des crédits',
+    dismiss: 'Ignorer'
   },
 
-  uninstall: {
-    dangerZone: 'Zone dangereuse',
-    checking: 'Vérification de ce qui est installé…',
-    confirmTitle: 'Confirmer la désinstallation',
-    confirmBody: consequence => `Cela supprimera ${consequence}. Cette action est irréversible.`,
-    uninstalling: 'Désinstallation…',
-    yesUninstall: 'Oui, désinstaller',
-    couldNotStart: 'La désinstallation n\'a pas pu démarrer.',
-    cancel: 'Annuler',
-    uninstallHermes: 'Désinstaller Hermes',
-    uninstallDescription:
-      'Choisissez ce que vous voulez supprimer. L\'application se fermera pour terminer ; rouvrez l\'installateur à tout moment pour revenir.',
-    options: {
-      gui: {
-        title: 'Désinstaller l\'interface seulement',
-        description: 'Supprime cette application de bureau. L\'agent Hermes, votre configuration et vos conversations sont conservés.',
-        consequence: 'l\'interface de chat (cette application et ses données)'
-      },
-      lite: {
-        title: 'Désinstaller l\'interface + l\'agent, garder mes données',
-        description:
-          'Supprime l\'application et l\'agent Hermes, mais conserve la configuration, les conversations et les secrets pour une réinstallation future.',
-        consequence: 'l\'interface de chat et l\'agent Hermes (la config, les conversations et les secrets sont conservés)'
-      },
-      full: {
-        title: 'Tout désinstaller',
-        description:
-          'Supprime l\'application, l\'agent et toutes les données utilisateur — config, conversations, tâches planifiées, secrets, logs.',
-        consequence:
-          'TOUT — l\'interface de chat, l\'agent Hermes, et toute votre configuration, conversations, secrets et logs'
-      }
+  findInPage: {
+    next: 'Occurrence suivante',
+    previous: 'Occurrence précédente'
+  },
+
+  webhooks: {
+    search: 'Rechercher des webhooks…',
+    loading: 'Chargement des webhooks…',
+    loadFailed: 'Échec du chargement des webhooks',
+    subscriptions: count => `Abonnements (${count})`,
+    hint: 'Les changements d\'abonnement sont rechargés à chaud une fois le récepteur lancé. Les abonnements désactivés rejettent les événements entrants.',
+    empty: 'Aucun abonnement webhook pour l\'instant.',
+    disabledTitle: 'Récepteur webhook désactivé',
+    disabledBody: 'Les webhooks sont leur propre plateforme de passerelle. Activez-les ici pour accepter les événements HTTP entrants.',
+    enable: 'Activer les webhooks',
+    enabling: 'Activation…',
+    enabled: name => `Activé : « ${name} »`,
+    disabled: name => `Désactivé : « ${name} »`,
+    enableRow: 'Activer',
+    disableRow: 'Désactiver',
+    delete: 'Supprimer',
+    deleting: 'Suppression…',
+    deleted: 'Webhook supprimé',
+    deleteTitle: 'Supprimer le webhook',
+    deleteDescPrefix: 'Cela supprimera définitivement ',
+    deleteDescSuffix: '. Cette action est irréversible.',
+    deleteFailed: name => `Échec de suppression de « ${name} »`,
+    toggleFailed: name => `Échec de mise à jour de « ${name} »`,
+    newSubscription: 'Nouvel abonnement',
+    restarting: 'Redémarrage de la passerelle…',
+    restartNeeded: 'Les webhooks sont activés, mais la passerelle doit encore redémarrer avant que le récepteur puisse démarrer.',
+    restartGateway: 'Redémarrer la passerelle',
+    restartingGateway: 'Redémarrage…',
+    restartFailed: detail => `Échec du redémarrage de la passerelle${detail}`,
+    enabledRestarting: 'Webhooks activés ; redémarrage de la passerelle…',
+    all: '(tout)',
+    deliverOnly: 'livrer uniquement',
+    createdTitle: 'Abonnement créé',
+    createdSecretHint: 'Copiez le secret maintenant — il n\'est affiché qu\'une seule fois.',
+    webhookUrl: 'URL du webhook',
+    secretOnce: 'Secret (affiché une seule fois)',
+    done: 'Terminé',
+    fieldName: 'Nom',
+    fieldNamePlaceholder: 'ex. github-push',
+    fieldDescription: 'Description',
+    fieldDescriptionPlaceholder: 'Ce que fait ce webhook (optionnel)',
+    fieldEvents: 'Événements',
+    fieldEventsPlaceholder: 'séparés par des virgules, laissez vide pour tout',
+    fieldSkills: 'Skills',
+    fieldSkillsPlaceholder: 'noms de skills séparés par des virgules (optionnel)',
+    fieldDeliver: 'Livrer à',
+    fieldDeliverOnly: 'Livrer uniquement le payload',
+    fieldPrompt: 'Prompt',
+    fieldPromptPlaceholder: 'Instructions pour l\'agent quand ce webhook se déclenche (optionnel)',
+    nameRequired: 'Nom requis',
+    create: 'Créer',
+    creating: 'Création…',
+    created: 'Créé',
+    createFailed: detail => `Échec de création : ${detail}`,
+    copy: 'Copier',
+    deliverOptions: {
+      log: 'Journal',
+      telegram: 'Telegram',
+      discord: 'Discord',
+      slack: 'Slack',
+      email: 'Email',
+      github_comment: 'Commentaire GitHub'
     }
+  },
+
+  artifactCard: {
+    kind: { code: 'Code', html: 'Page interactive', svg: 'Graphique' },
+    generating: lines => `Génération… ${lines} lignes`,
+    versionBadge: count => `${count} versions`,
+    open: 'Ouvrir'
+  },
+
+  artifactPane: {
+    tabFallback: 'Artefact',
+    modePreview: 'APERÇU',
+    modeSource: 'SOURCE',
+    versionOf: (current, total) => `v${current} sur ${total}`,
+    olderVersion: 'Version précédente',
+    newerVersion: 'Version suivante',
+    latest: 'Dernière',
+    copyContent: 'Copier le contenu',
+    download: 'Télécharger',
+    openInBrowser: 'Ouvrir dans le navigateur',
+    openInBrowserFailed: 'Impossible d\'ouvrir dans le navigateur',
+    missingTitle: 'Artefact indisponible',
+    missingBody: 'Cet artefact n\'est plus dans la conversation.'
   }
 }
