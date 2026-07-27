@@ -542,7 +542,9 @@ same auth gate as the rest of `/api/`.
 | `GET /api/ops/checkpoints` · `POST .../prune` | Inspect / prune the `/rollback` store |
 | `POST /api/ops/hooks` · `DELETE /api/ops/hooks` | Create / remove a shell hook (consent-gated) |
 | `GET /api/system/stats` | Host stats — OS, CPU, memory, disk, uptime |
-| `GET /api/hermes/update/check` | Report update availability (commits behind, install method) without applying. For git installs that are behind, also returns a `commits` list (`sha`, `summary`, `author`, `at`) of what's changed. `?force=1` busts the 6h cache |
+| `GET /api/dashboard/remote-access` | The configured dashboard public URL (for [Continue on phone](#continue-a-session-on-your-phone)); empty when unset |
+| `POST /api/auth/handoff-ticket` | Mint a single-use phone handoff ticket `{session_id, profile?}` (full desk only; resume-scoped consume on GET `/chat?handoff=`) |
+| `GET /api/hermes/update/check` | Report update availability (commits behind, install method) without applying. For git/pip installs that are behind, also returns a `commits` list (`sha`, `summary`, `author`, `at`) of what's changed. `?force=1` busts the 6h cache |
 | `GET /api/curator` · `PUT .../paused` · `POST .../run` | Skill-curator status + pause/resume + run |
 | `GET /api/portal` | Nous Portal auth + Tool Gateway routing (read-only) |
 | `POST /api/ops/prompt-size` · `/dump` · `/config-migrate` | Diagnostics (backgrounded) |
@@ -910,6 +912,55 @@ Validation rejects values without `http://` / `https://` scheme, without a host,
 
 > **Note:** `public_url` overrides the OAuth callback URL only. The `Secure` cookie flag is still controlled by `request.url.scheme` (X-Forwarded-Proto under proxy_headers), so an `http://` `public_url` on a TLS-terminated public deploy will produce non-Secure cookies. This is an operator footgun — pair `public_url` with proper TLS termination upstream.
 
+### Exposing the dashboard (reverse proxy)
+
+Continue-on-phone and remote browser access need the dashboard reachable at a stable **HTTPS** URL with the auth gate engaged. Two common shapes:
+
+**Local tunnel (dev / personal phone)**
+
+1. Run the dashboard on loopback: `hermes dashboard --no-open` (default `127.0.0.1:9119`).
+2. Front it with any TLS tunnel that terminates HTTPS and forwards to that port (examples: Cloudflare Tunnel, Tailscale Serve/Funnel, ngrok, Caddy with a public hostname). Prefer a tunnel that sets `X-Forwarded-Proto` / `X-Forwarded-Host`.
+3. Set the public origin Hermes should advertise:
+
+```yaml
+dashboard:
+  public_url: "https://hermes.example.com"   # or https://…/hermes if path-prefixed
+```
+
+or `export HERMES_DASHBOARD_PUBLIC_URL=https://hermes.example.com`.
+
+4. Confirm `curl -sS https://hermes.example.com/api/status | jq '.auth_required, .public_url'` — `auth_required` should be `true` once the process is bound/reached in gated mode (non-loopback bind or equivalent gate). Desktop's Continue-on-phone probe requires a gated public URL.
+
+**VPS / reverse proxy (production-style)**
+
+1. Bind the dashboard on loopback on the host (`127.0.0.1:9119`) or a private interface.
+2. Terminate TLS at nginx/Caddy/Traefik and reverse-proxy to the dashboard. Forward at least:
+
+   - `Host`
+   - `X-Forwarded-Host`
+   - `X-Forwarded-Proto`
+   - `X-Forwarded-Prefix` when the public path is not `/` (e.g. `/hermes`)
+
+3. Set `dashboard.public_url` to the full browser origin (including path prefix if any).
+4. Enable a real browser auth provider (Nous OAuth, self-hosted OIDC, or basic auth on a trusted network only — see [Authentication](#authentication-gated-mode)). Do not expose a token-only loopback token over the public internet.
+
+Minimal nginx sketch (adjust host/path/upstream):
+
+```nginx
+location /hermes/ {
+    proxy_pass http://127.0.0.1:9119/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Prefix /hermes;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+}
+```
+
+WebSocket upgrades (`/api/pty`, `/api/events`, `/api/ws` for full desk) must pass through the same proxy with Upgrade headers.
+
 ### OAuth flow
 
 The provider implements the [Nous Portal OAuth contract v1](https://github.com/NousResearch/nous-account-service/blob/main/docs/agent-dashboard-oauth-contract.md) — authorization-code grant with PKCE (S256):
@@ -1055,6 +1106,52 @@ Instead of the in-app setting, you can point the desktop at a backend with an en
 - **No "Sign in" button — it asks for a session token instead** — the username/password provider isn't active (`/api/status` won't list `"basic"`). Make sure the username and a password (or password hash) are set and the dashboard process loaded them.
 - **Signed out on every restart** — set `HERMES_DASHBOARD_BASIC_AUTH_SECRET` to a stable value; otherwise the signing key is regenerated per boot.
 - **Connection refused / times out** — the backend bound to `127.0.0.1` (the default) instead of a reachable address, or a firewall/VPN is blocking the port. Bind to `0.0.0.0` or the tailscale IP and open the port to your trusted network.
+
+## Continue a session on your phone
+
+Hermes Desktop can hand the conversation you're looking at to your phone: **session menu → Continue on phone** shows a QR code that opens the same session in this dashboard's Chat tab.
+
+The QR encodes a **single-use handoff URL**:
+
+```
+https://<public-host>/<prefix>/chat?resume=<session-id>&handoff=<ticket>[&profile=<name>]
+```
+
+On first load the dashboard consumes `handoff` (GET `/chat` only), sets a **resume-scoped** browser session cookie bound to that session/profile, and strips the ticket from the URL. The phone then opens chat PTY against the bound session — client query params cannot pivot to another session. If the handoff ticket is missing/expired/already used, the phone falls through to normal gated sign-in.
+
+Prerequisites — Desktop checks all of these and won't render a QR code until they pass:
+
+- **A public dashboard URL** — `dashboard.public_url` in `config.yaml` or `HERMES_DASHBOARD_PUBLIC_URL` (see [Public URL override](#public-url-override) and [Exposing the dashboard](#exposing-the-dashboard-reverse-proxy)).
+- **HTTPS** — plain `http://` public URLs are refused; this link is meant to leave your machine.
+- **Gated dashboard** — the public URL must serve a dashboard with its [auth gate](#authentication-gated-mode) engaged (`auth_required: true`). Token-proxy topologies — where Desktop authenticates against a bare backend with a static session token and there is no browser login page — are not supported.
+
+The QR code encodes the public chat URL plus a short-lived handoff ticket — **no long-lived credentials or cookies**. The ticket is single-use and resume-scoped; it cannot mint admin power.
+
+Desktop:
+
+1. Resolves the public base via `GET /api/dashboard/remote-access` (`{"public_url": "…"}`, empty when unset).
+2. Mints `POST /api/auth/handoff-ticket` with `{session_id, profile}` against the local/authenticated desk backend.
+3. Builds the QR URL with `resume` + `handoff` (+ `profile` when needed).
+
+### Handoff URL lifetime, scope, and logs
+
+| Control | Value | Why it matters |
+|---------|-------|----------------|
+| Handoff ticket TTL | **120 seconds** | QR is momentary; expired tickets fail closed |
+| Handoff ticket use | **single-use** | Replay after consume fails closed |
+| Resume browser session TTL | **45 minutes** (not multi-hour admin sessions) | Limits blast radius if a phone is left unlocked |
+| Scope after consume | **`resume` only** | Denies `/api/env`, `/api/config`, session list, admin WS (`/api/ws`, `/api/console`, `/api/pub`) |
+| Logout | `/auth/logout` clears cookies and best-effort revokes provider refresh tokens | Phone end of session |
+
+**Tunnel / reverse-proxy access logs (read this before public exposure).**
+
+The first phone hit is `GET /chat?resume=…&handoff=<ticket>`. The app **strips** `handoff` on the 302 redirect, but anything sitting **in front of** the app can still log the original request line:
+
+- **cloudflared**: at `--loglevel debug` it logs the request URL and headers and **warns that this can expose sensitive information**. Keep production tunnels at `info` or higher unless you are actively debugging, and treat debug logs as secret material.
+- **nginx / Caddy / other reverse proxies**: default access logs often include the full request URI (path **and** query). Prefer logging `$uri` / path-only, or redact `handoff` / `ticket` query parameters before shipping logs to a third party.
+- **Hermes app audit logs** already redact handoff/ticket secrets; do not assume the tunnel does.
+
+Mitigations already in the product: short TTL, single-use tickets, resume-only scope, no long-lived token in the SPA bundle. Mitigations on the operator side: avoid debug tunnel logging, redact query strings in proxy access logs, and rotate/re-mint if a ticket URL was captured before consume.
 
 ## CORS
 

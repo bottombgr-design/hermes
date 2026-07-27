@@ -1059,6 +1059,17 @@ export interface StatusResponse {
   version: string
 }
 
+export interface DashboardRemoteAccessResponse {
+  public_url: string
+}
+
+export interface DashboardHandoffTicketResponse {
+  ticket: string
+  ttl_seconds: number
+  session_id: string
+  profile: string
+}
+
 export interface ActionResponse {
   name: string
   ok: boolean

@@ -407,10 +407,20 @@ def _require_token(request: Request) -> None:
     if getattr(request.app.state, "auth_required", False):
         # Gate is authoritative. It attaches ``request.state.session`` on
         # success and 401s otherwise, so a request that reached us is already
-        # authenticated. Belt-and-braces: confirm the session is present.
-        if getattr(request.state, "session", None) is not None:
-            return
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        # authenticated. Belt-and-braces: confirm the session is present and
+        # is full-dashboard (resume-scoped cookies must not pass admin
+        # endpoints that call _require_token).
+        sess = getattr(request.state, "session", None)
+        if sess is None:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        from hermes_cli.dashboard_auth.scopes import session_is_restricted
+
+        if session_is_restricted(sess):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient scope for this operation",
+            )
+        return
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -17442,6 +17452,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             TicketInvalid,
             consume_internal_credential,
             consume_ticket,
+            resume_event_channel,
         )
 
         # Server-spawned children (PTY child → /api/ws, /api/pub) present the
@@ -17466,7 +17477,65 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            allowed = info.get("allowed_endpoints")
+            if allowed is not None:
+                path = ws.url.path or ""
+                if path not in set(allowed):
+                    audit_log(
+                        AuditEvent.WS_TICKET_REJECTED,
+                        reason="ticket_endpoint_denied",
+                        ip=(ws.client.host if ws.client else ""),
+                        path=path,
+                    )
+                    return "ticket_endpoint_denied", "ticket"
+                expected_channel = resume_event_channel(
+                    user_id=str(info.get("user_id") or ""),
+                    session_id=str(info.get("bound_session_id") or ""),
+                    profile=str(info.get("bound_profile") or ""),
+                )
+                actual_channel = info.get("event_channel")
+                if (
+                    not isinstance(actual_channel, str)
+                    or not _VALID_CHANNEL_RE.fullmatch(actual_channel)
+                    or not hmac.compare_digest(actual_channel, expected_channel)
+                ):
+                    audit_log(
+                        AuditEvent.WS_TICKET_REJECTED,
+                        reason="ticket_event_channel_invalid",
+                        ip=(ws.client.host if ws.client else ""),
+                        path=path,
+                    )
+                    return "ticket_event_channel_invalid", "ticket"
+                if path == "/api/events":
+                    requested_channel = ws.query_params.get("channel", "")
+                    if (
+                        not _VALID_CHANNEL_RE.fullmatch(requested_channel)
+                        or not hmac.compare_digest(requested_channel, expected_channel)
+                    ):
+                        audit_log(
+                            AuditEvent.WS_TICKET_REJECTED,
+                            reason="ticket_event_channel_denied",
+                            ip=(ws.client.host if ws.client else ""),
+                            path=path,
+                        )
+                        return "ticket_event_channel_denied", "ticket"
+                try:
+                    ws.state.ws_ticket_event_channel = expected_channel
+                except Exception:
+                    audit_log(
+                        AuditEvent.WS_TICKET_REJECTED,
+                        reason="ticket_event_channel_state_invalid",
+                        ip=(ws.client.host if ws.client else ""),
+                        path=path,
+                    )
+                    return "ticket_event_channel_state_invalid", "ticket"
+            # Destination handlers (esp. /api/pty) force bound session/profile
+            # from the ticket and ignore hostile client query params.
+            try:
+                ws.state.ws_ticket_info = info
+            except Exception:
+                pass
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -18376,6 +18445,32 @@ async def console_ws(ws: WebSocket) -> None:
                 pass
 
 
+def _pty_resume_params(ws: Any) -> tuple[Optional[str], Optional[str], bool]:
+    """Return PTY resume parameters, forcing a resume-ticket's immutable bind.
+
+    A resume-scoped WS ticket may reach ``/api/pty`` only after auth stashes
+    its ticket info on ``ws.state``. In that case the bound session/profile
+    win over all client query params and ``fresh`` is disabled. Full desk
+    tickets retain the normal client-selected behaviour.
+    """
+    resume = ws.query_params.get("resume") or None
+    profile = ws.query_params.get("profile") or None
+    force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
+    if isinstance(ticket_info, dict) and ticket_info.get("allowed_endpoints") is not None:
+        return (
+            str(ticket_info.get("bound_session_id") or "").strip() or None,
+            str(ticket_info.get("bound_profile") or "").strip() or None,
+            False,
+        )
+    return resume, profile, force_fresh
+
+
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
@@ -18429,18 +18524,23 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     # --- spawn PTY ------------------------------------------------------
-    raw_resume = ws.query_params.get("resume") or None
-    resume = raw_resume
-    profile = ws.query_params.get("profile") or None
-    channel = _channel_or_close_code(ws)
+    resume, profile, force_fresh = _pty_resume_params(ws)
+    # Preserve the explicit target for the attach registry before any active
+    # session-file fallback below. A ticket-bound resume is explicit too.
+    raw_resume = resume
+    channel = getattr(getattr(ws, "state", None), "ws_ticket_event_channel", None)
+    if channel is None:
+        channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
-    force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
     active_session_file: Optional[Path] = None
+
+    ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
+    if isinstance(ticket_info, dict) and ticket_info.get("allowed_endpoints") is not None:
+        _log.info(
+            "pty ticket bind session=%r profile=%r (client query ignored)",
+            resume,
+            profile,
+        )
 
     if channel:
         active_session_file = _active_session_file_for_channel(ws.app, channel)
@@ -19188,6 +19288,20 @@ async def get_dashboard_themes():
         })
         seen.add(t["name"])
     return {"themes": themes, "active": active}
+
+
+@app.get("/api/dashboard/remote-access")
+async def get_dashboard_remote_access():
+    """Return the configured public URL used for authenticated remote access.
+
+    This route stays behind the normal dashboard authentication middleware.
+    The URL is configuration, not a credential. Desktop separately probes the
+    public target before presenting a session handoff so a stale or insecure
+    value never becomes a scannable link.
+    """
+    from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+    return {"public_url": resolve_public_url()}
 
 
 class ThemeSetBody(BaseModel):
