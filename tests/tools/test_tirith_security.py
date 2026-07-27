@@ -1332,8 +1332,8 @@ _CFG = {"tirith_enabled": True, "tirith_path": "tirith",
         "tirith_timeout": 5, "tirith_fail_open": True}
 
 
-class TestAppTldSuppression:
-    """warn verdicts whose only finding is lookalike_tld/.app are downgraded to allow."""
+class TestBenignTldSuppression:
+    """warn verdicts whose only finding is lookalike_tld/.app or .dev are downgraded to allow."""
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
@@ -1343,6 +1343,18 @@ class TestAppTldSuppression:
                      "message": "Domain uses '.app' TLD which can be confused with file extensions"}]
         mock_run.return_value = _mock_run(2, _json_stdout(findings, ".app TLD warning"))
         result = check_command_security("curl https://example.app")
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+        assert result["summary"] == ""
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_dev_only_warn_downgraded_to_allow(self, mock_cfg, mock_run):
+        mock_cfg.return_value = _CFG
+        findings = [{"rule_id": "lookalike_tld", "value": ".dev",
+                     "message": "Domain uses '.dev' TLD which can be confused with file extensions"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".dev TLD warning"))
+        result = check_command_security("curl https://example.dev")
         assert result["action"] == "allow"
         assert result["findings"] == []
         assert result["summary"] == ""
@@ -1359,8 +1371,18 @@ class TestAppTldSuppression:
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
+    def test_dev_tld_in_description_field_also_suppressed(self, mock_cfg, mock_run):
+        mock_cfg.return_value = _CFG
+        findings = [{"rule_id": "lookalike_tld",
+                     "description": "TLD .dev looks like a file extension"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings))
+        result = check_command_security("curl https://dash.home.peterramsay.dev")
+        assert result["action"] == "allow"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
     def test_mixed_findings_preserve_warn(self, mock_cfg, mock_run):
-        """If .app finding is accompanied by another finding, warn is preserved."""
+        """If benign finding is accompanied by another finding, warn is preserved."""
         mock_cfg.return_value = _CFG
         findings = [
             {"rule_id": "lookalike_tld", "value": ".app"},
@@ -1373,8 +1395,8 @@ class TestAppTldSuppression:
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
-    def test_non_app_lookalike_tld_preserved(self, mock_cfg, mock_run):
-        """lookalike_tld for a non-.app TLD is not suppressed."""
+    def test_non_benign_lookalike_tld_preserved(self, mock_cfg, mock_run):
+        """lookalike_tld for a non-benign TLD is not suppressed."""
         mock_cfg.return_value = _CFG
         findings = [{"rule_id": "lookalike_tld", "value": ".zip",
                      "message": "TLD .zip can be confused with zip archives"}]
@@ -1386,7 +1408,7 @@ class TestAppTldSuppression:
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
     def test_block_verdict_never_suppressed(self, mock_cfg, mock_run):
-        """block exit code is never downgraded, even if finding looks like .app."""
+        """block exit code is never downgraded, even if finding looks benign."""
         mock_cfg.return_value = _CFG
         findings = [{"rule_id": "lookalike_tld", "value": ".app"}]
         mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
@@ -1406,16 +1428,32 @@ class TestAppTldSuppression:
         result = check_command_security("curl https://a.app https://b.app")
         assert result["action"] == "allow"
 
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_mixed_app_and_dev_all_suppressed(self, mock_cfg, mock_run):
+        """All findings being benign (.app + .dev) lookalike_tld → allow."""
+        mock_cfg.return_value = _CFG
+        findings = [
+            {"rule_id": "lookalike_tld", "value": ".app"},
+            {"rule_id": "lookalike_tld", "value": ".dev"},
+        ]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings))
+        result = check_command_security("curl https://a.app https://b.dev")
+        assert result["action"] == "allow"
 
-class TestIsAppTldFinding:
-    """Unit tests for the _is_app_tld_finding helper."""
+
+class TestIsBenignTldFinding:
+    """Unit tests for the _is_benign_tld_finding helper."""
 
     def setup_method(self):
-        from tools.tirith_security import _is_app_tld_finding
-        self.fn = _is_app_tld_finding
+        from tools.tirith_security import _is_benign_tld_finding
+        self.fn = _is_benign_tld_finding
 
-    def test_matching_value_field(self):
+    def test_matching_app_value_field(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".app"})
+
+    def test_matching_dev_value_field(self):
+        assert self.fn({"rule_id": "lookalike_tld", "value": ".dev"})
 
     def test_matching_tld_field(self):
         assert self.fn({"rule_id": "lookalike_tld", "tld": ".app"})
@@ -1424,6 +1462,10 @@ class TestIsAppTldFinding:
         assert self.fn({"rule_id": "lookalike_tld",
                         "description": "TLD .app looks like an executable"})
 
+    def test_dev_in_description_field(self):
+        assert self.fn({"rule_id": "lookalike_tld",
+                        "description": "TLD .dev can be confused with DEV files"})
+
     def test_matching_message_field(self):
         assert self.fn({"rule_id": "lookalike_tld",
                         "message": "Domain uses '.app' TLD"})
@@ -1431,7 +1473,7 @@ class TestIsAppTldFinding:
     def test_wrong_rule_id(self):
         assert not self.fn({"rule_id": "shortened_url", "value": ".app"})
 
-    def test_non_app_tld(self):
+    def test_non_benign_tld(self):
         assert not self.fn({"rule_id": "lookalike_tld", "value": ".zip"})
 
     def test_no_tld_value_fields(self):
@@ -1442,6 +1484,9 @@ class TestIsAppTldFinding:
 
     def test_case_insensitive_match(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".APP"})
+
+    def test_case_insensitive_dev(self):
+        assert self.fn({"rule_id": "lookalike_tld", "value": ".DEV"})
 
 
 # ---------------------------------------------------------------------------
