@@ -959,6 +959,7 @@ def _close_sessions_for_transport(
                             if _sessions.get(sid) is session:
                                 _sessions.pop(sid, None)
                                 session["_sid"] = sid
+                                session["_disconnect_claimed"] = True
                                 claimed = True
                                 close_claim = True
                     else:
@@ -5354,7 +5355,10 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
                 turn_id = str(
                     (child_session.get("inflight_turn") or {}).get("turn_id") or ""
                 )
-                _emit("message.start", csid, {"turn_id": turn_id})
+                sync_enabled = _transport_requests_sync(
+                    _captured_session_transport(child_session)
+                )
+                _emit("message.start", csid, {"turn_id": turn_id} if sync_enabled else None)
         if event_type == "subagent.thinking":
             if text := str(payload.get("text") or ""):
                 _emit("reasoning.delta", csid, {"text": text})
@@ -5413,10 +5417,13 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
                     ) + 1
                 child_session["running"] = False
                 _clear_inflight_turn(child_session)
+                complete_payload = {"text": final_text}
+                if _transport_requests_sync(_captured_session_transport(child_session)):
+                    complete_payload["turn_id"] = turn_id
                 _emit(
                     "message.complete",
                     csid,
-                    {"text": final_text, "turn_id": turn_id},
+                    complete_payload,
                 )
             _child_mirrors.pop(child_key, None)
 
@@ -6928,11 +6935,10 @@ def _emit_inflight_delta(
         turn_id = str(
             (session.get("inflight_turn") or {}).get("turn_id") or ""
         )
-        payload = {
-            "text": delta,
-            "turn_id": turn_id,
-            "offset": offset,
-        }
+        payload = {"text": delta}
+        if _transport_requests_sync(_captured_session_transport(session)):
+            payload["turn_id"] = turn_id
+            payload["offset"] = offset
         if rendered is not None:
             payload["rendered"] = rendered
         _emit("message.delta", sid, payload)
@@ -7502,11 +7508,11 @@ def _attach_synchronization(
     session: dict,
     cursor: object = None,
 ) -> dict:
+    if not _transport_requests_sync(_captured_session_transport(session)):
+        return payload
     with session["history_lock"]:
         stream = _session_event_stream(session)
         with stream.transition(lambda _stream: None):
-            if not _transport_requests_sync(_captured_session_transport(session)):
-                return payload
             session["mobile_sync_retention"] = True
             payload["synchronization"] = _session_synchronization_locked(
                 sid,
@@ -8608,11 +8614,15 @@ def _live_session_payload(
     cursor: object = None,
 ) -> dict | None:
     info = _fallback_session_info(session)
+    with _sessions_lock:
+        was_registered = _sessions.get(sid) is session
     with session["history_lock"]:
         stream = _session_event_stream(session)
         with stream.transition(lambda _stream: None):
+            if session.get("_disconnect_claimed"):
+                return None
             with _sessions_lock:
-                if _sessions.get(sid) is not session:
+                if was_registered and _sessions.get(sid) is not session:
                     return None
             if cols is not None:
                 session["cols"] = cols
@@ -11624,6 +11634,11 @@ def _(rid, params: dict) -> dict:
         return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    # A child-watch session mirrors the parent-owned run as busy. Reject input
+    # before generic busy handling can queue it onto a turn this session does
+    # not own.
+    if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+        return _err(rid, 4009, "subagent still running — wait for it to finish")
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
@@ -11675,13 +11690,6 @@ def _(rid, params: dict) -> dict:
         # queue whose drain already ran.
 
     with session["history_lock"]:
-        # A watch session's run lives in the PARENT turn, so its own running
-        # flag is False — without this, typing mid-run builds a second agent
-        # racing the in-flight child on the same stored session (interleaved
-        # transcript, stale fork). After the run completes, submitting is fine:
-        # the upgrade resumes the child's transcript as a normal conversation.
-        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
-            return _err(rid, 4009, "subagent still running — wait for it to finish")
         if t is not None:
             _set_session_transport_locked(session, t)
         if truncate_user_ordinal is not None:
@@ -12501,6 +12509,7 @@ def _commit_prompt_completion(
     expected_history_version: int,
     result_messages: list | None,
     payload: dict[str, Any],
+    retained_error: str | None = None,
 ) -> str | None:
     """Publish final history and completion at one snapshot/event barrier."""
     status_note = None
@@ -12527,9 +12536,15 @@ def _commit_prompt_completion(
                 )
                 payload["warning"] = status_note
 
-        turn_id = str((session.get("inflight_turn") or {}).get("turn_id") or "")
-        payload["turn_id"] = turn_id
-        _clear_inflight_turn(session)
+        if _transport_requests_sync(_captured_session_transport(session)):
+            turn_id = str((session.get("inflight_turn") or {}).get("turn_id") or "")
+            payload["turn_id"] = turn_id
+        if retained_error is not None:
+            _fail_inflight_turn(session, retained_error)
+            payload["error"] = retained_error
+            payload["recoverable"] = True
+        else:
+            _clear_inflight_turn(session)
         # _emit allocates the stream sequence while history_lock is still held.
         # Snapshot capture takes the same locks in this order, so it can observe
         # either the streaming turn or the completed history, never a mixture.
@@ -12552,7 +12567,9 @@ def _run_prompt_submit(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
         turn_id = str((session.get("inflight_turn") or {}).get("turn_id") or "")
-        _emit("message.start", sid, {"turn_id": turn_id})
+        sync_enabled = _transport_requests_sync(_captured_session_transport(session))
+        start_payload = {"turn_id": turn_id} if sync_enabled else None
+        _emit("message.start", sid, start_payload)
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
         try:
@@ -12923,8 +12940,6 @@ def _run_prompt_submit(
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
-            if status_note:
-                payload["warning"] = status_note
             if result.get("response_previewed"):
                 payload["response_previewed"] = True
             # Forward the structured billing-wall descriptor (provider,
@@ -12937,28 +12952,24 @@ def _run_prompt_submit(
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
-            with session["history_lock"]:
-                turn_id = str((session.get("inflight_turn") or {}).get("turn_id") or "")
-                payload["turn_id"] = turn_id
-                if status == "error":
-                    # Returned-error result (provider 4xx, budget, etc.): retain
-                    # the failed turn for resume replay instead of clearing it.
-                    # If this terminal frame is lost to a disconnect, resume's
-                    # inflight payload is the only carrier of the failure.
-                    _fail_inflight_turn(
-                        session,
-                        result.get("error") if isinstance(result, dict) else raw,
-                    )
-                    turn_error_retained = True
-                else:
-                    _clear_inflight_turn(session)
+            retained_error = None
             if status == "error":
-                payload["error"] = str(
+                retained_error = str(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
-                payload["recoverable"] = True
+                turn_error_retained = True
+            # A delivered terminal frame means this turn is concluded. Retire
+            # the durable crash marker before publishing that frame so a client
+            # disconnect immediately afterward cannot replay completed work.
             _retire_turn_marker(session, marker_key)
-            _emit("message.complete", sid, payload)
+            _commit_prompt_completion(
+                sid,
+                session,
+                expected_history_version=history_version,
+                result_messages=result_messages,
+                payload=payload,
+                retained_error=retained_error,
+            )
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
