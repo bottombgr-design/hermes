@@ -488,14 +488,16 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
  *  editor pulls this module in, and a static import would boot the profile
  *  store (and its REST routing) along with it. */
 function openSessionRef(value: string) {
-  const { sessionId } = parseSessionRefValue(value)
+  const { profile, sessionId } = parseSessionRefValue(value)
 
   if (!sessionId) {
     return
   }
 
   triggerHaptic('selection')
-  void import('@/store/session-states').then(({ openSessionTile }) => openSessionTile(sessionId, 'center'))
+  void import('@/store/session-states').then(({ openSessionTile }) =>
+    openSessionTile(sessionId, 'center', undefined, undefined, profile)
+  )
 }
 
 /** A `@session:<profile>/<id>` reference in the user transcript (directive

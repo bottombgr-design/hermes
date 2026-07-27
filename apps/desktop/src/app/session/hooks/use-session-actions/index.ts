@@ -1178,7 +1178,7 @@ export function useSessionActions({
         // chat exactly where it is. Prime the tile with the create runtime so it
         // skips a redundant resume. Do NOT select it as the primary session
         // first — openSessionTile no-ops when the id is already primary.
-        openSessionTile(routedSessionId, 'center')
+        openSessionTile(routedSessionId, 'center', undefined, undefined, profile ?? undefined)
         patchSessionTile(routedSessionId, { runtimeId: branched.session_id })
         revealTreePane(`session-tile:${routedSessionId}`)
         broadcastSessionsChanged()

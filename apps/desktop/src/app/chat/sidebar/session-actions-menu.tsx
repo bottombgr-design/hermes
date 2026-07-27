@@ -227,7 +227,7 @@ function useSessionActions({
               triggerHaptic('selection')
               // Stack into the MAIN zone as a tab (center dock; the strip
               // sticky-shows on gain) — the door to the tab bar.
-              openSessionTile(sessionId, 'center')
+              openSessionTile(sessionId, 'center', undefined, undefined, profile)
             }
           })
         ]

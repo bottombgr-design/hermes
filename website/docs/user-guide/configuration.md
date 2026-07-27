@@ -1713,6 +1713,11 @@ stt:
   enabled: true                # Auto-transcribe inbound voice messages (default: true)
   echo_transcripts: true       # Post raw transcripts back to the chat as 🎙️ "..." (default: true)
   provider: "local"            # "local" | "groq" | "openai" | "mistral"
+  recovery:
+    enabled: true              # Preserve desktop recordings when STT fails
+    retention_hours: 24        # 0 disables recovery; maximum 168 (7 days)
+    max_entries: 50            # Per-profile recording cap; maximum 500
+    max_total_mb: 500          # Per-profile byte cap; maximum 2048 MiB
   local:
     model: "base"              # tiny, base, small, medium, large-v3
   openai:
@@ -1721,6 +1726,21 @@ stt:
 ```
 
 Set `stt.echo_transcripts: false` when the gateway should transcribe voice notes for the agent but must not post the raw transcript back to the chat (for example, customer-facing WhatsApp bots).
+
+### Failed recording recovery
+
+Desktop recordings are written to a private, profile-scoped cache before transcription starts. A successful transcription (including a successful empty/no-speech result) removes the cached audio immediately. Provider errors, unexpected failures, and interrupted HTTP requests retain the original bytes for the configured interval, counted from the latest failure. Expired entries become unavailable immediately on the next recovery lookup. Their files are physically pruned the next time Hermes accesses this cache (there is no background cleanup while Hermes is stopped), followed by the oldest failures until both the entry and storage limits are satisfied.
+
+```bash
+hermes stt recovery list
+hermes stt recovery retry <recovery-id>
+hermes stt recovery save <recovery-id> ./recording.webm
+hermes stt recovery discard <recovery-id>
+```
+
+Run recovery commands on the Hermes backend host and select the same profile that received the recording (for example, `hermes -p coder stt recovery list`). This matters when Desktop is connected to a remote backend. Recovery IDs are opaque; the API never exposes backend filesystem paths. The cache stores no transcript, provider exception, or credential material, and `.cache` is excluded from Hermes backups, profile exports, and `--clone-all` profile copies. On POSIX systems its directory is owner-only (`0700`) and its files are `0600`; on Windows Hermes relies on the account's inherited filesystem ACLs.
+
+This feature protects recordings when STT itself fails. It does not yet keep successful audio until the desktop acknowledges that the returned transcript was inserted into the composer; a connection loss after successful STT can therefore still lose that narrow delivery window.
 
 Provider behavior:
 

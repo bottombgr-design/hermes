@@ -1,8 +1,18 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 
 import { group, split } from '@/components/pane-shell/tree/model'
 import type { SessionTile } from '@/store/session-states'
-import { focusedSessionNeedsRoute, orderTilesByTree, selectionHomesToWorkspace } from '@/store/session-states'
+import {
+  $sessionTiles,
+  focusedSessionNeedsRoute,
+  orderTilesByTree,
+  resetTileRuntimeBindings,
+  selectionHomesToWorkspace
+} from '@/store/session-states'
+
+afterEach(() => {
+  $sessionTiles.set([])
+})
 
 const tile = (storedSessionId: string): SessionTile => ({ storedSessionId })
 const tilePane = (id: string) => `session-tile:${id}`
@@ -62,5 +72,15 @@ describe('focusedSessionNeedsRoute', () => {
   it('never routes for a tile — its pane shows the chat on any route', () => {
     expect(focusedSessionNeedsRoute('tile', true)).toBe(false)
     expect(focusedSessionNeedsRoute('tile', false)).toBe(false)
+  })
+})
+
+describe('session tile profile persistence', () => {
+  it('retains the owning profile when runtime bindings reset for resume', () => {
+    $sessionTiles.set([{ profile: 'medical', runtimeId: 'runtime-1', storedSessionId: 'stored-1' }])
+
+    resetTileRuntimeBindings()
+
+    expect($sessionTiles.get()).toEqual([{ profile: 'medical', storedSessionId: 'stored-1' }])
   })
 })

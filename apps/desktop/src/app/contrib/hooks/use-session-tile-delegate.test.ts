@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesModule from '@/hermes'
 import { setSessions } from '@/store/session'
-import { sessionTileDelegate } from '@/store/session-states'
+import { $sessionTiles, sessionTileDelegate } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
 import { useSessionTileDelegate } from './use-session-tile-delegate'
@@ -51,11 +51,13 @@ function renderTile(requestGateway: ReturnType<typeof vi.fn>) {
 describe('useSessionTileDelegate resumeTile', () => {
   beforeEach(() => {
     setSessions([])
+    $sessionTiles.set([])
     vi.mocked(getSessionMessages).mockClear()
   })
 
   afterEach(() => {
     setSessions([])
+    $sessionTiles.set([])
   })
 
   it('carries the owning profile into a cold tile resume so it cannot fork profiles', async () => {
@@ -64,6 +66,7 @@ describe('useSessionTileDelegate resumeTile', () => {
     // conversation into the wrong profile (#67603). The owning profile must ride
     // both the transcript prefetch and the resume RPC.
     setSessions([row({ id: 'stored-x', profile: 'ai-engineer' })])
+    $sessionTiles.set([{ storedSessionId: 'stored-x' }])
 
     const requestGateway = vi.fn(async (method: string) =>
       method === 'session.resume' ? ({ session_id: 'runtime-1' } as never) : ({} as never)
@@ -79,6 +82,7 @@ describe('useSessionTileDelegate resumeTile', () => {
       cols: 96,
       profile: 'ai-engineer'
     })
+    expect($sessionTiles.get()).toContainEqual({ profile: 'ai-engineer', storedSessionId: 'stored-x' })
   })
 
   it('resolves and carries a default-profile session explicitly', async () => {

@@ -15152,7 +15152,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "model", "pairing", "pets", "plugins", "portal", "profile",
         "project", "proxy",
         "prompt-size",
-        "send", "sessions", "setup",
+        "send", "sessions", "setup", "stt",
         "skin", "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
@@ -15825,6 +15825,13 @@ def main():
         return 0
 
     egress_parser.set_defaults(func=_dispatch_egress)
+
+    # =========================================================================
+    # stt recovery command — retry/export recordings retained after failure
+    # =========================================================================
+    from hermes_cli.stt_recovery_cli import register_cli as _register_stt_cli
+
+    _register_stt_cli(subparsers)
 
     # =========================================================================
     # migrate command

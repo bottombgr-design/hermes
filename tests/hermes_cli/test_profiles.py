@@ -265,6 +265,9 @@ class TestCreateProfile:
         (default_home / "gateway.pid").write_text("12345")
         (default_home / "gateway_state.json").write_text("{}")
         (default_home / "processes.json").write_text("[]")
+        recovery_audio = default_home / ".cache" / "stt-recovery" / ("a" * 32) / "audio.webm"
+        recovery_audio.parent.mkdir(parents=True)
+        recovery_audio.write_bytes(b"private voice")
 
         profile_dir = create_profile("coder", clone_all=True, no_alias=True)
 
@@ -275,6 +278,7 @@ class TestCreateProfile:
         assert not (profile_dir / "gateway.pid").exists()
         assert not (profile_dir / "gateway_state.json").exists()
         assert not (profile_dir / "processes.json").exists()
+        assert not (profile_dir / ".cache").exists()
 
     def test_clone_all_excludes_sibling_profiles_tree(self, profile_env):
         """--clone-all from default ~/.hermes must not copy profiles/* (nested explosion)."""
@@ -1173,6 +1177,21 @@ class TestExportImport:
         assert Path(result).exists()
         assert tarfile.is_tarfile(str(result))
 
+    def test_named_export_excludes_stt_recovery_cache(self, profile_env, tmp_path):
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        recovery_audio = profile_dir / ".cache" / "stt-recovery" / ("a" * 32) / "audio.webm"
+        recovery_audio.parent.mkdir(parents=True)
+        recovery_audio.write_bytes(b"private voice")
+
+        output = tmp_path / "export" / "coder.tar.gz"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        export_profile("coder", str(output))
+
+        with tarfile.open(str(output), "r:gz") as tf:
+            names = tf.getnames()
+        assert not any("stt-recovery" in name for name in names)
+
     def test_import_restores_from_archive(self, profile_env, tmp_path):
         # Create and export a profile
         create_profile("coder", no_alias=True)
@@ -1308,6 +1327,9 @@ class TestExportImport:
         mem_dir = default_dir / "memories"
         mem_dir.mkdir(exist_ok=True)
         (mem_dir / "MEMORY.md").write_text("remember this")
+        recovery_audio = default_dir / ".cache" / "stt-recovery" / ("b" * 32) / "audio.webm"
+        recovery_audio.parent.mkdir(parents=True)
+        recovery_audio.write_bytes(b"private voice")
 
         output = tmp_path / "export" / "default.tar.gz"
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1320,6 +1342,7 @@ class TestExportImport:
         assert "default/.env" not in names  # credentials excluded
         assert "default/SOUL.md" in names
         assert "default/memories/MEMORY.md" in names
+        assert not any("stt-recovery" in name for name in names)
 
     def test_export_default_excludes_infrastructure(self, profile_env, tmp_path):
         """Repo checkout, worktrees, profiles, databases are excluded."""
