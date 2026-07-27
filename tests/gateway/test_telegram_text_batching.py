@@ -148,6 +148,7 @@ class TestTextBatching:
         event = MessageEvent(
             text="hello from DM topic",
             message_type=MessageType.TEXT,
+            reply_to_message_id="10",
             source=SessionSource(
                 platform=Platform.TELEGRAM,
                 chat_id="12345",
