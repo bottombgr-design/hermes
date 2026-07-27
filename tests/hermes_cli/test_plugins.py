@@ -512,6 +512,19 @@ class TestPluginDiscovery:
 
         assert _get_extra_plugin_paths() == [external_root.resolve()]
 
+    def test_relative_extra_path_resolves_from_hermes_home(self, tmp_path, monkeypatch):
+        """Service launch cwd must not change config-relative plugin discovery."""
+        hermes_home = tmp_path / "hermes_test"
+        external_root = hermes_home / "private_plugins"
+        external_root.mkdir(parents=True)
+        unrelated_cwd = tmp_path / "service_cwd"
+        unrelated_cwd.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.chdir(unrelated_cwd)
+        _write_plugins_config(hermes_home, extra_paths=["private_plugins"])
+
+        assert _get_extra_plugin_paths() == [external_root.resolve()]
+
     def test_unresolvable_extra_path_does_not_hide_later_valid_path(
         self, tmp_path, monkeypatch, caplog
     ):
@@ -630,6 +643,29 @@ class TestPluginDiscovery:
         assert loaded.enabled is True
         assert "external-shared" in mgr._plugin_commands
         assert "bundled-shared" not in mgr._plugin_commands
+
+    def test_enabled_external_key_collision_warns_with_both_sources(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """An ordered override must not silently hide an external checkout."""
+        hermes_home = tmp_path / "hermes_test"
+        first_root = tmp_path / "first_plugins"
+        second_root = tmp_path / "second_plugins"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        _make_plugin_dir(first_root, "shared-plugin", auto_enable=False)
+        _make_plugin_dir(second_root, "shared-plugin", auto_enable=False)
+        _write_plugins_config(
+            hermes_home,
+            enabled=["shared-plugin"],
+            extra_paths=[str(first_root), str(second_root)],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            PluginManager().discover_and_load()
+
+        assert "multiple enabled plugin sources provide key 'shared-plugin'" in caplog.text
+        assert str(first_root / "shared-plugin") in caplog.text
+        assert str(second_root / "shared-plugin") in caplog.text
 
     def test_discover_is_idempotent(self, tmp_path, monkeypatch):
         """Calling discover_and_load() twice does not duplicate plugins."""
