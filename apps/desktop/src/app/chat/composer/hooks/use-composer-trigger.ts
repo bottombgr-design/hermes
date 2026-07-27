@@ -6,7 +6,6 @@ import { desktopSlashCommandTakesArgs } from '@/lib/desktop-slash-commands'
 
 import {
   COMPLETION_ACTIONS,
-  isSkillItem,
   slashArgStage,
   slashChipKindForItem,
   slashCommandToken
@@ -18,10 +17,10 @@ import {
   renderComposerContents,
   slashChipElement
 } from '../rich-editor'
-import { detectTrigger, textBeforeCaret, type TriggerState } from '../text-utils'
+import { composerContextBeforeCaret, detectTrigger, type TriggerState } from '../text-utils'
 
 interface CompletionSource {
-  adapter: Unstable_TriggerAdapter | null
+  adapter: (Unstable_TriggerAdapter & { reset?: () => void }) | null
   loading: boolean
 }
 
@@ -63,6 +62,15 @@ export function useComposerTrigger({
   // re-rendered and the handler closure sees the post-keydown state.
   const triggerKeyConsumedRef = useRef(false)
 
+  const resetCompletionSource = useCallback(
+    (kind: TriggerState['kind']) => {
+      const source = kind === '@' ? at : slash
+
+      source.adapter?.reset?.()
+    },
+    [at, slash]
+  )
+
   const refreshTrigger = useCallback(() => {
     const editor = editorRef.current
 
@@ -79,6 +87,7 @@ export function useComposerTrigger({
 
     if (!rawText.includes('@') && !rawText.includes('/')) {
       if (trigger) {
+        resetCompletionSource(trigger.kind)
         setTrigger(null)
         setTriggerActive(0)
       }
@@ -86,8 +95,12 @@ export function useComposerTrigger({
       return
     }
 
-    const before = textBeforeCaret(editor)
-    const found = detectTrigger(before ?? composerPlainText(editor))
+    const caretContext = composerContextBeforeCaret(editor)
+
+    const found = detectTrigger(
+      caretContext?.text ?? composerPlainText(editor),
+      caretContext?.hasReferenceChip ?? false
+    )
 
     // The arg-stage popover is only useful for commands with an options screen.
     // For a no-arg command it would dead-end on "No matches", so drop it — the
@@ -96,6 +109,10 @@ export function useComposerTrigger({
       found?.kind === '/' && slashArgStage(found.query) && !desktopSlashCommandTakesArgs(slashCommandToken(found.query))
         ? null
         : found
+
+    if (trigger?.kind && trigger.kind !== detected?.kind) {
+      resetCompletionSource(trigger.kind)
+    }
 
     setTrigger(detected)
 
@@ -106,7 +123,7 @@ export function useComposerTrigger({
     if (detected?.kind !== trigger?.kind || detected?.query !== trigger?.query) {
       setTriggerActive(0)
     }
-  }, [editorRef, trigger])
+  }, [editorRef, resetCompletionSource, trigger])
 
   const triggerAdapter: Unstable_TriggerAdapter | null =
     trigger?.kind === '@' ? at.adapter : trigger?.kind === '/' ? slash.adapter : null
@@ -120,11 +137,10 @@ export function useComposerTrigger({
 
     const items = triggerAdapter.search(trigger.query)
 
-    // Mid-message only offers SKILLS. A built-in like `/model` or `/new` acts
-    // on the app, so it's meaningless as a reference inside prose — only a
-    // skill reads as "handle this part with X". Filtering here rather than in
-    // the fetcher keeps one completion source for both shapes.
-    setTriggerItems(trigger.inline ? items.filter(isSkillItem) : items)
+    // A valid slash boundary exposes the same searchable catalog everywhere.
+    // Command execution remains guarded by the submit path; this layer only
+    // owns discovery and insertion at the caret.
+    setTriggerItems(items)
   }, [trigger, triggerAdapter])
 
   const triggerLoading = trigger?.kind === '@' ? at.loading : trigger?.kind === '/' ? slash.loading : false
@@ -135,6 +151,10 @@ export function useComposerTrigger({
   const argStageEmpty = trigger?.kind === '/' && slashArgStage(trigger.query) && !triggerLoading && !triggerItems.length
 
   const closeTrigger = () => {
+    if (trigger) {
+      resetCompletionSource(trigger.kind)
+    }
+
     setTrigger(null)
     setTriggerItems([])
     setTriggerActive(0)

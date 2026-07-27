@@ -1,5 +1,7 @@
 import { DATA_IMAGE_URL_RE, dataUrlToBlob } from '@/lib/embedded-images'
 
+import { composerPlainText } from './rich-editor'
+
 export interface TriggerState {
   /** True for a `/` typed mid-message — an inline skill/command reference in
    *  prose rather than a command invocation. Arg completion doesn't apply. */
@@ -103,8 +105,13 @@ export function extractClipboardImageBlobs(clipboard: DataTransfer): Blob[] {
   return blobs
 }
 
-/** Caret-anchored text before the cursor, or null if the selection isn't a collapsed caret inside `editor`. */
-export function textBeforeCaret(editor: HTMLDivElement): string | null {
+export interface ComposerCaretContext {
+  hasReferenceChip: boolean
+  text: string
+}
+
+/** Chip-aware composer context before the caret. */
+export function composerContextBeforeCaret(editor: HTMLDivElement): ComposerCaretContext | null {
   const sel = window.getSelection()
   const range = sel?.rangeCount ? sel.getRangeAt(0) : null
 
@@ -116,10 +123,38 @@ export function textBeforeCaret(editor: HTMLDivElement): string | null {
   before.selectNodeContents(editor)
   before.setEnd(range.startContainer, range.startOffset)
 
-  return before.toString()
+  // Range.toString() only sees rendered descendant text. It can omit or
+  // reshape contenteditable=false chips, whose submitted value lives in
+  // data-ref-text. Serialize the cloned range through the same chip-aware
+  // path as the rest of the composer so a trigger immediately after a chip
+  // observes the real preceding whitespace and slash token.
+  const contents = before.cloneContents()
+
+  return {
+    hasReferenceChip: contents.querySelector('[data-ref-text]') !== null,
+    text: composerPlainText(contents)
+  }
 }
 
-export function detectTrigger(textBefore: string): TriggerState | null {
+/** Caret-anchored text before the cursor, or null if there is no valid caret. */
+export function textBeforeCaret(editor: HTMLDivElement): string | null {
+  return composerContextBeforeCaret(editor)?.text ?? null
+}
+
+export function detectTrigger(textBefore: string, preferInline = false): TriggerState | null {
+  // A serialized chip followed by `/` looks like a command plus an argument.
+  // Preserve the DOM distinction: after a committed chip, the trailing slash
+  // starts another inline reference.
+  if (preferInline) {
+    const inline = SLASH_INLINE_TRIGGER_RE.exec(textBefore)
+
+    if (inline) {
+      const query = inline[2] ?? ''
+
+      return { inline: true, kind: '/', query, tokenLength: 1 + query.length }
+    }
+  }
+
   const command = SLASH_COMMAND_TRIGGER_RE.exec(textBefore)
 
   if (command) {

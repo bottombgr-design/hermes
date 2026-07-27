@@ -49,6 +49,8 @@ describe('detectTrigger', () => {
     expect(detectTrigger('check src/foo/bar')).toBeNull()
     expect(detectTrigger('look at /usr/local/bin')).toBeNull()
     expect(detectTrigger('and/or')).toBeNull()
+    expect(detectTrigger('wo/rd')).toBeNull()
+    expect(detectTrigger('https://example.com/path')).toBeNull()
   })
 
   it('treats a mid-message slash as an inline reference', () => {

@@ -302,6 +302,10 @@ export function composerPlainText(node: Node): string {
     return node.textContent || ''
   }
 
+  if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+    return Array.from(node.childNodes).map(composerPlainText).join('')
+  }
+
   if (node.nodeType !== Node.ELEMENT_NODE) {
     return ''
   }

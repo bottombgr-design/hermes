@@ -29,7 +29,8 @@ function Harness({
   onSubmit,
   onQueue,
   onCancel,
-  onDrain
+  onDrain,
+  onResetTrigger = () => undefined
 }: {
   busy?: boolean
   disabled?: boolean
@@ -38,6 +39,7 @@ function Harness({
   onQueue: (text: string) => void
   onCancel: () => void
   onDrain: () => void
+  onResetTrigger?: () => void
 }) {
   const editorRef = useRef<HTMLDivElement>(null)
   const draftRef = useRef('')
@@ -106,6 +108,7 @@ function Harness({
         return
       }
 
+      onResetTrigger()
       submitDraft()
     }
   }
@@ -127,6 +130,31 @@ function Harness({
 }
 
 describe('composer Enter submit — live DOM vs stale composer state (#39630)', () => {
+  it('resets live completions before an exact slash directive submits', async () => {
+    const onResetTrigger = vi.fn()
+    const onSubmit = vi.fn()
+
+    const { getByTestId } = render(
+      <Harness
+        onCancel={vi.fn()}
+        onDrain={vi.fn()}
+        onQueue={vi.fn()}
+        onResetTrigger={onResetTrigger}
+        onSubmit={onSubmit}
+      />
+    )
+
+    const editor = getByTestId('editor')
+
+    await act(async () => {
+      editor.textContent = '/new'
+      fireEvent.keyDown(editor, { key: 'Enter' })
+    })
+
+    expect(onResetTrigger).toHaveBeenCalledTimes(1)
+    expect(onSubmit).toHaveBeenCalledWith('/new')
+  })
+
   it('sends the just-typed text on Enter even when composer state has not synced', async () => {
     const onSubmit = vi.fn()
 

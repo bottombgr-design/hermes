@@ -4,6 +4,7 @@ import { createRef } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { composerPlainText, renderComposerContents, RICH_INPUT_SLOT } from '../rich-editor'
+import { textBeforeCaret } from '../text-utils'
 
 import { useComposerTrigger } from './use-composer-trigger'
 
@@ -83,14 +84,60 @@ describe('useComposerTrigger — slash anywhere in the prompt', () => {
     expect(composerPlainText(editor)).toBe('please run /clean ')
   })
 
-  it('offers only skills mid-message, not app commands', () => {
-    // `/model` and `/new` act on the app — meaningless as a reference in prose.
+  it('reopens immediately after inserting a slash chip', () => {
+    const editor = mountEditor('/austin-code')
+    const choices = [item('/austin-code'), item('/auto-skill-router')]
+    const { hook } = mountTrigger(editor, choices)
+
+    act(() => hook.result.current.refreshTrigger())
+    act(() => hook.result.current.replaceTriggerWithChip(choices[0]))
+
+    const tail = editor.lastChild
+    expect(tail?.nodeType).toBe(Node.TEXT_NODE)
+    tail!.textContent = ' /'
+
+    const range = document.createRange()
+    range.setStart(tail!, 2)
+    range.collapse(true)
+    const selection = window.getSelection()!
+    selection.removeAllRanges()
+    selection.addRange(range)
+
+    expect(textBeforeCaret(editor)).toBe('/austin-code /')
+    act(() => hook.result.current.refreshTrigger())
+
+    expect(hook.result.current.trigger).toMatchObject({ kind: '/', inline: true, query: '' })
+    expect(hook.result.current.triggerItems.map(i => i.label)).toContain('auto-skill-router')
+  })
+
+  it('offers the full catalog at an inline token boundary', () => {
     const editor = mountEditor('please run /')
     const { hook } = mountTrigger(editor, [item('/clean'), item('/model', 'Commands'), item('/new', 'Commands')])
 
     act(() => hook.result.current.refreshTrigger())
 
-    expect(hook.result.current.triggerItems.map(i => i.label)).toEqual(['clean'])
+    expect(hook.result.current.triggerItems.map(i => i.label)).toEqual(['clean', 'model', 'new'])
+  })
+
+  it('opens at a valid boundary when the caret is in the middle of the composer', () => {
+    const editor = mountEditor('before / after')
+    const text = editor.firstChild!
+    const range = document.createRange()
+
+    range.setStart(text, 8)
+    range.collapse(true)
+
+    const selection = window.getSelection()!
+
+    selection.removeAllRanges()
+    selection.addRange(range)
+
+    const { hook } = mountTrigger(editor, [item('/auto-skill-router'), item('/new', 'Commands')])
+
+    act(() => hook.result.current.refreshTrigger())
+
+    expect(hook.result.current.trigger).toMatchObject({ kind: '/', inline: true, query: '' })
+    expect(hook.result.current.triggerItems.map(i => i.label)).toEqual(['auto-skill-router', 'new'])
   })
 
   it('still offers the full command set at the start of the prompt', () => {
