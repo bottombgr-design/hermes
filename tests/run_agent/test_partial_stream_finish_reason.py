@@ -592,3 +592,16 @@ class TestContentFilterStallActivatesFallback:
             "_try_activate_fallback — it should fall through to continuation."
         )
         assert result["completed"] is True
+
+
+def test_partial_stub_prompt_reasserts_tool_availability():
+    """Regression: after a mid-stream transport cut, the continuation prompt
+    must reassert that the model's tools are still available and tell it to
+    ignore any earlier text-only / no-tools claim. Without this, the model
+    sometimes refuses to call tools on continuation, stalling the task."""
+    prompt = _get_continuation_prompt(is_partial_stub=True, dropped_tools=None)
+    low = prompt.lower()
+    assert "still" in low and "available" in low
+    assert "text-only" in low or "compatibility" in low
+    # must NOT collapse to the plain output-length continuation
+    assert "truncated by the output" not in low
