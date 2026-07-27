@@ -425,6 +425,28 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
+    def test_skill_index_preamble_stays_compact_and_preserves_disclosure_contract(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+        preamble = result.split("<available_skills>", 1)[0]
+
+        assert "Skills (mandatory)" in preamble
+        assert "skill_view(name)" in preamble
+        assert "even partially" in preamble
+        assert "MUST load" in preamble
+        assert "before acting" in preamble
+        assert "even when basic tools" in preamble
+        assert "hermes-agent" in preamble
+        assert len(preamble) <= 900
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
