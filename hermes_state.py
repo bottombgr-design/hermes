@@ -1553,6 +1553,13 @@ _FTS_CJK_TRIGGERS = (
 # `hermes sessions optimize-storage` rebuilds it on a capable host.
 FTS_CJK_STALE_KEY = "fts_cjk_stale"
 
+# Durable breadcrumb for a base/trigram FTS index that was detached from the
+# canonical messages table after runtime corruption.  While present, startup
+# must rebuild the complete index before reinstalling sync triggers: rows may
+# have been written while those triggers were absent, so merely recreating
+# them would preserve an unknown index gap.
+FTS_STALE_KEY = "fts_stale"
+
 
 def fts5_cjk_so_path() -> Path:
     """Location of the cjk_unicode61 loadable extension."""
@@ -1916,6 +1923,7 @@ class SessionDB:
         # unrecoverable database can't put writers into a rebuild loop.
         self._fts_runtime_rebuild_attempted = False
         self._fts_enabled = False
+        self._fts_stale = False
         self._trigram_available = False
         # CJK-bigram index (cjk_unicode61 loadable tokenizer). _fts_cjk_loaded:
         # extension present on the writer connection; _fts_cjk_available: the
@@ -2269,6 +2277,15 @@ class SessionDB:
                 pass
 
     @staticmethod
+    def _drop_all_fts_triggers(cursor: sqlite3.Cursor) -> None:
+        SessionDB._drop_fts_triggers(cursor)
+        for trigger in _FTS_CJK_TRIGGERS:
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+
+    @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
         placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
         row = cursor.execute(
@@ -2379,6 +2396,99 @@ class SessionDB:
                 self._warn_fts5_unavailable(exc)
             return False
 
+    def _recover_stale_fts(self, cursor: sqlite3.Cursor, *, legacy: bool) -> bool:
+        """Atomically rebuild stale base/trigram indexes and resume syncing."""
+        try:
+            trigram_status = self._fts_table_probe(cursor, "messages_fts_trigram")
+        except sqlite3.DatabaseError:
+            # A corrupt vtable may fail even a LIMIT 0 probe. It still needs
+            # to be included in the drop-and-recreate recovery below.
+            trigram_status = True
+        include_trigram = trigram_status is True
+
+        drop_sql = "".join(
+            f"DROP TRIGGER IF EXISTS {trigger};" for trigger in _FTS_TRIGGERS
+        )
+        if include_trigram:
+            drop_sql += "DROP TABLE IF EXISTS messages_fts_trigram;"
+        drop_sql += "DROP VIEW IF EXISTS messages_fts_trigram_src;"
+        drop_sql += "DROP TABLE IF EXISTS messages_fts;"
+
+        if legacy:
+            schema_sql = LEGACY_FTS_SQL
+            if include_trigram:
+                schema_sql += LEGACY_FTS_TRIGRAM_SQL
+            rebuild_sql = schema_sql + """
+                INSERT INTO messages_fts(rowid, content)
+                SELECT id,
+                       COALESCE(content, '') || ' ' ||
+                       COALESCE(tool_name, '') || ' ' ||
+                       COALESCE(tool_calls, '')
+                FROM messages;
+            """
+            if include_trigram:
+                rebuild_sql += """
+                    DELETE FROM messages_fts_trigram;
+                    INSERT INTO messages_fts_trigram(rowid, content)
+                    SELECT id,
+                           COALESCE(content, '') || ' ' ||
+                           COALESCE(tool_name, '') || ' ' ||
+                           COALESCE(tool_calls, '')
+                    FROM messages;
+                """
+        else:
+            schema_sql = FTS_SQL
+            if include_trigram:
+                schema_sql += FTS_TRIGRAM_SQL
+            rebuild_sql = schema_sql + (
+                "INSERT INTO messages_fts(messages_fts) VALUES('rebuild');"
+            )
+            if include_trigram:
+                rebuild_sql += (
+                    "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                    "VALUES('rebuild');"
+                )
+            rebuild_sql += (
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_rebuild_high_water', 'fts_rebuild_progress');"
+            )
+
+        # One write transaction closes the only dangerous gap: no canonical
+        # writer can slip between the full rebuild and trigger restoration.
+        recovery_sql = (
+            "BEGIN IMMEDIATE;"
+            + drop_sql
+            + rebuild_sql
+            + f"DELETE FROM state_meta WHERE key = '{FTS_STALE_KEY}';"
+            + "COMMIT;"
+        )
+        try:
+            cursor.executescript(recovery_sql)
+        except sqlite3.DatabaseError as exc:
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+            # Defensive cleanup for SQLite builds whose DDL transaction
+            # behavior differs: stale indexes must remain detached.
+            self._drop_fts_triggers(cursor)
+            self._conn.commit()
+            logger.error(
+                "Automatic rebuild of stale FTS indexes failed (%s); "
+                "canonical writes remain enabled with FTS detached.",
+                exc,
+            )
+            return False
+
+        self._fts_stale = False
+        self._fts_enabled = True
+        self._trigram_available = include_trigram
+        logger.warning(
+            "Rebuilt stale state.db FTS indexes from canonical messages and "
+            "restored sync triggers."
+        )
+        return True
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
@@ -2434,16 +2544,18 @@ class SessionDB:
             except sqlite3.DatabaseError as exc:
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
-                # while the canonical messages table is intact. The gateway
-                # session store has its own retry queue for transcript
-                # appends (#65637 salvage), but cron and CLI writers call
-                # SessionDB directly — without this, their writes hard-fail
-                # until the next process restart triggers the offline repair.
-                # Rebuild the FTS index in place (once per instance) via
-                # rebuild_fts() and retry the failed write immediately.
-                if not self._try_runtime_fts_rebuild(exc):
-                    raise
-                continue
+                # while the canonical messages table is intact. Recover here,
+                # at the shared persistence boundary, so gateway, cron, CLI,
+                # desktop, and every other caller get the same guarantee.
+                # First try the cheap in-place repair.  If that one-shot path
+                # is unavailable or corruption recurs, detach the derived FTS
+                # indexes and retry against the canonical tables.  Transcript
+                # persistence must not depend on a healthy search index.
+                if self._try_runtime_fts_rebuild(exc):
+                    continue
+                if self._enter_fts_fail_open(exc):
+                    continue
+                raise
         # Retries exhausted (shouldn't normally reach here).
         raise last_err or sqlite3.OperationalError(
             "database is locked after max retries"
@@ -2511,6 +2623,63 @@ class SessionDB:
         logger.warning(
             "state.db FTS indexes rebuilt in place (%d); retrying the failed write.",
             rebuilt,
+        )
+        return True
+
+    def _enter_fts_fail_open(self, exc: sqlite3.DatabaseError) -> bool:
+        """Detach corrupt FTS indexes so canonical writes can continue.
+
+        The stale breadcrumb and trigger removal commit atomically.  Its
+        ordering is load-bearing: after triggers are absent, new canonical
+        rows create an index gap of unknown extent, so another process must
+        never reinstall the triggers without first rebuilding every row.
+        """
+        if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
+            return False
+
+        try:
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._conn.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (FTS_STALE_KEY,),
+                    )
+                    cjk_triggers_present = self._conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
+                        "LIMIT 1",
+                        _FTS_CJK_TRIGGERS,
+                    ).fetchone()
+                    if cjk_triggers_present:
+                        self._conn.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (FTS_CJK_STALE_KEY,),
+                        )
+                    self._drop_all_fts_triggers(self._conn.cursor())
+                    self._conn.commit()
+                except BaseException:
+                    self._conn.rollback()
+                    raise
+        except sqlite3.Error as detach_exc:
+            logger.error(
+                "Could not detach corrupt FTS indexes; canonical write still "
+                "cannot proceed: %s",
+                detach_exc,
+            )
+            return False
+
+        self._fts_stale = True
+        self._fts_enabled = False
+        self._trigram_available = False
+        self._fts_cjk_available = False
+        logger.error(
+            "state.db FTS indexes remain corrupt (%s); disabled FTS sync and "
+            "retrying the canonical write. Search temporarily uses LIKE until "
+            "a later SessionDB open rebuilds the indexes.",
+            exc,
         )
         return True
 
@@ -3313,6 +3482,14 @@ class SessionDB:
 
         fts5_available = self._sqlite_supports_fts5(cursor)
         fts_migrations_complete = True
+        self._fts_stale = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+            (FTS_STALE_KEY,),
+        ).fetchone() is not None
+        if self._fts_stale:
+            # A prior process deliberately detached FTS after corruption.
+            # Keep every FTS writer detached until a full rebuild succeeds.
+            self._drop_all_fts_triggers(cursor)
         if not fts5_available:
             # Existing FTS triggers can still fire on messages INSERT/UPDATE
             # even though the current sqlite runtime cannot read the virtual
@@ -3644,7 +3821,18 @@ class SessionDB:
             # its inline triggers exist (via the legacy DDL), and skip the
             # v23 view/external tables entirely. Fresh installs and opted-in
             # DBs have no legacy inline FTS, so they get the v23 DDL.
-            if self._db_has_legacy_inline_fts(cursor):
+            legacy_fts = self._db_has_legacy_inline_fts(cursor)
+            if self._fts_stale:
+                if self._recover_stale_fts(cursor, legacy=legacy_fts):
+                    # CJK was detached alongside the corrupt base indexes and
+                    # carries its own stale marker. Its existing ensure path
+                    # will keep it offline until its dedicated rebuild.
+                    self._ensure_fts_cjk_schema(cursor)
+                else:
+                    self._fts_enabled = False
+                    self._trigram_available = False
+                    self._fts_cjk_available = False
+            elif legacy_fts:
                 triggers_need_repair = (
                     self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
                 )
@@ -7975,6 +8163,8 @@ class SessionDB:
     def _describe_search_path(self, query: str) -> str:
         """Best-effort name of the routing path a query takes (log-only)."""
         try:
+            if self._fts_stale:
+                return "like_scan_fts_stale"
             sanitized = self._sanitize_fts5_query(query or "")
             if not sanitized:
                 return "empty"
@@ -7993,6 +8183,154 @@ class SessionDB:
             return "like_scan"
         except Exception:
             return "unknown"
+
+    def _search_messages_like_fallback(
+        self,
+        query: str,
+        *,
+        source_filter: Optional[List[str]],
+        exclude_sources: Optional[List[str]],
+        role_filter: Optional[List[str]],
+        limit: int,
+        offset: int,
+        sort: Optional[str],
+        include_inactive: bool,
+    ) -> List[Dict[str, Any]]:
+        """Search canonical messages while derived FTS state is stale."""
+        raw_tokens = re.findall(r'"[^"]+"|\S+', query)
+        terms = [
+            token.strip('"').strip("*").strip()
+            for token in raw_tokens
+            if token.upper() not in {"AND", "OR", "NOT", "NEAR"}
+        ]
+        terms = [term for term in terms if term]
+        if not terms:
+            return []
+
+        term_clauses = []
+        params: List[Any] = []
+        for term in terms:
+            escaped = (
+                term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            term_clauses.append(
+                "(m.content LIKE ? ESCAPE '\\' OR "
+                "m.tool_name LIKE ? ESCAPE '\\' OR "
+                "m.tool_calls LIKE ? ESCAPE '\\')"
+            )
+            params.extend([f"%{escaped}%"] * 3)
+        joiner = " OR " if any(t.upper() == "OR" for t in raw_tokens) else " AND "
+        where = [f"({joiner.join(term_clauses)})"]
+        if not include_inactive:
+            where.append("(m.active = 1 OR m.compacted = 1)")
+        if source_filter is not None:
+            where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+            params.extend(source_filter)
+        if exclude_sources is not None:
+            where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+            params.extend(exclude_sources)
+        if role_filter:
+            where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+            params.extend(role_filter)
+
+        order = "ASC" if isinstance(sort, str) and sort.lower() == "oldest" else "DESC"
+        sql = f"""
+            SELECT m.id, m.session_id, m.role,
+                   substr(m.content, max(1, instr(m.content, ?) - 40), 120) AS snippet,
+                   m.content, m.timestamp, m.tool_name,
+                   s.source, s.model, s.started_at AS session_started
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {' AND '.join(where)}
+            ORDER BY m.timestamp {order}, m.id {order}
+            LIMIT ? OFFSET ?
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                sql, [terms[0], *params, limit, offset]
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _refresh_fts_stale_state(self) -> None:
+        """Observe fail-open initiated by another process sharing state.db."""
+        if self._fts_stale or not self._fts_enabled:
+            return
+        try:
+            with self._lock:
+                stale = self._conn.execute(
+                    "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                    (FTS_STALE_KEY,),
+                ).fetchone()
+        except sqlite3.Error:
+            return
+        if stale is not None:
+            self._fts_stale = True
+            self._fts_enabled = False
+            self._trigram_available = False
+            self._fts_cjk_available = False
+
+    def _finalize_search_matches(
+        self, matches: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Attach neighboring messages and trim full content from results."""
+        for match in matches:
+            try:
+                with self._lock:
+                    ctx_cursor = self._conn.execute(
+                        """WITH target AS (
+                               SELECT session_id, timestamp, id
+                               FROM messages
+                               WHERE id = ?
+                           )
+                           SELECT role, content
+                           FROM (
+                               SELECT m.id, m.timestamp, m.role, m.content
+                               FROM messages m
+                               JOIN target t ON t.session_id = m.session_id
+                               WHERE (m.timestamp < t.timestamp)
+                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
+                               ORDER BY m.timestamp DESC, m.id DESC
+                               LIMIT 1
+                           )
+                           UNION ALL
+                           SELECT role, content
+                           FROM messages
+                           WHERE id = ?
+                           UNION ALL
+                           SELECT role, content
+                           FROM (
+                               SELECT m.id, m.timestamp, m.role, m.content
+                               FROM messages m
+                               JOIN target t ON t.session_id = m.session_id
+                               WHERE (m.timestamp > t.timestamp)
+                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
+                               ORDER BY m.timestamp ASC, m.id ASC
+                               LIMIT 1
+                           )""",
+                        (match["id"], match["id"]),
+                    )
+                    context_msgs = []
+                    for row in ctx_cursor.fetchall():
+                        decoded = self._decode_content(row["content"])
+                        if isinstance(decoded, list):
+                            text_parts = [
+                                part.get("text", "") for part in decoded
+                                if isinstance(part, dict) and part.get("type") == "text"
+                            ]
+                            text = " ".join(t for t in text_parts if t).strip()
+                            preview = text or "[multimodal content]"
+                        elif isinstance(decoded, str):
+                            preview = decoded
+                        else:
+                            preview = ""
+                        context_msgs.append(
+                            {"role": row["role"], "content": preview[:200]}
+                        )
+                match["context"] = context_msgs
+            except Exception:
+                match["context"] = []
+            match.pop("content", None)
+        return matches
 
     def _search_messages_impl(
         self,
@@ -8033,6 +8371,23 @@ class SessionDB:
         pre-compaction transcript stays discoverable after in-place compaction
         (#38763). Pass ``include_inactive=True`` to search every row regardless.
         """
+        self._refresh_fts_stale_state()
+        if self._fts_stale:
+            if not query or not query.strip():
+                return []
+            return self._finalize_search_matches(
+                self._search_messages_like_fallback(
+                    query,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit,
+                    offset=offset,
+                    sort=sort,
+                    include_inactive=include_inactive,
+                )
+            )
+
         if not self._fts_enabled:
             return []
 
@@ -8481,73 +8836,7 @@ class SessionDB:
                 if tri_matches:
                     matches = tri_matches
 
-        # Add surrounding context (1 message before + after each match).
-        # Done outside the lock so we don't hold it across N sequential queries.
-        for match in matches:
-            try:
-                with self._lock:
-                    ctx_cursor = self._conn.execute(
-                        """WITH target AS (
-                               SELECT session_id, timestamp, id
-                               FROM messages
-                               WHERE id = ?
-                           )
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp < t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
-                               ORDER BY m.timestamp DESC, m.id DESC
-                               LIMIT 1
-                           )
-                           UNION ALL
-                           SELECT role, content
-                           FROM messages
-                           WHERE id = ?
-                           UNION ALL
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp > t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
-                               ORDER BY m.timestamp ASC, m.id ASC
-                               LIMIT 1
-                           )""",
-                        (match["id"], match["id"]),
-                    )
-                    context_msgs = []
-                    for r in ctx_cursor.fetchall():
-                        raw = r["content"]
-                        decoded = self._decode_content(raw)
-                        # Multimodal context: render a compact text-only
-                        # summary for search previews.
-                        if isinstance(decoded, list):
-                            text_parts = [
-                                p.get("text", "") for p in decoded
-                                if isinstance(p, dict) and p.get("type") == "text"
-                            ]
-                            text = " ".join(t for t in text_parts if t).strip()
-                            preview = text or "[multimodal content]"
-                        elif isinstance(decoded, str):
-                            preview = decoded
-                        else:
-                            preview = ""
-                        context_msgs.append(
-                            {"role": r["role"], "content": preview[:200]}
-                        )
-                match["context"] = context_msgs
-            except Exception:
-                match["context"] = []
-
-        # Remove full content from result (snippet is enough, saves tokens)
-        for match in matches:
-            match.pop("content", None)
-
-        return matches
+        return self._finalize_search_matches(matches)
 
     def _search_unindexed_gap(
         self,
