@@ -19,8 +19,8 @@
 import type { PickedElement, PickedRegion } from './element-picker'
 
 export type SessionEvent =
-  | { kind: 'element'; target: PickedElement; type: 'pick' }
-  | { kind: 'region'; target: PickedRegion; type: 'pick' }
+  | { clickX: number; clickY: number; kind: 'element'; target: PickedElement; type: 'pick' }
+  | { clickX: number; clickY: number; kind: 'region'; target: PickedRegion; type: 'pick' }
   | { type: 'badge-click'; id: string }
   | { type: 'cancel-request' }
   | { type: 'iframe-blocked' }
@@ -55,6 +55,11 @@ export function buildRemoveBadgeCall(id: string): string {
 
 export function buildTeardownCall(): string {
   return `window[${JSON.stringify(SESSION_GLOBAL_KEY)}] && window[${JSON.stringify(SESSION_GLOBAL_KEY)}].teardown()`
+}
+
+/** Flash a temporary highlight on a target rect and scroll it into view. */
+export function buildFlashCall(rect: { height: number; width: number; x: number; y: number }): string {
+  return `window[${JSON.stringify(SESSION_GLOBAL_KEY)}] && window[${JSON.stringify(SESSION_GLOBAL_KEY)}].flash(${Math.round(rect.x)}, ${Math.round(rect.y)}, ${Math.round(rect.width)}, ${Math.round(rect.height)})`
 }
 
 export function buildSessionProbeSource(bannerMessage: string): string {
@@ -286,6 +291,8 @@ export const SESSION_PROBE_SOURCE = `(function () {
       emit({
         type: 'pick',
         kind: 'region',
+        clickX: rect.x,
+        clickY: rect.y,
         target: {
           rect: rect,
           scrollX: window.scrollX,
@@ -338,7 +345,7 @@ export const SESSION_PROBE_SOURCE = `(function () {
     var descriptor = describe(el);
     pickingActive = false;
     hideHighlight();
-    emit({ type: 'pick', kind: 'element', target: descriptor });
+    emit({ type: 'pick', kind: 'element', clickX: event.clientX, clickY: event.clientY, target: descriptor });
   }
 
   // ---- badges ------------------------------------------------------------
@@ -405,10 +412,42 @@ export const SESSION_PROBE_SOURCE = `(function () {
     try { delete window[GLOBAL_KEY]; } catch (e) { window[GLOBAL_KEY] = undefined; }
   }
 
+  var flashTimer = null;
+  function flash(x, y, w, h) {
+    // Rect is viewport-relative — pin it to absolute page coordinates first,
+    // because the scroll below changes the viewport origin.
+    var absX = x + window.scrollX;
+    var absY = y + window.scrollY;
+    var targetTop = Math.max(0, absY - (window.innerHeight - h) / 2);
+    window.scrollTo({ top: targetTop, behavior: 'smooth' });
+
+    // Paint the flash after the scroll settles, so coordinates line up.
+    if (flashTimer) clearTimeout(flashTimer);
+    flashTimer = setTimeout(function () {
+      highlight.style.display = 'block';
+      highlight.style.top = (absY - window.scrollY) + 'px';
+      highlight.style.left = (absX - window.scrollX) + 'px';
+      highlight.style.width = w + 'px';
+      highlight.style.height = h + 'px';
+      // Blink: toggle visibility a few times then hide.
+      var blinks = 0;
+      var blinkTimer = setInterval(function () {
+        highlight.style.opacity = highlight.style.opacity === '0.2' ? '1' : '0.2';
+        blinks++;
+        if (blinks >= 5) {
+          clearInterval(blinkTimer);
+          highlight.style.display = 'none';
+          highlight.style.opacity = '1';
+        }
+      }, 220);
+    }, 350);
+  }
+
   window[GLOBAL_KEY] = {
     teardown: teardown,
     addBadge: addBadge,
     removeBadge: removeBadge,
+    flash: flash,
     setPicking: function (on) {
       pickingActive = !!on;
       if (!on) hideHighlight();

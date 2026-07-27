@@ -7,11 +7,25 @@ import { addComposerAttachment } from '@/store/composer'
 import { notify, notifyError } from '@/store/notifications'
 
 import { AnnotationPopover } from './annotation-popover'
-import { AnnotationToolbar } from './annotation-toolbar'
+import { AnnotationToolbar, type AnnotationListEntry } from './annotation-toolbar'
 import type { PickedElement, PickedRegion } from './element-picker'
+
+function isPickedElement(target: PickedElement | PickedRegion): target is PickedElement {
+  return 'selector' in target
+}
+
+function listSummary(item: AnnotationItem): string {
+  if (isPickedElement(item.target)) {
+    const text = item.target.text ? ` "${item.target.text}"` : ''
+    return `<${item.target.tagName.toLowerCase()}>${item.target.id ? ` #${item.target.id}` : ''}${text}`
+  }
+
+  return `${Math.round(item.target.rect.width)}×${Math.round(item.target.rect.height)}px 区域`
+}
 import { dataUrlToBytes } from './image-annotate'
 import {
   buildAddBadgeCall,
+  buildFlashCall,
   buildRemoveBadgeCall,
   buildSessionProbeSource,
   buildSetPickingCall,
@@ -36,6 +50,9 @@ interface AnnotationLayerProps {
 }
 
 export interface AnnotationItem {
+  /** Badge anchor — the actual click point (element) or region corner. */
+  anchorX: number
+  anchorY: number
   comment: string
   id: string
   kind: 'element' | 'region'
@@ -45,9 +62,19 @@ export interface AnnotationItem {
 }
 
 interface PendingPick {
+  anchorX: number
+  anchorY: number
   kind: 'element' | 'region'
   screenshot?: string
   target: PickedElement | PickedRegion
+}
+
+/** Keep badge anchors inside the viewport and clear of the top banner. */
+function clampAnchor(x: number, y: number): { x: number; y: number } {
+  return {
+    x: Math.max(24, Math.min(x, window.innerWidth - 24)),
+    y: Math.max(40, Math.min(y, window.innerHeight - 24))
+  }
 }
 
 let idCounter = 0
@@ -68,9 +95,11 @@ export function AnnotationLayer({ onExit, webview }: AnnotationLayerProps) {
   const [items, setItems] = useState<AnnotationItem[]>([])
   const [pending, setPending] = useState<PendingPick | null>(null)
   const itemsRef = useRef<AnnotationItem[]>([])
+  const pendingRef = useRef<PendingPick | null>(null)
   const exitedRef = useRef(false)
 
   itemsRef.current = items
+  pendingRef.current = pending
 
   const exit = useCallback(() => {
     if (exitedRef.current) {
@@ -158,18 +187,7 @@ export function AnnotationLayer({ onExit, webview }: AnnotationLayerProps) {
       }
 
       if (event.type === 'badge-click') {
-        setItems(prev => {
-          const next = prev.filter(item => item.id !== event.id)
-          // Renumber survivors and re-pin their badges.
-          const renumbered = next.map((item, index) => ({ ...item, number: index + 1 }))
-          for (const item of renumbered) {
-            void webview.executeJavaScript!(
-              buildAddBadgeCall(item.id, item.number, item.target.rect.x, item.target.rect.y)
-            ).catch(() => undefined)
-          }
-          return renumbered
-        })
-        void webview.executeJavaScript!(buildRemoveBadgeCall(event.id)).catch(() => undefined)
+        removeItemRef.current(event.id)
         return
       }
 
@@ -183,7 +201,8 @@ export function AnnotationLayer({ onExit, webview }: AnnotationLayerProps) {
           return
         }
 
-        setPending({ kind: event.kind, screenshot, target: event.target })
+        const anchor = clampAnchor(event.clickX, event.clickY)
+        setPending({ anchorX: anchor.x, anchorY: anchor.y, kind: event.kind, screenshot, target: event.target })
       })()
     }
 
@@ -217,14 +236,29 @@ export function AnnotationLayer({ onExit, webview }: AnnotationLayerProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [webview])
 
+  const removeItemRef = useRef<(itemId: string) => void>(() => undefined)
+  const locateItemRef = useRef<(item: AnnotationItem) => void>(() => undefined)
+
   const resumePicking = useCallback(() => {
     void webview?.executeJavaScript?.(buildSetPickingCall(true)).catch(() => undefined)
   }, [webview])
 
 
+  const pinBadge = useCallback(
+    (item: AnnotationItem) => {
+      void webview?.executeJavaScript?.(
+        buildAddBadgeCall(item.id, item.number, item.anchorX, item.anchorY)
+      ).catch(() => undefined)
+    },
+    [webview]
+  )
+
   const handleAdd = useCallback(
     (draft: { comment: string; kind: 'element' | 'region'; screenshotDataUrl?: string; target: PickedElement | PickedRegion }) => {
+      const anchor = pendingRef.current
       const item: AnnotationItem = {
+        anchorX: anchor?.anchorX ?? draft.target.rect.x,
+        anchorY: anchor?.anchorY ?? draft.target.rect.y,
         comment: draft.comment,
         id: nextId(),
         kind: draft.kind,
@@ -234,15 +268,40 @@ export function AnnotationLayer({ onExit, webview }: AnnotationLayerProps) {
       }
 
       setItems(prev => [...prev, item])
-      void webview?.executeJavaScript?.(
-        buildAddBadgeCall(item.id, item.number, item.target.rect.x, item.target.rect.y)
-      ).catch(() => undefined)
+      pinBadge(item)
 
       setPending(null)
       resumePicking()
     },
-    [resumePicking, webview]
+    [pinBadge, resumePicking]
   )
+
+  /** Remove one annotation and re-pin survivors with fresh numbers. */
+  const removeItem = useCallback(
+    (itemId: string) => {
+      const survivors = itemsRef.current
+        .filter(item => item.id !== itemId)
+        .map((item, index) => ({ ...item, number: index + 1 }))
+
+      setItems(survivors)
+      void webview?.executeJavaScript?.(buildRemoveBadgeCall(itemId)).catch(() => undefined)
+      for (const item of survivors) {
+        pinBadge(item)
+      }
+    },
+    [pinBadge, webview]
+  )
+
+  /** Scroll to an annotation's target and flash it. */
+  const locateItem = useCallback(
+    (item: AnnotationItem) => {
+      void webview?.executeJavaScript?.(buildFlashCall(item.target.rect)).catch(() => undefined)
+    },
+    [webview]
+  )
+
+  removeItemRef.current = removeItem
+  locateItemRef.current = locateItem
 
   const handleDiscard = useCallback(() => {
     setPending(null)
@@ -265,11 +324,27 @@ export function AnnotationLayer({ onExit, webview }: AnnotationLayerProps) {
         copy={{
           cancel: copy.cancelSession,
           finish: copy.finishSession,
+          locate: copy.locate,
+          remove: copy.remove,
           title: count => copy.sessionTitle(count)
         }}
-        count={items.length}
+        items={items.map(
+          (item): AnnotationListEntry => ({
+            commentPreview: item.comment.trim().slice(0, 40),
+            id: item.id,
+            number: item.number,
+            summary: listSummary(item)
+          })
+        )}
         onCancel={exit}
         onFinish={handleFinish}
+        onLocate={id => {
+          const item = itemsRef.current.find(entry => entry.id === id)
+          if (item) {
+            locateItem(item)
+          }
+        }}
+        onRemove={removeItem}
       />
 
       {pending && (

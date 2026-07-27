@@ -2359,7 +2359,9 @@ export const en: Translations = {
         noComment: '(no comment)',
         composeFailed: 'Could not compose the annotated image',
         imageSaveFailed: 'Failed to save the annotated image',
-        screenshotsAttached: (count: number) => `${count} screenshot(s) added as image attachments, named by number`
+        screenshotsAttached: (count: number) => `${count} screenshot(s) added as image attachments, named by number`,
+        locate: 'Locate on page',
+        remove: 'Remove this annotation'
       }
     }
   },

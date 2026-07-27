@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   buildAddBadgeCall,
+  buildFlashCall,
   buildRemoveBadgeCall,
   buildSessionProbeSource,
   buildSetPickingCall,
@@ -24,6 +25,7 @@ function runProbe(bannerMessage = 'Annotate mode'): boolean {
 
 function sessionApi(): {
   addBadge: (id: string, number: number, x: number, y: number) => void
+  flash: (x: number, y: number, w: number, h: number) => void
   removeBadge: (id: string) => void
   setPicking: (on: boolean) => void
   teardown: () => void
@@ -53,6 +55,7 @@ describe('annotation session probe', () => {
     expect(runProbe()).toBe(true)
     expect(sessionApi()).toBeDefined()
     expect(typeof sessionApi().teardown).toBe('function')
+    expect(typeof sessionApi().flash).toBe('function')
   })
 
   it('emits a pick event on click without tearing down', () => {
@@ -70,6 +73,8 @@ describe('annotation session probe', () => {
     expect(events[0].type).toBe('pick')
     if (events[0].type === 'pick') {
       expect(events[0].kind).toBe('element')
+      expect(typeof events[0].clickX).toBe('number')
+      expect(typeof events[0].clickY).toBe('number')
       if (events[0].kind === 'element') {
         expect(events[0].target.selector).toBe('#app > button.submit.primary')
       }
@@ -179,6 +184,7 @@ describe('host-side call builders', () => {
     expect(buildAddBadgeCall('ann-1', 3, 12, 34)).toContain('.addBadge("ann-1", 3, 12, 34)')
     expect(buildRemoveBadgeCall('ann-1')).toContain('.removeBadge("ann-1")')
     expect(buildTeardownCall()).toContain('.teardown()')
+    expect(buildFlashCall({ height: 50, width: 100, x: 12, y: 34 })).toContain('.flash(12, 34, 100, 50)')
   })
 })
 

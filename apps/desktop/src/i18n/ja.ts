@@ -2284,7 +2284,9 @@ export const ja = defineLocale({
         noComment: '（コメントなし）',
         composeFailed: '注釈画像を合成できませんでした',
         imageSaveFailed: '注釈画像の保存に失敗しました',
-        screenshotsAttached: (count: number) => `${count} 枚のスクリーンショットを番号付きの画像添付として追加しました`
+        screenshotsAttached: (count: number) => `${count} 枚のスクリーンショットを番号付きの画像添付として追加しました`,
+        locate: 'ページ内の位置を表示',
+        remove: 'この注釈を削除'
       }
     }
   },

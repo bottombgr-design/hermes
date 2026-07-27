@@ -1986,6 +1986,8 @@ export interface Translations {
         composeFailed: string
         imageSaveFailed: string
         screenshotsAttached: (count: number) => string
+        locate: string
+        remove: string
       }
     }
   }

@@ -2527,7 +2527,9 @@ export const zh: Translations = {
         noComment: '（未填写说明）',
         composeFailed: '无法合成标注图片',
         imageSaveFailed: '标注图片保存失败',
-        screenshotsAttached: (count: number) => `${count} 张截图已按编号添加为图片附件`
+        screenshotsAttached: (count: number) => `${count} 张截图已按编号添加为图片附件`,
+        locate: '定位到页面位置',
+        remove: '删除此标注'
       }
     }
   },

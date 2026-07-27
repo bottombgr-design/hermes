@@ -2216,7 +2216,9 @@ export const zhHant = defineLocale({
         noComment: '（未填寫說明）',
         composeFailed: '無法合成標註圖片',
         imageSaveFailed: '標註圖片儲存失敗',
-        screenshotsAttached: (count: number) => `${count} 張截圖已按編號新增為圖片附件`
+        screenshotsAttached: (count: number) => `${count} 張截圖已按編號新增為圖片附件`,
+        locate: '定位到頁面位置',
+        remove: '刪除此標註'
       }
     }
   },
