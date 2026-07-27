@@ -4546,6 +4546,14 @@ def _resolve_single_provider(
     )
     return client
 
+
+def _mark_client_route_provider(client: Any, provider: str) -> Any:
+    """Remember the concrete provider selected behind an ``auto`` route."""
+    if client is not None:
+        object.__setattr__(client, "_hermes_route_provider", _route_provider_name(provider))
+    return client
+
+
 def _resolve_auto(
     main_runtime: Optional[Dict[str, Any]] = None,
     task: Optional[str] = None,
@@ -4687,6 +4695,7 @@ def _resolve_auto(
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                             main_provider, resolved or main_model)
+                _mark_client_route_provider(client, main_provider)
                 return client, resolved or main_model
 
     # ── Step 2: user-configured fallback policy ─────────────────────────
@@ -4698,10 +4707,12 @@ def _resolve_auto(
         fb_client, fb_model, _fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
         if fb_client is not None:
+            _mark_client_route_provider(fb_client, _fb_label)
             return fb_client, fb_model
     fb_client, fb_model, _fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable")
     if fb_client is not None:
+        _mark_client_route_provider(fb_client, _fb_label)
         return fb_client, fb_model
 
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
@@ -4718,6 +4729,7 @@ def _resolve_auto(
                             label, model or "default", ", ".join(tried))
             else:
                 logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
+            _mark_client_route_provider(client, label)
             return client, model
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
@@ -4748,23 +4760,29 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     """
     from openai import AsyncOpenAI
 
+    def converted(client):
+        route_provider = getattr(sync_client, "_hermes_route_provider", None)
+        if route_provider:
+            object.__setattr__(client, "_hermes_route_provider", route_provider)
+        return client, model
+
     if isinstance(sync_client, CodexAuxiliaryClient):
-        return AsyncCodexAuxiliaryClient(sync_client), model
+        return converted(AsyncCodexAuxiliaryClient(sync_client))
     if isinstance(sync_client, AnthropicAuxiliaryClient):
-        return AsyncAnthropicAuxiliaryClient(sync_client), model
+        return converted(AsyncAnthropicAuxiliaryClient(sync_client))
     if isinstance(sync_client, BedrockAuxiliaryClient):
-        return AsyncBedrockAuxiliaryClient(sync_client), model
+        return converted(AsyncBedrockAuxiliaryClient(sync_client))
     try:
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
 
         if isinstance(sync_client, GeminiNativeClient):
-            return AsyncGeminiNativeClient(sync_client), model
+            return converted(AsyncGeminiNativeClient(sync_client))
     except ImportError:
         pass
     try:
         from agent.copilot_acp_client import CopilotACPClient
         if isinstance(sync_client, CopilotACPClient):
-            return sync_client, model
+            return converted(sync_client)
     except ImportError:
         pass
 
@@ -4809,7 +4827,7 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     # See _create_openai_client: disable SDK-internal retries so Hermes owns
     # the auxiliary retry/timeout budget (issue #54465).
     async_kwargs.setdefault("max_retries", 0)
-    return AsyncOpenAI(**async_kwargs), model
+    return converted(AsyncOpenAI(**async_kwargs))
 
 
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
@@ -7516,6 +7534,24 @@ async def _acreate_with_stream(
     )
 
 
+def _route_provider_name(label: str) -> str:
+    """Extract a provider from a fallback candidate's diagnostic label."""
+    match = re.match(
+        r"(?:fallback_chain\[\d+\]|fallback_providers\[\d+\]|main-agent)\((.+)\)$",
+        label,
+    )
+    return match.group(1) if match else label
+
+
+def _record_route_info(
+    route_info: Optional[Dict[str, str]], provider: Optional[str], model: Optional[str]
+) -> None:
+    """Record the route selected for a call without a second config lookup."""
+    if route_info is not None:
+        route_info["provider"] = provider or "auto"
+        route_info["model"] = model or "default"
+
+
 def call_llm(
     task: str = None,
     *,
@@ -7535,6 +7571,7 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -7620,6 +7657,7 @@ def call_llm(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            task=task,
         )
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
@@ -7656,6 +7694,12 @@ def call_llm(
                 f"Run: hermes setup")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
+    _record_route_info(
+        route_info,
+        getattr(client, "_hermes_route_provider", None)
+        or _route_provider_name(resolved_provider),
+        final_model,
+    )
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
@@ -8101,6 +8145,7 @@ def call_llm(
                         resolved_provider, task, reason=reason)
 
             if fb_client is not None:
+                _record_route_info(route_info, _route_provider_name(fb_label), fb_model)
                 fb_resp = _call_fallback_candidate_sync(
                     fb_client, fb_model, fb_label,
                     task=task, messages=messages,
@@ -8116,6 +8161,7 @@ def call_llm(
                 fb_client, fb_model, fb_label = _try_payment_fallback(
                     resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
+                    _record_route_info(route_info, _route_provider_name(fb_label), fb_model)
                     fb_resp = _call_fallback_candidate_sync(
                         fb_client, fb_model, fb_label,
                         task=task, messages=messages,
@@ -8218,6 +8264,7 @@ async def async_call_llm(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
+    route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
@@ -8266,6 +8313,7 @@ async def async_call_llm(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            task=task,
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
@@ -8294,6 +8342,12 @@ async def async_call_llm(
                 f"Run: hermes setup")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
+    _record_route_info(
+        route_info,
+        getattr(client, "_hermes_route_provider", None)
+        or _route_provider_name(resolved_provider),
+        final_model,
+    )
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
@@ -8639,6 +8693,9 @@ async def async_call_llm(
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
                 )
+                _record_route_info(
+                    route_info, _route_provider_name(fb_label), async_fb_model or fb_model
+                )
                 fb_resp = await _call_fallback_candidate_async(
                     async_fb, async_fb_model or fb_model, fb_label,
                     task=task, messages=messages,
@@ -8655,6 +8712,9 @@ async def async_call_llm(
                 if fb_client is not None:
                     async_fb, async_fb_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
+                    )
+                    _record_route_info(
+                        route_info, _route_provider_name(fb_label), async_fb_model or fb_model
                     )
                     fb_resp = await _call_fallback_candidate_async(
                         async_fb, async_fb_model or fb_model, fb_label,
