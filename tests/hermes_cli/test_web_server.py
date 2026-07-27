@@ -1,6 +1,7 @@
 """Tests for hermes_cli.web_server and related config utilities."""
 
 import asyncio
+import base64
 import os
 import json
 import shutil
@@ -2540,6 +2541,534 @@ class TestWebServerEndpoints:
         assert captured["path"].endswith(".webm")
         assert not Path(captured["path"]).exists()
 
+    def test_audio_transcription_failure_retains_original_with_opaque_id(self, monkeypatch):
+        import tools.transcription_tools as transcription_tools
+        from hermes_constants import get_hermes_home
+
+        secret_error = "Authorization: Bearer sk-proj-this-must-never-leak"
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: {
+                "success": False,
+                "error": secret_error,
+                "provider": "openai",
+            },
+        )
+
+        original = b"long irreplaceable recording"
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/webm;base64," + base64.b64encode(original).decode(),
+                "mime_type": "audio/webm;codecs=opus",
+            },
+        )
+
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error_code"] == "provider_error"
+        assert body["recovery_available"] is True
+        assert secret_error not in resp.text
+        assert str(get_hermes_home()) not in resp.text
+        recovery_id = body["recovery_id"]
+        assert len(recovery_id) == 32
+        recovery_dir = get_hermes_home() / ".cache" / "stt-recovery" / recovery_id
+        assert (recovery_dir / "audio.webm").read_bytes() == original
+        manifest = json.loads((recovery_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["status"] == "failed"
+        assert manifest["failure_code"] == "provider_error"
+        assert secret_error not in json.dumps(manifest)
+
+    def test_audio_transcription_exception_is_generic_and_recoverable(self, monkeypatch):
+        import tools.transcription_tools as transcription_tools
+        from hermes_constants import get_hermes_home
+
+        def fail_transcription(path, model=None):
+            raise RuntimeError("api_key=sk-proj-private-value")
+
+        monkeypatch.setattr(transcription_tools, "transcribe_audio", fail_transcription)
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert resp.json()["recovery_available"] is True
+        assert "sk-proj-private-value" not in resp.text
+        assert str(get_hermes_home()) not in resp.text
+
+    def test_audio_transcription_recovery_failure_does_not_mask_success(self, monkeypatch):
+        import hermes_cli.stt_recovery as stt_recovery
+        import tools.transcription_tools as transcription_tools
+
+        monkeypatch.setattr(
+            stt_recovery.SttRecoveryCache,
+            "stage_audio",
+            lambda self, *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: {
+                "success": True,
+                "transcript": "fallback worked",
+                "provider": "test",
+            },
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["transcript"] == "fallback worked"
+
+    def test_audio_transcription_deferred_cleanup_does_not_mask_success(self, monkeypatch):
+        import hermes_cli.stt_recovery as stt_recovery
+        import tools.transcription_tools as transcription_tools
+        from hermes_constants import get_hermes_home
+
+        monkeypatch.setattr(
+            stt_recovery.SttRecoveryCache,
+            "_remove_directory",
+            staticmethod(lambda path: False),
+        )
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: {
+                "success": True,
+                "transcript": "cleanup may wait",
+                "provider": "test",
+            },
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["transcript"] == "cleanup may wait"
+        recovery_root = get_hermes_home() / ".cache" / "stt-recovery"
+        manifests = list(recovery_root.glob("*/manifest.json"))
+        assert len(manifests) == 1
+        assert json.loads(manifests[0].read_text(encoding="utf-8"))["status"] == "cleanup_pending"
+
+    def test_audio_transcription_cleanup_commit_failure_retains_original(self, monkeypatch):
+        import hermes_cli.stt_recovery as stt_recovery
+        import tools.transcription_tools as transcription_tools
+
+        real_atomic_json_write = stt_recovery.atomic_json_write
+
+        def fail_cleanup_commit(path, payload, *args, **kwargs):
+            if payload.get("status") == "cleanup_pending":
+                raise OSError("disk full")
+            return real_atomic_json_write(path, payload, *args, **kwargs)
+
+        monkeypatch.setattr(stt_recovery, "atomic_json_write", fail_cleanup_commit)
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: {
+                "success": True,
+                "transcript": "not delivered yet",
+                "provider": "test",
+            },
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert resp.json()["error_code"] == "cleanup_error"
+        assert resp.json()["recovery_available"] is True
+        assert "not delivered yet" not in resp.text
+
+    def test_audio_transcription_does_not_claim_recovery_when_staging_fails(self, monkeypatch):
+        import hermes_cli.stt_recovery as stt_recovery
+        import tools.transcription_tools as transcription_tools
+
+        monkeypatch.setattr(
+            stt_recovery.SttRecoveryCache,
+            "stage_audio",
+            lambda self, *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: {
+                "success": False,
+                "error": "provider unavailable",
+                "provider": "test",
+            },
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert resp.json()["recovery_available"] is False
+        assert "recovery_id" not in resp.json()
+
+    def test_audio_transcription_does_not_claim_recovery_when_failure_transition_fails(
+        self,
+        monkeypatch,
+    ):
+        import hermes_cli.stt_recovery as stt_recovery
+        import tools.transcription_tools as transcription_tools
+
+        monkeypatch.setattr(
+            stt_recovery.SttRecoveryCache,
+            "mark_failed_attempt",
+            lambda self, *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: {
+                "success": False,
+                "error": "provider unavailable",
+                "provider": "test",
+            },
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert resp.json()["recovery_available"] is False
+        assert "recovery_id" not in resp.json()
+
+    def test_audio_transcription_rejects_malformed_provider_result_safely(
+        self,
+        monkeypatch,
+    ):
+        import tools.transcription_tools as transcription_tools
+
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: {
+                "success": True,
+                "transcript": {"not": "text"},
+                "provider": "test",
+            },
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert resp.json()["error_code"] == "unexpected_error"
+        assert resp.json()["recovery_available"] is True
+
+    def test_audio_transcription_rejects_truthy_non_boolean_success(self, monkeypatch):
+        import tools.transcription_tools as transcription_tools
+
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: {
+                "success": "true",
+                "transcript": "must not be trusted",
+                "provider": "test",
+            },
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert resp.json()["error_code"] == "provider_error"
+        assert resp.json()["recovery_available"] is True
+        assert "must not be trusted" not in resp.text
+
+    def test_audio_transcription_http_exception_is_redacted_and_recoverable(
+        self,
+        monkeypatch,
+    ):
+        from fastapi import HTTPException
+        import tools.transcription_tools as transcription_tools
+
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: (_ for _ in ()).throw(
+                HTTPException(status_code=401, detail="Bearer sk-private")
+            ),
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert resp.json()["error_code"] == "unexpected_error"
+        assert resp.json()["recovery_available"] is True
+        assert "sk-private" not in resp.text
+
+    def test_audio_transcription_http_exception_is_redacted_without_recovery(
+        self,
+        monkeypatch,
+    ):
+        from fastapi import HTTPException
+        import hermes_cli.stt_recovery as stt_recovery
+        import tools.transcription_tools as transcription_tools
+
+        monkeypatch.setattr(
+            stt_recovery.SttRecoveryCache,
+            "stage_audio",
+            lambda self, *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: (_ for _ in ()).throw(
+                HTTPException(status_code=401, detail="Bearer sk-private")
+            ),
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert resp.json()["error_code"] == "unexpected_error"
+        assert resp.json()["recovery_available"] is False
+        assert "sk-private" not in resp.text
+
+    def test_audio_fallback_partial_write_is_removed(self, monkeypatch):
+        import tempfile
+
+        import hermes_cli.stt_recovery as stt_recovery
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(
+            stt_recovery.SttRecoveryCache,
+            "stage_audio",
+            lambda self, *args, **kwargs: None,
+        )
+        real_named_temporary_file = tempfile.NamedTemporaryFile
+        created_paths = []
+
+        class PartialWriteTemp:
+            def __init__(self, *args, **kwargs):
+                self._file = real_named_temporary_file(*args, **kwargs)
+                self.name = self._file.name
+                created_paths.append(Path(self.name))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self._file.close()
+
+            def write(self, data):
+                self._file.write(data[:1])
+                self._file.flush()
+                raise OSError("disk full")
+
+        monkeypatch.setattr(
+            web_server.tempfile,
+            "NamedTemporaryFile",
+            PartialWriteTemp,
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/wav;base64,aGVsbG8=",
+                "mime_type": "audio/wav",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert resp.json()["recovery_available"] is False
+        assert created_paths
+        assert all(not path.exists() for path in created_paths)
+
+    def test_audio_transcription_uses_requested_profile_in_worker(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as web_server
+        import tools.transcription_tools as transcription_tools
+        from hermes_constants import get_hermes_home
+
+        profile_home = tmp_path / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        observed = {}
+        monkeypatch.setattr(web_server, "_resolve_profile_dir", lambda name: profile_home)
+
+        def fake_transcribe_audio(path, model=None):
+            observed["home"] = get_hermes_home()
+            observed["path"] = Path(path)
+            return {"success": True, "transcript": "profiled", "provider": "test"}
+
+        monkeypatch.setattr(transcription_tools, "transcribe_audio", fake_transcribe_audio)
+        resp = self.client.post(
+            "/api/audio/transcribe?profile=coder",
+            json={
+                "data_url": "data:audio/webm;base64,aGVsbG8=",
+                "mime_type": "audio/webm",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert observed["home"] == profile_home
+        assert observed["path"].is_relative_to(profile_home)
+        assert not observed["path"].exists()
+
+    def test_audio_transcription_failure_names_owning_profile(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as web_server
+        import tools.transcription_tools as transcription_tools
+
+        profile_home = tmp_path / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setattr(web_server, "_resolve_profile_dir", lambda name: profile_home)
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: {
+                "success": False,
+                "error": "provider unavailable",
+                "provider": "test",
+            },
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe?profile=coder",
+            json={
+                "data_url": "data:audio/webm;base64,aGVsbG8=",
+                "mime_type": "audio/webm",
+            },
+        )
+
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["recovery_profile"] == "coder"
+        assert f"hermes -p coder stt recovery retry {body['recovery_id']}" in body["detail"]
+
+    def test_audio_transcription_failure_infers_pooled_process_profile(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import tools.transcription_tools as transcription_tools
+
+        profile_home = tmp_path / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda path, model=None: {
+                "success": False,
+                "error": "provider unavailable",
+                "provider": "test",
+            },
+        )
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/webm;base64,aGVsbG8=",
+                "mime_type": "audio/webm",
+            },
+        )
+
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["recovery_profile"] == "coder"
+        assert f"hermes -p coder stt recovery retry {body['recovery_id']}" in body["detail"]
+
+    def test_audio_transcription_cancellation_keeps_worker_input(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        import tools.transcription_tools as transcription_tools
+        from hermes_cli.stt_recovery import SttRecoveryCache
+
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        observed = {}
+
+        def blocking_transcription(path, model=None):
+            observed["path"] = Path(path)
+            started.set()
+            assert release.wait(timeout=5)
+            observed["bytes"] = Path(path).read_bytes()
+            finished.set()
+            return {"success": True, "transcript": "too late", "provider": "test"}
+
+        monkeypatch.setattr(transcription_tools, "transcribe_audio", blocking_transcription)
+
+        async def run_and_cancel():
+            payload = web_server.AudioTranscriptionRequest(
+                data_url="data:audio/webm;base64,aGVsbG8=",
+                mime_type="audio/webm",
+            )
+            task = asyncio.create_task(web_server.transcribe_audio_upload(payload))
+            assert await asyncio.to_thread(started.wait, 2)
+            task.cancel()
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert observed["path"].exists()
+            finally:
+                release.set()
+                assert await asyncio.to_thread(finished.wait, 2)
+                await asyncio.sleep(0)
+
+        asyncio.run(run_and_cancel())
+
+        records = SttRecoveryCache.from_config(DEFAULT_CONFIG).list_records()
+        assert len(records) == 1
+        assert records[0].status == "failed"
+        assert records[0].failure_code == "request_cancelled"
+        assert observed["bytes"] == b"hello"
+
     def test_audio_transcription_no_speech_is_not_an_error(self, monkeypatch):
         """A provider hearing silence (empty transcript) must return 200/"" —
         the live voice loop treats it as a quiet turn and re-listens, instead
@@ -2569,6 +3098,9 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
         assert resp.json()["transcript"] == ""
+        from hermes_cli.stt_recovery import SttRecoveryCache
+
+        assert SttRecoveryCache.from_config(DEFAULT_CONFIG).list_records() == []
 
     def test_audio_transcription_rejects_invalid_base64(self):
         resp = self.client.post(

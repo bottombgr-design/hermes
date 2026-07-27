@@ -117,6 +117,7 @@ function TileChat({
   const queryClient = useQueryClient()
   const { selectModel } = useModelControls({ queryClient, requestGateway })
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const tileProfile = useTileMenuRow(storedSessionId).profile
   const cwd = useStore(view.$cwd)
   const gatewayOpen = useStore($gatewayState) === 'open'
 
@@ -186,7 +187,9 @@ function TileChat({
           onSubmit={actions.submitText}
           onThreadMessagesChange={actions.handleThreadMessagesChange}
           onToggleSelectedPin={() => undefined}
-          onTranscribeAudio={async audio => (await transcribeAudio(await blobToDataUrl(audio), audio.type)).transcript}
+          onTranscribeAudio={async audio =>
+            (await transcribeAudio(await blobToDataUrl(audio), audio.type, tileProfile)).transcript
+          }
         />
       </ComposerScopeProvider>
     </SessionViewProvider>
@@ -345,6 +348,15 @@ export function tileStoredRow(storedSessionId: string): SessionInfo | undefined 
   )
 }
 
+/** Durable profile owner for backend routing. Prefer the persisted tile field;
+ *  bounded session/project caches are presentation fallbacks only. */
+export function tileOwnerProfile(storedSessionId: string): string | undefined {
+  return (
+    $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.profile ??
+    tileStoredRow(storedSessionId)?.profile
+  )
+}
+
 function tileTitle(storedSessionId: string): string {
   const stored = tileStoredRow(storedSessionId)
 
@@ -357,7 +369,7 @@ function tileTitle(storedSessionId: string): string {
 function tileDragPayload(storedSessionId: string): SessionDragPayload {
   const stored = tileStoredRow(storedSessionId)
 
-  return { id: storedSessionId, profile: stored?.profile ?? '', title: tileTitle(storedSessionId) }
+  return { id: storedSessionId, profile: tileOwnerProfile(storedSessionId) ?? '', title: tileTitle(storedSessionId) }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,10 +447,12 @@ function useTileMenuRow(storedSessionId: string): { pinId: string; profile?: str
   const subscribe = useCallback((onChange: () => void) => {
     const offSessions = $sessions.listen(onChange)
     const offTree = $projectTree.listen(onChange)
+    const offTiles = $sessionTiles.listen(onChange)
 
     return () => {
       offSessions()
       offTree()
+      offTiles()
     }
   }, [])
 
@@ -446,7 +460,7 @@ function useTileMenuRow(storedSessionId: string): { pinId: string; profile?: str
     const stored = tileStoredRow(storedSessionId)
     const pinId = stored ? sessionPinId(stored) : storedSessionId
     const title = tileTitle(storedSessionId)
-    const profile = stored?.profile
+    const profile = tileOwnerProfile(storedSessionId)
     const key = `${pinId}\u0000${title}\u0000${profile ?? ''}`
 
     if (cache.current?.key !== key) {

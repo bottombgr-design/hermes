@@ -288,6 +288,9 @@ export type TileDock = 'center' | SplitDir
 export interface SessionTile {
   /** Stored session id — the durable identity (runtime ids are ephemeral). */
   storedSessionId: string
+  /** Owning profile — persisted because sidebar/project rows are bounded
+   *  caches and may evict an idle open tile's session metadata. */
+  profile?: string
   /** Dock against `anchor` on adoption (default right; center = stack). */
   dir?: TileDock
   /** Pane to dock against (a drop's target zone) — default the workspace.
@@ -303,12 +306,11 @@ export interface SessionTile {
   error?: string
 }
 
-// Tiles are persisted PER PROFILE: a session belongs to one profile, and the
-// single live gateway is scoped to one profile at a time, so a tile only makes
-// sense while its profile is active. Switching profiles swaps the visible set
-// (and drops runtime bindings so each tile re-resumes against the now-current
-// gateway — which also settles the "tile resumes against the wrong backend" and
-// "stale runtime after respawn" bugs by construction).
+// Tiles are bucketed by the rail profile active when they were opened. Each
+// tile also persists its session's exact owner because the all-profiles view
+// can open a cross-profile session and bounded sidebar/project caches may later
+// evict that row. Switching rail profiles swaps the visible bucket and drops
+// runtime bindings; the persisted owner still routes resume/STT correctly.
 const TILES_KEY = 'hermes.desktop.sessionTiles.v2'
 const LEGACY_TILES_KEY = 'hermes.desktop.sessionTiles.v1'
 const TILE_PANE_PREFIX = 'session-tile:'
@@ -316,16 +318,17 @@ const TILE_PANE_PREFIX = 'session-tile:'
 /** Persisted placement — `dir` + strip slot (`before`) + dock `anchor` so a
  *  restart / profile swap re-adopts tiles in the same order, not all stacked
  *  right of workspace. */
-type StoredTile = Pick<SessionTile, 'anchor' | 'before' | 'dir' | 'storedSessionId'>
+type StoredTile = Pick<SessionTile, 'anchor' | 'before' | 'dir' | 'profile' | 'storedSessionId'>
 
 const toStored = (t: SessionTile): StoredTile => ({
   anchor: t.anchor,
   before: t.before,
   dir: t.dir,
+  profile: typeof t.profile === 'string' && t.profile.trim() ? normalizeProfileKey(t.profile) : undefined,
   storedSessionId: t.storedSessionId
 })
 
-function parseTileList(value: unknown): StoredTile[] {
+function parseTileList(value: unknown, fallbackProfile?: string): StoredTile[] {
   return Array.isArray(value)
     ? value
         .filter((t): t is SessionTile => Boolean(t && typeof (t as SessionTile).storedSessionId === 'string'))
@@ -336,6 +339,12 @@ function parseTileList(value: unknown): StoredTile[] {
             anchor: typeof raw.anchor === 'string' ? raw.anchor : undefined,
             before: typeof raw.before === 'string' || raw.before === null ? raw.before : undefined,
             dir: raw.dir,
+            profile:
+              typeof raw.profile === 'string' && raw.profile.trim()
+                ? normalizeProfileKey(raw.profile)
+                : fallbackProfile
+                  ? normalizeProfileKey(fallbackProfile)
+                  : undefined,
             storedSessionId: raw.storedSessionId
           }
         })
@@ -348,6 +357,10 @@ function loadTilesByProfile(): Record<string, StoredTile[]> {
 
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
     for (const [profile, list] of Object.entries(parsed as Record<string, unknown>)) {
+      // A v2 bucket records the rail profile that was visible when a tile was
+      // opened, not necessarily the session's owner: All Profiles can place a
+      // cross-profile session in that bucket. Leave pre-owner records unknown
+      // until cold resume resolves and persists the authoritative profile.
       const tiles = parseTileList(list)
 
       if (tiles.length > 0) {
@@ -357,7 +370,7 @@ function loadTilesByProfile(): Record<string, StoredTile[]> {
   }
 
   // Migrate a v1 flat list into the default profile, then retire the key.
-  const legacy = parseTileList(readJson<unknown>(LEGACY_TILES_KEY))
+  const legacy = parseTileList(readJson<unknown>(LEGACY_TILES_KEY), 'default')
 
   if (legacy.length > 0) {
     const key = normalizeProfileKey('default')
@@ -527,16 +540,19 @@ export function openSessionTile(
   storedSessionId: string,
   dir: TileDock = 'right',
   anchor?: string,
-  before?: null | string
+  before?: null | string,
+  profile?: string
 ) {
   const tiles = $sessionTiles.get()
+  const existing = tiles.find(t => t.storedSessionId === storedSessionId)
+  const ownerProfile = normalizeProfileKey(profile?.trim() || existing?.profile || profileKey())
 
   if (storedSessionId === $selectedStoredSessionId.get()) {
     return
   }
 
-  if (!tiles.some(t => t.storedSessionId === storedSessionId)) {
-    saveTiles([...tiles, { anchor, before, dir, storedSessionId }])
+  if (!existing) {
+    saveTiles([...tiles, { anchor, before, dir, profile: ownerProfile, storedSessionId }])
     // Adoption is async via the registry — order sync runs after the move path
     // below; a brand-new tile's strip slot is already in `before`.
 
@@ -550,7 +566,7 @@ export function openSessionTile(
 
   if (target) {
     moveTreePane(`${TILE_PANE_PREFIX}${storedSessionId}`, { before: before ?? null, groupId: target, pos: dir })
-    patchSessionTile(storedSessionId, { anchor, before: before ?? undefined, dir })
+    patchSessionTile(storedSessionId, { anchor, before: before ?? undefined, dir, profile: ownerProfile })
     syncTileStripOrder()
   }
 }
@@ -639,7 +655,13 @@ export function closeSessionTile(storedSessionId: string) {
   const tile = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)
 
   if (tile) {
-    closedStack().push({ anchor: tile.anchor, before: tile.before, dir: tile.dir, storedSessionId })
+    closedStack().push({
+      anchor: tile.anchor,
+      before: tile.before,
+      dir: tile.dir,
+      profile: tile.profile,
+      storedSessionId
+    })
   }
 
   saveTiles($sessionTiles.get().filter(t => t.storedSessionId !== storedSessionId))
@@ -672,7 +694,7 @@ export function reopenLastClosedTile(): void {
     }
 
     if (!$sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
-      openSessionTile(storedSessionId, tile.dir, tile.anchor, tile.before)
+      openSessionTile(storedSessionId, tile.dir, tile.anchor, tile.before, tile.profile)
 
       return
     }

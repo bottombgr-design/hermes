@@ -8,6 +8,7 @@ import {
   restartGateway,
   saveMemoryProviderConfig,
   setApiRequestProfile,
+  transcribeAudio,
   updateHermes
 } from './hermes'
 
@@ -54,6 +55,7 @@ describe('backend action helpers are profile-scoped', () => {
     void updateHermes()
     void checkHermesUpdate()
     void getActionStatus('gateway-restart')
+    void transcribeAudio('data:audio/webm;base64,aGVsbG8=', 'audio/webm')
 
     for (const call of api.mock.calls) {
       expect(call[0].profile).toBe('coder')

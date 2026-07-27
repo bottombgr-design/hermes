@@ -175,7 +175,7 @@ export function SidebarSessionRow({
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSessionTile(session.id, 'center')
+              openSessionTile(session.id, 'center', undefined, undefined, session.profile)
             }
           }}
           onClick={event => {
@@ -196,7 +196,7 @@ export function SidebarSessionRow({
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSessionTile(session.id, 'center')
+              openSessionTile(session.id, 'center', undefined, undefined, session.profile)
 
               return
             }

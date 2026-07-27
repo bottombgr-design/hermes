@@ -2,7 +2,7 @@ import { useEffect } from 'react'
 
 import { getSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
-import { publishSessionState, setSessionTileDelegate } from '@/store/session-states'
+import { patchSessionTile, publishSessionState, setSessionTileDelegate } from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
@@ -73,6 +73,15 @@ export function useSessionTileDelegate({
         // launch-profile DB and fork the conversation into the wrong profile —
         // the same cross-profile bleed the recovery resumes had (#67603).
         const profile = await resolveSessionProfile(storedSessionId)
+
+        // Older v2 tile records predate durable ownership. Their persistence
+        // bucket is only the rail profile and can be wrong in All Profiles;
+        // remember the profile resolved from the authoritative session row so
+        // future resume, STT, and drag actions remain correctly scoped even if
+        // that bounded row later ages out.
+        if (profile) {
+          patchSessionTile(storedSessionId, { profile })
+        }
 
         const [prefetch, resumed] = await Promise.all([
           getSessionMessages(storedSessionId, profile).catch(() => null),
