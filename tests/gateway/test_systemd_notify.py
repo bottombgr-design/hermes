@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
+import tempfile
 
 import pytest
 
@@ -16,22 +18,28 @@ def test_notify_without_notify_socket_is_a_noop(monkeypatch):
     assert notify("READY=1") is False
 
 
-def test_notify_sends_real_unix_datagram(tmp_path, monkeypatch):
-    address = str(tmp_path / "notify.sock")
-    receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    receiver.bind(address)
-    receiver.settimeout(1.0)
-    monkeypatch.setenv("NOTIFY_SOCKET", address)
+def test_notify_sends_real_unix_datagram(monkeypatch):
+    # Darwin limits AF_UNIX paths to 104 bytes; pytest's nested tmp_path can
+    # exceed that before the socket filename is appended.
+    with tempfile.TemporaryDirectory(prefix="hn-", dir="/tmp") as socket_dir:
+        address = f"{socket_dir}/notify.sock"
+        receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            receiver.bind(address)
+            receiver.settimeout(1.0)
+            monkeypatch.setenv("NOTIFY_SOCKET", address)
 
-    from gateway.systemd_notify import notify
+            from gateway.systemd_notify import notify
 
-    assert notify("READY=1") is True
-    assert receiver.recv(4096) == b"READY=1"
-    receiver.close()
+            assert notify("READY=1") is True
+            assert receiver.recv(4096) == b"READY=1"
+        finally:
+            receiver.close()
 
 
 @pytest.mark.skipif(
-    not hasattr(socket, "AF_UNIX"), reason="Unix datagram sockets are unavailable"
+    sys.platform != "linux" or not hasattr(socket, "AF_UNIX"),
+    reason="systemd abstract Unix sockets are a Linux-only address format",
 )
 def test_notify_supports_systemd_abstract_socket(monkeypatch):
     name = "\0hermes-test-notify"
