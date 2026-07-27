@@ -9,6 +9,7 @@ facade's contract and lock the gateway boundary so a 39th raw call can't regress
 import ast
 import asyncio
 import threading
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -119,7 +120,21 @@ def test_non_callable_attribute_passes_through():
 # Guard: no raw self._session_db.<method>( on the gateway loop
 # --------------------------------------------------------------------------
 
-_GATEWAY_FILES = ("gateway/run.py", "gateway/slash_commands.py")
+_GATEWAY_FILES = (
+    "gateway/run.py",
+    "gateway/slash_commands.py",
+    # Loop-reachable helpers that live outside gateway/ but receive the runner
+    # (and therefore its AsyncSessionDB) as a parameter. The gateway hands
+    # ``self`` to these, so a non-awaited facade call inside them is exactly as
+    # broken as one written inline — but scanning only gateway/*.py missed them.
+    # That blind spot is why the un-awaited
+    # ``db.get_messages_as_conversation(...)`` in the model-switch warning
+    # shipped after #63712 was closed as already-fixed on the strength of this
+    # guard. Keep this list in sync with _RUNNER_RECEIVING_HELPERS below, which
+    # fails if the gateway starts passing the runner to a module not listed here.
+    "hermes_cli/context_switch_guard.py",
+    "plugins/teams_pipeline/runtime.py",
+)
 # The only legitimate non-loop paths:
 #   - SessionDB.sanitize_title: pure @staticmethod string cleaning, no DB.
 #   - self._session_db._db.<x>: the sync escape, allowed ONLY where the call is
@@ -402,3 +417,98 @@ async def test_concurrent_create_session_idempotent(tmp_path):
 
     rows = await db.list_sessions_rich(limit=100)
     assert sum(1 for r in rows if r["id"] == sid) == 1
+
+
+# --------------------------------------------------------------------------
+# Meta-guard: keep _GATEWAY_FILES honest as the gateway grows
+# --------------------------------------------------------------------------
+
+def _runner_receiving_modules() -> dict:
+    """Modules the gateway hands its runner (``self``/``_self``) to.
+
+    Any such module can reach ``runner._session_db`` — the AsyncSessionDB
+    facade — so its bodies must be scanned by the raw-call guard just like
+    gateway/*.py. Resolves each call's callee back to the module it was
+    imported from (function-local imports included, which is how the gateway
+    pulls in these helpers).
+    """
+    out: dict[str, set] = {}
+    for rel in ("gateway/run.py", "gateway/slash_commands.py"):
+        tree = ast.parse((_repo_root() / rel).read_text(encoding="utf-8"))
+        imported_from: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    imported_from[alias.asname or alias.name] = node.module
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                continue
+            passes_runner = any(
+                isinstance(a, ast.Name) and a.id in ("self", "_self")
+                for a in node.args
+            )
+            if not passes_runner:
+                continue
+            module = imported_from.get(node.func.id)
+            if module and not module.startswith("gateway"):
+                out.setdefault(module, set()).add(node.func.id)
+    return out
+
+
+def test_gateway_files_covers_every_runner_receiving_helper():
+    """A helper handed the runner must be inside the guard's scan set.
+
+    The raw-call guard is only as good as the files it reads. Scanning just
+    ``gateway/*.py`` let a non-awaited AsyncSessionDB call live in
+    ``hermes_cli/context_switch_guard.py`` — the gateway passes ``self`` in, so
+    the facade crossed a module boundary the scanner never opened. This test
+    fails when the gateway starts handing the runner to a module that
+    ``_GATEWAY_FILES`` does not cover, so the scan set cannot silently fall
+    behind the code again.
+    """
+    scanned_modules = {
+        rel[: -len(".py")].replace("/", ".") for rel in _GATEWAY_FILES
+    }
+    unscanned = {
+        module: sorted(fns)
+        for module, fns in _runner_receiving_modules().items()
+        if module not in scanned_modules
+    }
+    assert not unscanned, (
+        "The gateway passes its runner to these modules, but _GATEWAY_FILES "
+        "does not scan them — a non-awaited AsyncSessionDB call there would go "
+        "undetected. Add the file to _GATEWAY_FILES:\n  "
+        + "\n  ".join(f"{m} (via {', '.join(f)})" for m, f in sorted(unscanned.items()))
+    )
+
+
+def test_raw_call_guard_detects_cross_module_alias_calls():
+    """The visitor must flag a non-awaited facade call behind a getattr alias.
+
+    Pins the detection itself, independent of which files are scanned: the
+    logic was always capable of catching the context_switch_guard bug, only
+    the scan set was too narrow. Guards against a future refactor that
+    silently drops alias tracking.
+    """
+    source = textwrap.dedent(
+        """
+        async def helper(runner, source):
+            db = getattr(runner, "_session_db", None)
+            if db is not None:
+                messages = db.get_messages_as_conversation("sid")
+            return messages
+        """
+    )
+    visitor = _RawCallVisitor(ast.parse(source))
+    assert ("get_messages_as_conversation", 5) in visitor.alias_calls
+
+    awaited = textwrap.dedent(
+        """
+        async def helper(runner, source):
+            db = getattr(runner, "_session_db", None)
+            if db is not None:
+                messages = await db.get_messages_as_conversation("sid")
+            return messages
+        """
+    )
+    assert not _RawCallVisitor(ast.parse(awaited)).alias_calls

@@ -16,6 +16,7 @@ carry the preflight warning.
 """
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -66,12 +67,30 @@ class _Store:
         return _Entry(self._session_id)
 
 
+class _AsyncStore:
+    """Mirrors AsyncSessionStore: every method call returns an awaitable."""
+
+    def __init__(self, store) -> None:
+        self._store = store
+
+    def __getattr__(self, name):
+        attr = getattr(self._store, name)
+        if not callable(attr):
+            return attr
+
+        async def _offloaded(*args, **kwargs):
+            return attr(*args, **kwargs)
+
+        return _offloaded
+
+
 class _Runner:
     """Mirrors the gateway runner surface the helper reaches into."""
 
     def __init__(self, session_db, session_id: str, agent: _Agent) -> None:
         self._session_db = session_db
         self.session_store = _Store(session_id)
+        self.async_session_store = _AsyncStore(self.session_store)
         self._agent_cache_lock = threading.Lock()
         self._agent_cache = {"skey": (agent, None)}
 
@@ -124,13 +143,31 @@ async def test_preflight_warning_fires_through_async_session_db(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_helper_accepts_plain_sync_session_db(tmp_path):
-    """Non-gateway wiring passes a plain SessionDB; both shapes must work."""
-    session_id = "s-preflight-sync"
+async def test_store_is_read_through_the_async_facade(tmp_path):
+    """``get_or_create_session`` must go through the async store facade.
+
+    It performs SQLite SELECTs plus a routing-index rewrite and ``os.fsync``,
+    so a bare call would block the gateway event loop. Asserted by making the
+    sync store raise if it is ever called directly.
+    """
+    session_id = "s-store-facade"
     sync_db = SessionDB(db_path=tmp_path / "state.db")
     _seed_session(sync_db, session_id, turns=800, chars=4000)
 
-    runner = _Runner(sync_db, session_id, _Agent())
+    runner = _Runner(AsyncSessionDB(sync_db), session_id, _Agent())
+
+    # The async facade forwards to a private snapshot of the real store, so
+    # poisoning the *public* sync attribute proves the helper never reaches for
+    # it directly. (_AsyncStore captured the store instance at construction.)
+    called_sync = []
+
+    def _record_sync_call(source):  # noqa: ARG001 - signature parity
+        called_sync.append(source)
+        return _Entry(session_id)
+
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=_record_sync_call
+    )
     result = _switch_result()
 
     await enrich_model_switch_warnings_for_gateway(
@@ -140,6 +177,10 @@ async def test_helper_accepts_plain_sync_session_db(tmp_path):
         source=object(),
     )
 
+    assert not called_sync, (
+        "get_or_create_session was called on the sync store — that runs "
+        "SQLite + os.fsync on the gateway event loop"
+    )
     assert result.warning_message
     assert "preflight compression" in result.warning_message
 
