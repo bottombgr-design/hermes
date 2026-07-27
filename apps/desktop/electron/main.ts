@@ -145,6 +145,8 @@ import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRoutePr
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import * as remoteLifecycle from './remote-lifecycle'
 import { RemoteLivenessTracker, RemoteRevalidationCoordinator, revalidateRemoteConnection } from './remote-liveness'
+import { startRendererServer } from './renderer-server'
+import { isRendererUrl } from './renderer-url'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -229,6 +231,7 @@ if (USER_DATA_OVERRIDE) {
 
 const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER
 const IS_PACKAGED = app.isPackaged || Boolean(process.env.HERMES_DESKTOP_IS_PACKAGED)
+let packagedRendererServer: Awaited<ReturnType<typeof startRendererServer>> | null = null
 const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
 const IS_WSL = isWslEnvironment()
@@ -3505,6 +3508,10 @@ function resolveRendererIndex() {
   )
 
   return candidates[0]
+}
+
+function rendererBaseUrl() {
+  return DEV_SERVER || packagedRendererServer?.origin || pathToFileURL(resolveRendererIndex()).toString()
 }
 
 // True when `dir` lives inside the packaged app bundle / install tree.
@@ -8361,7 +8368,7 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
     return { action: 'deny' }
   })
   win.webContents.on('will-navigate', (event, url) => {
-    if ((DEV_SERVER && url.startsWith(DEV_SERVER)) || (!DEV_SERVER && url.startsWith('file:'))) {
+    if (isRendererUrl(url, rendererBaseUrl())) {
       return
     }
 
@@ -8436,8 +8443,13 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
 
   win.loadURL(
     buildSessionWindowUrl(sessionId, {
-      devServer: DEV_SERVER,
-      rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
+      // Prefer the packaged renderer HTTP server when it is running: loading the
+      // renderer over http:// gives embeds a real origin, which `file://` cannot
+      // provide (YouTube rejects file-origin embeds). Fall back to upstream's
+      // rendererIndexPath path so the file:// URL is still built correctly --
+      // passing a file:// URL as `devServer` would yield `index.html/?win=...`.
+      devServer: DEV_SERVER || packagedRendererServer?.origin,
+      rendererIndexPath: DEV_SERVER || packagedRendererServer?.origin ? undefined : resolveRendererIndex(),
       watch
     })
   )
@@ -8538,11 +8550,9 @@ function createInstanceWindow() {
 let petOverlayWindow = null
 
 function petOverlayUrl() {
-  if (DEV_SERVER) {
-    return `${DEV_SERVER.endsWith('/') ? DEV_SERVER.slice(0, -1) : DEV_SERVER}/?win=overlay#/`
-  }
+  const base = rendererBaseUrl().replace(/\/$/, '')
 
-  return `${pathToFileURL(resolveRendererIndex()).toString()}?win=overlay#/`
+  return `${base}/?win=overlay#/`
 }
 
 function spawnPetOverlayWindow(bounds) {
@@ -9081,11 +9091,7 @@ function createWindow() {
     rememberLog(`[renderer console] ${text} (${src}:${lineNo})`)
   })
 
-  if (DEV_SERVER) {
-    mainWindow.loadURL(DEV_SERVER)
-  } else {
-    mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
-  }
+  mainWindow.loadURL(rendererBaseUrl())
 
   // Start the Python backend NOW, in parallel with the renderer load — not on
   // did-finish-load. The backend cold boot (spawn → port announce → /api/status)
@@ -11285,7 +11291,11 @@ app.on('open-url', (event, url) => {
   handleDeepLink(url)
 })
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  if (!DEV_SERVER) {
+    packagedRendererServer = await startRendererServer(path.dirname(resolveRendererIndex()))
+  }
+
   const systemCa = installWindowsSystemCaTrust(tls)
 
   if (systemCa.applied) {
@@ -11391,6 +11401,7 @@ app.on('before-quit', event => {
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
+  void packagedRendererServer?.close()
 
   // Same for the Quick Entry composer — and release its global accelerator so a
   // quitting Hermes never keeps another app's chord hostage.
