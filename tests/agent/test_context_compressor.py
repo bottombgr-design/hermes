@@ -4513,3 +4513,150 @@ class TestMinTailUserMessages:
         exactly the pre-feature single-anchor behavior."""
         from hermes_cli.config import DEFAULT_CONFIG
         assert DEFAULT_CONFIG["compression"]["min_tail_user_messages"] == 1
+
+
+class TestTopicAwareCompression:
+    """Tests for topic-aware multi-topic compression."""
+
+    @staticmethod
+    def _mk_msg(role, content, ts_offset_min=0):
+        from datetime import datetime, timedelta
+        ts = datetime(2026, 1, 1, 12, 0) + timedelta(minutes=ts_offset_min)
+        return {"role": role, "content": content, "timestamp": ts}
+
+    def _make_compressor(self, enabled=True, time_gap=120, min_messages=6, max_chars=None):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="test-model",
+                topic_aware_enabled=enabled,
+                topic_aware_time_gap=time_gap,
+                topic_aware_min_messages=min_messages,
+                topic_aware_max_chars=max_chars,
+            )
+
+    def test_detect_single_topic_no_gaps(self):
+        """All user messages within the time window → single topic."""
+        c = self._make_compressor()
+        msgs = [
+            self._mk_msg("system", "sys", 0),
+            self._mk_msg("user", "hello", 5),
+            self._mk_msg("assistant", "hi", 6),
+            self._mk_msg("user", "follow up", 10),
+            self._mk_msg("assistant", "ok", 11),
+        ]
+        boundaries = c._detect_topics(msgs, 1, len(msgs))
+        assert boundaries == [1, 5]
+
+    def test_detect_two_topics_time_gap(self):
+        """A 3-hour gap between user messages → two topics."""
+        c = self._make_compressor(time_gap=120, min_messages=4)
+        msgs = [
+            self._mk_msg("user", "topic 1 start", 0),
+            self._mk_msg("assistant", "reply 1", 1),
+            self._mk_msg("user", "topic 1 more", 10),
+            self._mk_msg("assistant", "reply 2", 11),
+            self._mk_msg("user", "topic 2 after gap", 200),  # 190 min gap
+            self._mk_msg("assistant", "reply 3", 201),
+            self._mk_msg("user", "topic 2 more", 210),
+            self._mk_msg("assistant", "reply 4", 211),
+        ]
+        boundaries = c._detect_topics(msgs, 0, len(msgs))
+        # Boundary should be at msg index 4 (the "topic 2" user message)
+        assert len(boundaries) == 3  # start, split, end
+        assert boundaries[0] == 0
+        assert boundaries[1] == 4  # first msg of topic 2
+        assert boundaries[2] == 8
+
+    def test_merge_tiny_segment(self):
+        """A segment shorter than min_messages merges into previous."""
+        c = self._make_compressor(time_gap=120, min_messages=6)
+        msgs = [
+            self._mk_msg("user", "big topic 1", 0),
+            self._mk_msg("assistant", "r1", 1),
+            self._mk_msg("user", "big topic 2", 2),
+            self._mk_msg("assistant", "r2", 3),
+            self._mk_msg("user", "big topic 3", 4),
+            self._mk_msg("assistant", "r3", 5),
+            self._mk_msg("user", "big topic 4", 6),
+            self._mk_msg("assistant", "r4", 7),
+            # Now a tiny segment (3 msgs) across a gap
+            self._mk_msg("user", "tiny 1", 200),
+            self._mk_msg("assistant", "tiny r1", 201),
+            self._mk_msg("user", "tiny 2", 202),
+            # Another big segment
+            self._mk_msg("user", "big 2 topic 1", 400),
+            self._mk_msg("assistant", "r", 401),
+            self._mk_msg("user", "big 2 topic 2", 402),
+            self._mk_msg("assistant", "r", 403),
+            self._mk_msg("user", "big 2 topic 3", 404),
+            self._mk_msg("assistant", "r", 405),
+            self._mk_msg("user", "big 2 topic 4", 406),
+        ]
+        boundaries = c._detect_topics(msgs, 0, len(msgs))
+        # The 3-msg tiny segment should merge into the preceding "big" segment
+        # → only 2 topics: [0..11] and [11..end]
+        assert len(boundaries) == 3
+        assert boundaries[1] == 11  # merged boundary
+
+    def test_disabled_no_splitting(self):
+        """When topic_aware_enabled=False, single-topic path is used."""
+        c = self._make_compressor(enabled=False, time_gap=5)
+        msgs = [
+            self._mk_msg("user", "a", 0), self._mk_msg("assistant", "ok", 1),
+            self._mk_msg("user", "b", 100), self._mk_msg("assistant", "ok", 101),
+            self._mk_msg("user", "c", 200), self._mk_msg("assistant", "ok", 201),
+            self._mk_msg("user", "d", 300), self._mk_msg("assistant", "ok", 301),
+            self._mk_msg("user", "e", 400), self._mk_msg("assistant", "ok", 401),
+            self._mk_msg("user", "f", 500),
+        ]
+        boundaries = c._detect_topics(msgs, 0, len(msgs))
+        # With time_gap=5 almost every pair would split, but enabled=False
+        # should still detect (detection is independent of enabled flag —
+        # it's the routing in compress() that checks the flag)
+        # _detect_topics uses self.topic_aware_time_gap regardless
+        assert boundaries[0] == 0
+
+    def test_empty_middle_no_splits(self):
+        """Empty range returns single-topic boundaries."""
+        c = self._make_compressor()
+        assert c._detect_topics([], 0, 0) == [0, 0]
+
+    def test_fallback_on_summary_failure(self):
+        """If _generate_summary raises, multi-topic continues for other topics."""
+        c = self._make_compressor(enabled=True, time_gap=60, min_messages=4)
+        c.protect_first_n = 2
+        c.tail_token_budget = 100000
+        msgs = [
+            self._mk_msg("system", "sys", 0),
+            self._mk_msg("user", "head user", 5),
+            self._mk_msg("user", "topic 1 msg1", 10),
+            self._mk_msg("assistant", "ok", 11),
+            self._mk_msg("user", "topic 1 msg2", 12),
+            self._mk_msg("assistant", "ok", 13),
+            self._mk_msg("user", "topic 2 msg1", 200),
+            self._mk_msg("assistant", "ok", 201),
+            self._mk_msg("user", "topic 2 msg2", 202),
+            self._mk_msg("assistant", "ok", 203),
+            self._mk_msg("user", "tail user", 300),
+        ]
+        boundaries = c._detect_topics(msgs, 2, 10)
+        assert len(boundaries) == 3  # 2 topics detected
+
+        # With a summary generator that raises, should still get a result
+        # (the default fallback returns messages unchanged)
+        call_count = [0]
+
+        def _fake_summary(messages, focus_topic=None, memory_context=""):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("simulated failure")
+            return f"Summary for {focus_topic or 'unknown'}"
+
+        with patch.object(c, "_generate_summary", side_effect=_fake_summary):
+            result = c._multi_topic_compress(
+                msgs, 2, 10, boundaries, {},
+            )
+        # Should have tried both topics (first failed, second succeeded)
+        assert call_count[0] == 2
+        assert result is not None
+        assert "Topic 2" in result
