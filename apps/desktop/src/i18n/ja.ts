@@ -2283,7 +2283,8 @@ export const ja = defineLocale({
         back: '戻る',
         noComment: '（コメントなし）',
         composeFailed: '注釈画像を合成できませんでした',
-        imageSaveFailed: '注釈画像の保存に失敗しました'
+        imageSaveFailed: '注釈画像の保存に失敗しました',
+        screenshotsAttached: (count: number) => `${count} 枚のスクリーンショットを番号付きの画像添付として追加しました`
       }
     }
   },

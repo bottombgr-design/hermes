@@ -2526,7 +2526,8 @@ export const zh: Translations = {
         back: '返回',
         noComment: '（未填写说明）',
         composeFailed: '无法合成标注图片',
-        imageSaveFailed: '标注图片保存失败'
+        imageSaveFailed: '标注图片保存失败',
+        screenshotsAttached: (count: number) => `${count} 张截图已按编号添加为图片附件`
       }
     }
   },

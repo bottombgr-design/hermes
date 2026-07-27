@@ -2358,7 +2358,8 @@ export const en: Translations = {
         back: 'Back',
         noComment: '(no comment)',
         composeFailed: 'Could not compose the annotated image',
-        imageSaveFailed: 'Failed to save the annotated image'
+        imageSaveFailed: 'Failed to save the annotated image',
+        screenshotsAttached: (count: number) => `${count} screenshot(s) added as image attachments, named by number`
       }
     }
   },

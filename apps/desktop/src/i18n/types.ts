@@ -1985,6 +1985,7 @@ export interface Translations {
         noComment: string
         composeFailed: string
         imageSaveFailed: string
+        screenshotsAttached: (count: number) => string
       }
     }
   }

@@ -2215,7 +2215,8 @@ export const zhHant = defineLocale({
         back: '返回',
         noComment: '（未填寫說明）',
         composeFailed: '無法合成標註圖片',
-        imageSaveFailed: '標註圖片儲存失敗'
+        imageSaveFailed: '標註圖片儲存失敗',
+        screenshotsAttached: (count: number) => `${count} 張截圖已按編號新增為圖片附件`
       }
     }
   },

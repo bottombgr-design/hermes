@@ -2,11 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { requestComposerFocus, requestComposerInsert } from '@/app/chat/composer/focus'
 import { useI18n } from '@/i18n'
+import { attachmentId } from '@/lib/chat-runtime'
+import { addComposerAttachment } from '@/store/composer'
 import { notify, notifyError } from '@/store/notifications'
 
 import { AnnotationPopover } from './annotation-popover'
 import { AnnotationToolbar } from './annotation-toolbar'
 import type { PickedElement, PickedRegion } from './element-picker'
+import { dataUrlToBytes } from './image-annotate'
 import {
   buildAddBadgeCall,
   buildRemoveBadgeCall,
@@ -80,25 +83,51 @@ export function AnnotationLayer({ onExit, webview }: AnnotationLayerProps) {
     onExit()
   }, [onExit, webview])
 
-  const submitCollected = useCallback(() => {
+  const submitCollected = useCallback(async () => {
     const collected = itemsRef.current
     if (collected.length === 0) {
       return false
     }
 
-    const message = formatAnnotationSessionMessage(collected)
-    const screenshotBlocks = collected
-      .filter(item => item.screenshot)
-      .map(item => `<details><summary>📎 标注 ${item.number} 截图</summary>\n\n![annotation-${item.number}](${item.screenshot})\n\n</details>`)
-      .join('\n\n')
+    // Screenshots go through the composer-images pipeline as real image
+    // attachments (chips under the composer) — never inline base64, which
+    // floods the plain-text composer with unreadable noise.
+    let attachedCount = 0
+    for (const item of collected) {
+      if (!item.screenshot) {
+        continue
+      }
 
-    requestComposerInsert(screenshotBlocks ? `${message}\n\n${screenshotBlocks}` : message, {
+      try {
+        const bytes = await dataUrlToBytes(item.screenshot)
+        const savedPath = bytes ? await window.hermesDesktop?.saveImageBuffer(bytes, '.png') : ''
+
+        if (savedPath) {
+          addComposerAttachment({
+            detail: savedPath,
+            id: attachmentId('image', savedPath),
+            kind: 'image',
+            label: `标注-${item.number}.png`,
+            path: savedPath,
+            previewUrl: item.screenshot
+          })
+          attachedCount += 1
+        }
+      } catch {
+        // A failed screenshot must not block the text report.
+      }
+    }
+
+    const message = formatAnnotationSessionMessage(collected)
+    const attachmentNote = attachedCount > 0 ? `\n\n📎 ${copy.screenshotsAttached(attachedCount)}` : ''
+
+    requestComposerInsert(`${message}${attachmentNote}`, {
       mode: 'block',
       target: 'main'
     })
     requestComposerFocus('main')
     return true
-  }, [])
+  }, [copy])
 
   // Inject the probe + subscribe to its console channel.
   useEffect(() => {
@@ -163,8 +192,9 @@ export function AnnotationLayer({ onExit, webview }: AnnotationLayerProps) {
       if (disposed) {
         return
       }
-      const submitted = submitCollected()
-      notify({ message: submitted ? copy.navigatedAwaySubmitted : copy.navigatedAway, kind: 'warning' })
+      void submitCollected().then(submitted => {
+        notify({ message: submitted ? copy.navigatedAwaySubmitted : copy.navigatedAway, kind: 'warning' })
+      })
       exit()
     }
 
@@ -220,11 +250,13 @@ export function AnnotationLayer({ onExit, webview }: AnnotationLayerProps) {
   }, [resumePicking])
 
   const handleFinish = useCallback(() => {
-    if (!submitCollected()) {
-      return
-    }
-    notify({ message: copy.sentToComposer, kind: 'success' })
-    exit()
+    void submitCollected().then(submitted => {
+      if (!submitted) {
+        return
+      }
+      notify({ message: copy.sentToComposer, kind: 'success' })
+      exit()
+    })
   }, [copy.sentToComposer, exit, submitCollected])
 
   return (
