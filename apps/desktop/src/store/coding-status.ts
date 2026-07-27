@@ -4,7 +4,13 @@ import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
 import { desktopGit } from '@/lib/desktop-git'
 
 import { $worktreeRefreshToken } from './projects'
-import { $busy, $currentCwd, $selectedStoredSessionId } from './session'
+import {
+  $busy,
+  $currentCwd,
+  $selectedStoredSessionId,
+  $workspaceCwdOwner,
+  workspaceCwdBelongsToSelectedSession
+} from './session'
 import { $workspaceChangeTick } from './workspace-events'
 
 // Live working-tree status for the active session's cwd — the data backbone of
@@ -44,7 +50,7 @@ export const $repoChangeByPath = computed([$repoStatus, $currentCwd], (status, c
   return map
 })
 
-async function loadWorktrees(target: string): Promise<void> {
+async function loadWorktrees(target: string, storedSessionId: null | string): Promise<void> {
   const list = desktopGit()?.worktreeList
 
   if (!list) {
@@ -53,14 +59,21 @@ async function loadWorktrees(target: string): Promise<void> {
     return
   }
 
+  const stillCurrent = () =>
+    inflightCwd === target &&
+    statusStillBelongsToActiveCwd(target) &&
+    statusStillBelongsToRequestingSession(storedSessionId)
+
   try {
     const worktrees = await list(target)
 
-    if (inflightCwd === target && statusStillBelongsToActiveCwd(target)) {
+    // Same ownership rule as the status probe: the worktree menu must not offer
+    // the previous conversation's worktrees after a switch (#71254).
+    if (stillCurrent()) {
       $repoWorktrees.set(worktrees)
     }
   } catch {
-    if (inflightCwd === target && statusStillBelongsToActiveCwd(target)) {
+    if (stillCurrent()) {
       $repoWorktrees.set([])
     }
   }
@@ -69,6 +82,7 @@ async function loadWorktrees(target: string): Promise<void> {
 interface RepoStatusRefreshRequest {
   probe: (cwd: string) => Promise<HermesRepoStatus | null>
   seq: number
+  storedSessionId: null | string
   target: string
 }
 
@@ -94,29 +108,55 @@ const statusStillBelongsToActiveCwd = (target: string): boolean => {
   return !active || active === target
 }
 
+// The cwd check above cannot see a conversation switch that has not re-homed
+// $currentCwd yet: the switch publishes the new stored-session id first and the
+// new cwd only lands when the resume settles, so mid-switch the PREVIOUS
+// conversation's path still reads as "active" and its probe result looks valid
+// (#71254). Two things are therefore required, and neither is sufficient alone.
+//
+// First, a result belongs to the conversation that asked for it. A probe started
+// under the previous chat must not publish under the new one.
+const statusStillBelongsToRequestingSession = (storedSessionId: null | string): boolean =>
+  storedSessionId === ($selectedStoredSessionId.get() ?? null)
+
+// Second — and this is what actually closes the window — a probe must not RUN
+// against a path the selected conversation does not own yet. Dropping late
+// results only delays the symptom: the switch schedules a fresh refresh, and
+// when that fires it reads the still-stale $currentCwd, tags it with the NEW
+// stored id, and republishes the previous repo as though it were the new
+// conversation's. Withholding until the workspace is re-homed is what makes the
+// switch atomic.
+const workspaceIsSettledForSelectedSession = (): boolean => workspaceCwdBelongsToSelectedSession()
+
 /**
  * Re-probe the working tree for `cwd` (defaults to the active session's cwd).
  * Best-effort: a non-repo, a remote backend, or a missing probe clears the
  * status so the rail hides rather than showing stale data.
  */
-async function runRepoStatusRefresh({ probe, seq, target }: RepoStatusRefreshRequest): Promise<void> {
+async function runRepoStatusRefresh({ probe, seq, storedSessionId, target }: RepoStatusRefreshRequest): Promise<void> {
+  const stillCurrent = () =>
+    seq === repoStatusRefreshSeq &&
+    inflightCwd === target &&
+    statusStillBelongsToActiveCwd(target) &&
+    statusStillBelongsToRequestingSession(storedSessionId)
+
   try {
     const status = await probe(target)
 
     // Drop the result if the cwd moved on while we were probing (a fast session
     // switch) — the newer probe owns the atom.
-    if (seq === repoStatusRefreshSeq && inflightCwd === target && statusStillBelongsToActiveCwd(target)) {
+    if (stillCurrent()) {
       $repoStatus.set(status)
 
       // Worktrees only matter inside a repo; clear them otherwise.
       if (status) {
-        void loadWorktrees(target)
+        void loadWorktrees(target, storedSessionId)
       } else {
         $repoWorktrees.set([])
       }
     }
   } catch {
-    if (seq === repoStatusRefreshSeq && inflightCwd === target && statusStillBelongsToActiveCwd(target)) {
+    if (stillCurrent()) {
       $repoStatus.set(null)
       $repoWorktrees.set([])
     }
@@ -142,8 +182,16 @@ export function refreshRepoStatus(cwd?: null | string): Promise<void> {
   const target = normalizeCwd(cwd ?? $currentCwd.get())
   const probe = desktopGit()?.repoStatus
   const seq = (repoStatusRefreshSeq += 1)
+  const storedSessionId = $selectedStoredSessionId.get() ?? null
 
-  if (!target || !probe) {
+  // An explicit target is a caller telling us which workspace to read (a folder
+  // pick, the cwd subscription passing the value it just committed), so it is
+  // trustworthy on its own. A defaulted target is only as good as $currentCwd,
+  // which mid-switch still holds the previous conversation's folder — probing it
+  // then is what republished stale Git facts under the new chat (#71254).
+  const targetIsOwnedBySelectedSession = cwd != null || workspaceIsSettledForSelectedSession()
+
+  if (!target || !probe || !targetIsOwnedBySelectedSession) {
     pendingRepoStatusRefresh = null
     inflightCwd = null
     $repoStatus.set(null)
@@ -154,7 +202,7 @@ export function refreshRepoStatus(cwd?: null | string): Promise<void> {
   }
 
   inflightCwd = target
-  pendingRepoStatusRefresh = { probe, seq, target }
+  pendingRepoStatusRefresh = { probe, seq, storedSessionId, target }
   $repoStatusLoading.set(true)
 
   if (!repoStatusRefreshInFlight) {
@@ -194,11 +242,29 @@ $currentCwd.subscribe(cwd => {
 // subscription above won't fire when the path is identical, so the branch label
 // would stay stale until a window focus or turn-settle triggers a refresh.
 // Treat the stored-session id as a structural edge in its own right.
-$selectedStoredSessionId.subscribe(() => scheduleRepoStatusRefresh())
+//
+// Clearing here (not just re-probing) is what keeps a conversation switch
+// atomic: the new conversation's cwd arrives asynchronously, so between the
+// switch and its resume we know the painted repo facts belong to the PREVIOUS
+// conversation but not yet what replaces them. Showing nothing is honest;
+// showing the old repo's branch is the stale Git indicator in #71254.
+$selectedStoredSessionId.subscribe(() => {
+  $repoStatus.set(null)
+  $repoWorktrees.set([])
+  scheduleRepoStatusRefresh()
+})
 
 // A worktree add/remove (desktop op, or the agent's out-of-band git in a settled
 // turn / a window refocus — both already bump this token) → re-probe.
 $worktreeRefreshToken.subscribe(() => scheduleRepoStatusRefresh())
+
+// The newly selected conversation re-homed the workspace → the refresh that was
+// withheld mid-switch can finally run. Ownership has to be a structural edge in
+// its own right: when two conversations share a folder the path never changes,
+// so the cwd subscription cannot fire, and nothing else would re-arm the probe.
+// The rail would then stay blank until an unrelated edge (turn settle, refocus)
+// happened along.
+$workspaceCwdOwner.subscribe(() => scheduleRepoStatusRefresh())
 
 // A file-mutating tool finished (event-driven, not polled) → re-probe so the
 // rail's branch/+/- move exactly when the agent touches the tree.
