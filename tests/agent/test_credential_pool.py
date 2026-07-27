@@ -2273,9 +2273,38 @@ def test_get_custom_provider_pool_key(tmp_path, monkeypatch):
 
     assert get_custom_provider_pool_key("https://api.together.ai/v1") == "custom:together.ai"
     assert get_custom_provider_pool_key("https://api.together.ai/v1/") == "custom:together.ai"
+    assert get_custom_provider_pool_key("HTTPS://API.together.ai/v1") == "custom:together.ai"
     assert get_custom_provider_pool_key("http://localhost:8080/v1") == "custom:my-local-server"
     assert get_custom_provider_pool_key("https://unknown.example.com/v1") is None
     assert get_custom_provider_pool_key("") is None
+
+
+def test_get_custom_provider_pool_key_distinguishes_query_trailing_slash(
+    tmp_path, monkeypatch,
+):
+    """Query values are credential-scope: ?tenant=a/ must not match ?tenant=a."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
+    import yaml
+    config_path = tmp_path / "hermes" / "config.yaml"
+    config_path.write_text(yaml.dump({
+        "custom_providers": [
+            {
+                "name": "trusted-private",
+                "base_url": "https://trusted.internal/v1?tenant=a/",
+                "api_key": "sk-xxx",
+            },
+        ]
+    }))
+
+    from agent.credential_pool import get_custom_provider_pool_key
+
+    assert (
+        get_custom_provider_pool_key("https://trusted.internal/v1?tenant=a/")
+        == "custom:trusted-private"
+    )
+    assert get_custom_provider_pool_key("https://trusted.internal/v1?tenant=a") is None
+    assert get_custom_provider_pool_key("https://trusted.internal/v1?tenant=A/") is None
 
 
 def test_get_custom_provider_pool_key_prefers_name_over_base_url(tmp_path, monkeypatch):
