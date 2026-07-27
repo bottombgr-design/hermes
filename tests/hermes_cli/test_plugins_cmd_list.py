@@ -164,6 +164,48 @@ def test_discover_all_plugins_includes_external_collection_and_checkout(monkeypa
     ]
 
 
+def test_discover_all_plugins_unenabled_external_does_not_shadow_bundled(
+    monkeypatch, tmp_path
+):
+    bundled_dir = tmp_path / "bundled"
+    user_dir = tmp_path / "user"
+    external_dir = tmp_path / "external"
+    bundled_plugin = bundled_dir / "shared-plugin"
+    external_plugin = external_dir / "shared-plugin"
+    user_dir.mkdir()
+    bundled_plugin.mkdir(parents=True)
+    external_plugin.mkdir(parents=True)
+    (bundled_plugin / "plugin.yaml").write_text(
+        "name: shared-plugin\nversion: 1.0.0\ndescription: Bundled\n"
+    )
+    (external_plugin / "plugin.yaml").write_text(
+        "name: shared-plugin\nversion: 2.0.0\ndescription: External\n"
+    )
+
+    monkeypatch.setattr(plugins_cmd, "_plugins_dir", lambda: user_dir)
+    monkeypatch.setattr("hermes_cli.plugins.get_bundled_plugins_dir", lambda: bundled_dir)
+    monkeypatch.setattr(
+        "hermes_cli.plugins._get_extra_plugin_paths",
+        lambda: [external_dir],
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd.importlib.metadata, "entry_points", lambda: [])
+
+    entries = plugins_cmd._discover_all_plugins()
+
+    assert entries == [
+        (
+            "shared-plugin",
+            "1.0.0",
+            "Bundled",
+            "bundled",
+            bundled_plugin,
+            "shared-plugin",
+        )
+    ]
+
+
 def test_discover_all_plugins_includes_enabled_project_plugins(monkeypatch, tmp_path):
     bundled_dir = tmp_path / "bundled"
     user_dir = tmp_path / "user"
