@@ -6,7 +6,6 @@ import { desktopSlashCommandTakesArgs } from '@/lib/desktop-slash-commands'
 
 import {
   COMPLETION_ACTIONS,
-  isSkillItem,
   slashArgStage,
   slashChipKindForItem,
   slashCommandToken
@@ -138,11 +137,10 @@ export function useComposerTrigger({
 
     const items = triggerAdapter.search(trigger.query)
 
-    // Mid-message only offers SKILLS. A built-in like `/model` or `/new` acts
-    // on the app, so it's meaningless as a reference inside prose — only a
-    // skill reads as "handle this part with X". Filtering here rather than in
-    // the fetcher keeps one completion source for both shapes.
-    setTriggerItems(trigger.inline ? items.filter(isSkillItem) : items)
+    // A valid slash boundary exposes the same searchable catalog everywhere.
+    // Command execution remains guarded by the submit path; this layer only
+    // owns discovery and insertion at the caret.
+    setTriggerItems(items)
   }, [trigger, triggerAdapter])
 
   const triggerLoading = trigger?.kind === '@' ? at.loading : trigger?.kind === '/' ? slash.loading : false
