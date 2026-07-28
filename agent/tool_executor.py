@@ -293,6 +293,38 @@ def _tool_search_scoped_names(agent) -> frozenset:
     return names
 
 
+def _tool_search_scoped_direct_names(agent) -> frozenset:
+    """Return eager tool names visible in this session.
+
+    This is the companion scope gate for recovering a model-emitted
+    ``tool_call`` wrapper around an already visible tool.  It is deliberately
+    derived from the same session-scoped definitions as the deferred catalog,
+    so compatibility unwrapping cannot widen tool access.
+    """
+    try:
+        import model_tools
+        from tools import tool_search as _ts
+    except Exception:
+        return frozenset()
+
+    try:
+        scoped_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
+        return frozenset(
+            name
+            for td in scoped_defs
+            if (name := (td.get("function") or {}).get("name", ""))
+            and name not in _ts.BRIDGE_TOOL_NAMES
+            and not _ts.is_deferrable_tool_name(name)
+        )
+    except Exception:
+        return frozenset()
+
+
 @dataclass
 class _ManagedToolResult:
     result: Any
@@ -705,7 +737,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
+                    function_args,
+                    allow_eager=True,
+                )
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
                         # Probe-validate before unwrapping (ironclaw#5149):
@@ -717,6 +752,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         else:
                             function_name = _underlying
                             function_args = _underlying_args
+                    elif _underlying in _tool_search_scoped_direct_names(agent):
+                        function_name = _underlying
+                        function_args = _underlying_args
                     else:
                         _ts_scope_block = (
                             f"'{_underlying}' is not available in this session. "
@@ -1379,7 +1417,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
+                    function_args,
+                    allow_eager=True,
+                )
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
                         # Probe-validate before unwrapping (ironclaw#5149):
@@ -1401,6 +1442,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         else:
                             function_name = _underlying
                             function_args = _underlying_args
+                    elif _underlying in _tool_search_scoped_direct_names(agent):
+                        function_name = _underlying
+                        function_args = _underlying_args
                     else:
                         _ts_scope_block = (
                             f"'{_underlying}' is not available in this session. "

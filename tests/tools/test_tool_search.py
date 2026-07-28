@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from types import SimpleNamespace
 from typing import List, Dict, Any
 
 import pytest
@@ -387,12 +388,22 @@ class TestBridgeDispatch:
         result = dispatch_tool_describe({}, current_tool_defs=[])
         assert "error" in json.loads(result)
 
-    def test_tool_describe_rejects_non_deferrable(self):
-        """If the model asks to describe a core tool, refuse — it's already
-        in the visible list."""
+    def test_tool_describe_recovers_visible_eager_tool(self):
+        """An eager tool bridge mistake returns its schema and direct-call hint."""
         from tools.tool_search import dispatch_tool_describe
         result = dispatch_tool_describe(
             {"name": "terminal"}, current_tool_defs=[_td("terminal", "Run shell")],
+        )
+        payload = json.loads(result)
+        assert payload["name"] == "terminal"
+        assert payload["invocation"] == "direct"
+        assert "Call 'terminal' directly" in payload["hint"]
+
+    def test_tool_describe_rejects_unavailable_non_deferrable(self):
+        from tools.tool_search import dispatch_tool_describe
+        result = dispatch_tool_describe(
+            {"name": "not_in_this_session"},
+            current_tool_defs=[_td("terminal", "Run shell")],
         )
         assert "error" in json.loads(result)
 
@@ -455,6 +466,53 @@ class TestHandleFunctionCallIntegration:
         # Without a real registry, the matches will be empty, but the
         # dispatch path completed without error.
         assert "matches" in parsed or "error" in parsed
+
+    def test_tool_call_transparently_dispatches_visible_eager_tool(self, monkeypatch):
+        """A mistaken bridge wrapper around an eager tool must not fail-loop."""
+        import model_tools
+
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **_kw: [_td("terminal", "Run shell")],
+        )
+        seen = {}
+
+        def _dispatch(name, args, **_kw):
+            seen.update(name=name, args=args)
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr(model_tools.registry, "dispatch", _dispatch)
+        result = model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={
+                "name": "terminal",
+                "arguments": {"command": "echo recovered"},
+            },
+        )
+
+        assert json.loads(result) == {"ok": True}
+        assert seen == {
+            "name": "terminal",
+            "args": {"command": "echo recovered"},
+        }
+
+    def test_agent_direct_scope_uses_session_visible_tools(self, monkeypatch):
+        """The agent-side unwrap cannot recover an out-of-scope eager tool."""
+        import model_tools
+        from agent.tool_executor import _tool_search_scoped_direct_names
+
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **_kw: [_td("terminal", "Run shell")],
+        )
+        agent = SimpleNamespace(
+            enabled_toolsets=["terminal"],
+            disabled_toolsets=None,
+        )
+
+        assert _tool_search_scoped_direct_names(agent) == frozenset({"terminal"})
 
 
 class TestRegression_OpenClawCron84141:
