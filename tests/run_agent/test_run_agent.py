@@ -2615,6 +2615,14 @@ class TestExecuteToolCalls:
         assert "API call failed" not in output
         assert "Rate limit reached" not in output
 
+    def test_chat_returns_error_when_result_has_no_final_response(self, agent):
+        with patch.object(
+            agent,
+            "run_conversation",
+            return_value={"completed": False, "failed": True, "error": "Invalid API response"},
+        ):
+            assert agent.chat("hello") == "Invalid API response"
+
 
 class TestRetryAfterCap:
     """#26293: the conversation loop owns rate-limit backoff and honors the

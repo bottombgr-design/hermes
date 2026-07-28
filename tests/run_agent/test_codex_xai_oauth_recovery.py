@@ -31,7 +31,7 @@ Three distinct failure modes the user community hit during rollout:
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -301,6 +301,77 @@ def test_codex_stream_truncated_no_terminal_event_raises():
 
     with pytest.raises(RuntimeError, match="did not emit a terminal response"):
         agent._run_codex_stream({}, client=mock_client)
+
+
+def test_codex_stream_nonetype_iterable_typeerror_falls_back():
+    """openai-python can raise TypeError on reasoning summary=None frames."""
+    agent = _make_codex_agent()
+
+    mock_client = MagicMock()
+    fallback_response = SimpleNamespace(output=[], status="completed")
+    mock_client.responses.create.side_effect = [
+        TypeError("'NoneType' object is not iterable"),
+        fallback_response,
+    ]
+
+    result = agent._run_codex_stream({}, client=mock_client)
+
+    assert result is fallback_response
+    assert mock_client.responses.create.call_count == 2
+    assert "stream" in mock_client.responses.create.call_args_list[0].kwargs
+    assert "stream" not in mock_client.responses.create.call_args_list[1].kwargs
+
+
+def test_codex_create_stream_fallback_nonetype_iterable_uses_nonstream_create():
+    """If the stream fallback hits the same SDK bug, bypass streaming entirely."""
+    agent = _make_codex_agent()
+
+    mock_client = MagicMock()
+    final_response = SimpleNamespace(output=[], status="completed")
+    mock_client.responses.create.side_effect = [
+        TypeError("'NoneType' object is not iterable"),
+        final_response,
+    ]
+
+    result = agent._run_codex_create_stream_fallback(
+        {"model": "gpt-5.3-codex", "instructions": "sys", "input": []},
+        client=mock_client,
+    )
+
+    assert result is final_response
+    assert mock_client.responses.create.call_count == 2
+    first_kwargs = mock_client.responses.create.call_args_list[0].kwargs
+    second_kwargs = mock_client.responses.create.call_args_list[1].kwargs
+    assert first_kwargs["stream"] is True
+    assert "stream" not in second_kwargs
+
+
+def test_codex_create_stream_fallback_iterator_nonetype_iterable_uses_nonstream_create():
+    """The null-summary SDK bug can also fire while consuming the stream."""
+    agent = _make_codex_agent()
+
+    class BrokenStream:
+        def __iter__(self):
+            raise TypeError("'NoneType' object is not iterable")
+
+        def close(self):
+            pass
+
+    mock_client = MagicMock()
+    final_response = SimpleNamespace(output=[], status="completed")
+    mock_client.responses.create.side_effect = [BrokenStream(), final_response]
+
+    result = agent._run_codex_create_stream_fallback(
+        {"model": "gpt-5.3-codex", "instructions": "sys", "input": []},
+        client=mock_client,
+    )
+
+    assert result is final_response
+    assert mock_client.responses.create.call_count == 2
+    first_kwargs = mock_client.responses.create.call_args_list[0].kwargs
+    second_kwargs = mock_client.responses.create.call_args_list[1].kwargs
+    assert first_kwargs["stream"] is True
+    assert "stream" not in second_kwargs
 
 
 # ---------------------------------------------------------------------------
