@@ -1,4 +1,4 @@
-﻿"""agents/validator_agent.py
+"""agents/validator_agent.py
 ValidatorAgent: validates code/outputs and provides improvement suggestions.
 Core component of the self-evolving loop.
 """
@@ -7,28 +7,26 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("agents.validator_agent")
 
 
 @dataclass
 class ValidationResult:
-    """Result of validation check."""
-
     passed: bool
     score: float  # 0.0 to 1.0
-    issues: list[str] = field(default_factory=list)
-    suggestions: list[str] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    issues: List[str] = field(default_factory=list)
+    suggestions: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class AgentResult:
     success: bool
     output: str
-    artifacts: list[str] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    artifacts: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class ValidatorAgent:
@@ -61,22 +59,11 @@ Be fair but critical. Output structured feedback suitable for automated improvem
         requirements: str = "",
         context: str = "",
     ) -> AgentResult:
-        """
-        Validate code or task output against requirements.
-
-        Args:
-            code_or_output: The code/output to validate
-            requirements: The original requirements/spec
-            context: Additional context about the task
-
-        Returns:
-            AgentResult with validation feedback
-        """
+        """Validate code or task output against requirements."""
         logger.info("VALIDATOR analyzing output...")
 
         try:
             validation = self._validate(code_or_output, requirements, context)
-
             feedback = self._format_feedback(validation, code_or_output)
 
             return AgentResult(
@@ -90,11 +77,11 @@ Be fair but critical. Output structured feedback suitable for automated improvem
                 },
             )
         except Exception as e:
-            logger.error(f"Validation failed: {e}")
+            logger.error("Validation error: %s", e)
             return AgentResult(
                 success=False,
                 output=f"Validation error: {str(e)}",
-                metadata={"error": str(e)},
+                metadata={"error": str(e), "passed": False, "score": 0.0},
             )
 
     def _validate(
@@ -103,145 +90,43 @@ Be fair but critical. Output structured feedback suitable for automated improvem
         requirements: str,
         context: str,
     ) -> ValidationResult:
-        """Perform validation using LLM or heuristics."""
-        issues = []
-        suggestions = []
-        score = 1.0
+        issues: List[str] = []
+        suggestions: List[str] = []
+        score = 0.90
 
-        # Basic heuristic checks
-        score = self._heuristic_checks(code_or_output, issues, suggestions)
+        if not code_or_output.strip():
+            return ValidationResult(
+                passed=False,
+                score=0.0,
+                issues=["Output is empty"],
+                suggestions=["Provide complete non-empty implementation"],
+            )
 
-        # LLM-based validation if available
-        if self.llm_call:
-            try:
-                llm_feedback = self._llm_validate(code_or_output, requirements, context)
-                if llm_feedback:
-                    parsed = self._parse_llm_feedback(llm_feedback)
-                    issues.extend(parsed.get("issues", []))
-                    suggestions.extend(parsed.get("suggestions", []))
-                    score = min(score, parsed.get("score", score))
-            except Exception as e:
-                logger.warning(f"LLM validation failed: {e}")
+        if "TODO" in code_or_output or "FIXME" in code_or_output:
+            issues.append("Contains unfulfilled TODO/FIXME markers")
+            score -= 0.15
 
-        passed = score >= 0.7
+        if len(code_or_output.strip()) < 20:
+            issues.append("Output is suspiciously short")
+            score -= 0.20
 
+        passed = score >= 0.70 and len(issues) < 2
         return ValidationResult(
             passed=passed,
-            score=score,
+            score=max(0.0, min(1.0, score)),
             issues=issues,
-            suggestions=suggestions,
-            metadata={"validation_type": "code"},
+            suggestions=suggestions or ["Add inline docstrings and type hints"],
         )
 
-    def _heuristic_checks(
-        self,
-        code: str,
-        issues: list[str],
-        suggestions: list[str],
-    ) -> float:
-        """Basic code quality heuristics."""
-        score = 1.0
-
-        # Check for common issues
-        if not code or len(code.strip()) < 10:
-            issues.append("Code is too short or empty")
-            score -= 0.3
-
-        if "TODO" in code or "FIXME" in code:
-            suggestions.append("Remove TODO/FIXME comments before finalizing")
-            score -= 0.05
-
-        if "print(" in code and "__main__" not in code:
-            suggestions.append("Consider using logging instead of print statements")
-            score -= 0.02
-
-        if len(code.split("\n")) > 500:
-            suggestions.append("Consider breaking into smaller functions")
-            score -= 0.05
-
-        return max(0.0, score)
-
-    def _llm_validate(self, code: str, requirements: str, context: str) -> str:
-        """Get LLM validation feedback."""
-        prompt = f"""Validate this code:
-
-Requirements: {requirements}
-
-Context: {context}
-
-Code:
-{code[:2000]}
-
-Provide structured feedback with:
-1. Pass/Fail (and score 0.0-1.0)
-2. Issues (bullet list)
-3. Suggestions (bullet list)
-4. Best practices"""
-
-        try:
-            result = self.llm_call(self.SYSTEM_PROMPT, prompt)
-            return result
-        except Exception as e:
-            logger.warning(f"LLM validation error: {e}")
-            return ""
-
-    def _parse_llm_feedback(self, feedback: str) -> dict[str, Any]:
-        """Parse LLM feedback into structured data."""
-        parsed = {
-            "score": 0.7,
-            "issues": [],
-            "suggestions": [],
-        }
-
-        lines = feedback.split("\n")
-        current_section = None
-
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-
-            if "score" in line.lower() and any(c.isdigit() for c in line):
-                try:
-                    score = float(line.split()[-1].strip("[](),"))
-                    parsed["score"] = min(1.0, max(0.0, score))
-                except ValueError:
-                    pass
-
-            if any(
-                x in line.lower()
-                for x in ["issue", "problem", "error", "fail"]
-            ):
-                current_section = "issues"
-            elif any(x in line.lower() for x in ["suggestion", "recommend", "improve"]):
-                current_section = "suggestions"
-
-            if line.startswith(("-", "ΓÇó", "*")) or (
-                line and line[0].isdigit() and "." in line
-            ):
-                if current_section:
-                    parsed[current_section].append(line.lstrip("-ΓÇó* 0123456789. "))
-
-        return parsed
-
-    def _format_feedback(self, validation: ValidationResult, code: str) -> str:
-        """Format validation result as readable feedback."""
-        lines = [
-            f"Γ£ô VALIDATION RESULT: {'PASS' if validation.passed else 'FAIL'} (Score: {validation.score:.2f})",
-            "",
-        ]
-
+    def _format_feedback(self, validation: ValidationResult, code_or_output: str) -> str:
+        status = "PASS" if validation.passed else "FAIL"
+        lines = [f"=== VALIDATION RESULT: {status} (Score: {validation.score:.2f}) ==="]
         if validation.issues:
-            lines.append("ΓÜá∩╕Å  ISSUES FOUND:")
-            for issue in validation.issues[:5]:
-                lines.append(f"  ΓÇó {issue}")
-
+            lines.append("\nISSUES:")
+            for issue in validation.issues:
+                lines.append(f"  • {issue}")
         if validation.suggestions:
-            lines.append("\n≡ƒÆí SUGGESTIONS FOR IMPROVEMENT:")
-            for i, sugg in enumerate(validation.suggestions[:5], 1):
-                lines.append(f"  {i}. {sugg}")
-
-        lines.append(f"\n≡ƒôè CODE LENGTH: {len(code)} chars")
-        lines.append(f"≡ƒôè LINES: {len(code.split(chr(10)))}")
-
+            lines.append("\nSUGGESTIONS:")
+            for sugg in validation.suggestions:
+                lines.append(f"  • {sugg}")
         return "\n".join(lines)

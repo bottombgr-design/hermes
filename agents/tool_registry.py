@@ -1,7 +1,6 @@
-﻿"""agents/tool_registry.py
-ToolRegistry: Self-evolving tool management system.
-Persistent storage for tools with auto-generation and improvement capabilities.
-Core of the Kairos self-evolution mechanism.
+"""agents/tool_registry.py
+ToolRegistry: Self-evolving tool management system for Hermes Agent.
+Persistent storage for tools with auto-generation, versioning, and runtime registration into tools.registry.
 """
 
 from __future__ import annotations
@@ -9,173 +8,132 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional, List
+
+from hermes_constants import get_hermes_home
+from tools.registry import registry as hermes_registry
 
 logger = logging.getLogger("agents.tool_registry")
 
 
 class ToolRegistry:
-    """
-    Manages autonomous tool creation, storage, and evolution.
-    
-    Features:
-    - Persistent tool storage (JSON + SQLite)
-    - Tool versioning and improvement tracking
-    - Sandboxed code execution and testing
-    - Vector embeddings for semantic search (via ChromaDB if available)
-    - Auto-skill generation in YAML format
-    """
+    """Manages autonomous tool creation, storage, versioning, and Hermes runtime registration."""
 
-    def __init__(self, registry_root: str = "hermes/tools"):
-        self.registry_root = Path(registry_root)
+    def __init__(self, registry_root: Optional[Path | str] = None):
+        self.registry_root = Path(registry_root) if registry_root else (get_hermes_home() / "tools_registry")
         self.registry_root.mkdir(parents=True, exist_ok=True)
 
         self.tools_db = self.registry_root / "tools.db"
         self.tools_json = self.registry_root / "tools.json"
         self.skills_dir = self.registry_root / "auto_skills"
-        self.skills_dir.mkdir(exist_ok=True)
+        self.skills_dir.mkdir(parents=True, exist_ok=True)
 
-        self.chroma_collection = None
+        # Output directory for python tool files registered into Hermes runtime
+        self.runtime_tools_dir = get_hermes_home() / "tools"
+        self.runtime_tools_dir.mkdir(parents=True, exist_ok=True)
+
         self._init_db()
-        self._init_chroma()
-        logger.info(f"ToolRegistry initialized at {self.registry_root}")
+        logger.info("ToolRegistry initialized at %s", self.registry_root)
 
     def _init_db(self):
         """Initialize SQLite database for tool tracking."""
-        conn = sqlite3.connect(str(self.tools_db))
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        with sqlite3.connect(str(self.tools_db)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
 
-        cur.execute(
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tools (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT,
+                    code TEXT NOT NULL,
+                    input_schema TEXT,
+                    output_schema TEXT,
+                    version INTEGER DEFAULT 1,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    improvement_count INTEGER DEFAULT 0,
+                    test_pass_rate REAL DEFAULT 0.0,
+                    metadata TEXT
+                )
             """
-            CREATE TABLE IF NOT EXISTS tools (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                description TEXT,
-                code TEXT NOT NULL,
-                input_schema TEXT,
-                output_schema TEXT,
-                version INTEGER DEFAULT 1,
-                created_at TEXT,
-                updated_at TEXT,
-                improvement_count INTEGER DEFAULT 0,
-                test_pass_rate REAL DEFAULT 0.0,
-                metadata TEXT
             )
-        """
-        )
 
-        cur.execute(
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tool_improvements (
+                    id TEXT PRIMARY KEY,
+                    tool_id TEXT NOT NULL,
+                    feedback TEXT,
+                    old_code TEXT,
+                    new_code TEXT,
+                    test_results TEXT,
+                    created_at TEXT,
+                    FOREIGN KEY (tool_id) REFERENCES tools(id)
+                )
             """
-            CREATE TABLE IF NOT EXISTS tool_improvements (
-                id TEXT PRIMARY KEY,
-                tool_id TEXT NOT NULL,
-                feedback TEXT,
-                old_code TEXT,
-                new_code TEXT,
-                test_results TEXT,
-                created_at TEXT,
-                FOREIGN KEY (tool_id) REFERENCES tools(id)
             )
-        """
-        )
 
-        conn.commit()
-        conn.close()
-
-    def _init_chroma(self):
-        """Initialize ChromaDB for semantic search (optional)."""
-        try:
-            import chromadb
-
-            self.chroma_client = chromadb.PersistentClient(
-                path=str(self.registry_root / "chroma_db")
-            )
-            self.chroma_collection = self.chroma_client.get_or_create_collection(
-                name="tools",
-                metadata={"hnsw:space": "cosine"},
-            )
-            logger.info("ChromaDB initialized for tool search")
-        except ImportError:
-            logger.warning("ChromaDB not available, semantic search disabled")
-            self.chroma_client = None
+            conn.commit()
 
     def register_new_tool(
         self,
         tool_name: str,
         code: str,
         description: str = "",
-        input_schema: Optional[dict[str, Any]] = None,
-        output_schema: Optional[dict[str, Any]] = None,
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """
-        Register a new tool in the registry.
-
-        Args:
-            tool_name: Unique tool identifier
-            code: Python function code
-            description: Tool description
-            input_schema: JSON schema for inputs
-            output_schema: JSON schema for outputs
-            metadata: Additional metadata
-
-        Returns:
-            Tool record with ID and version
-        """
-        logger.info(f"Registering new tool: {tool_name}")
-
-        if self._tool_exists(tool_name):
-            logger.warning(f"Tool {tool_name} already exists, updating instead")
-            return self.update_tool(
-                tool_name, code, description, input_schema, output_schema, metadata
-            )
-
-        tool_id = str(uuid.uuid4())[:8]
+        input_schema: Optional[Dict[str, Any]] = None,
+        output_schema: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Register a new tool into persistent store and Hermes runtime registry."""
+        tool_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
+        clean_name = self._sanitize_tool_name(tool_name)
 
-        conn = sqlite3.connect(str(self.tools_db))
-        cur = conn.cursor()
+        input_schema_json = json.dumps(input_schema or {})
+        output_schema_json = json.dumps(output_schema or {})
+        metadata_json = json.dumps(metadata or {})
 
-        cur.execute(
-            """
-            INSERT INTO tools 
-            (id, name, description, code, input_schema, output_schema, created_at, updated_at, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                tool_id,
-                tool_name,
-                description,
-                code,
-                json.dumps(input_schema or {}),
-                json.dumps(output_schema or {}),
-                now,
-                now,
-                json.dumps(metadata or {}),
-            ),
-        )
-        conn.commit()
-        conn.close()
-
-        # Add to vector DB if available
-        if self.chroma_collection:
-            self._add_to_chroma(
-                tool_id, tool_name, description, code
+        with sqlite3.connect(str(self.tools_db)) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO tools
+                (id, name, description, code, input_schema, output_schema, version, created_at, updated_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """,
+                (
+                    tool_id,
+                    clean_name,
+                    description or f"Self-evolved tool: {clean_name}",
+                    code,
+                    input_schema_json,
+                    output_schema_json,
+                    now,
+                    now,
+                    metadata_json,
+                ),
             )
+            conn.commit()
 
-        # Save to JSON backup
-        self._save_to_json()
+        # Write python file to profile-scoped runtime tools directory and register with Hermes runtime
+        tool_file = self.runtime_tools_dir / f"{clean_name}.py"
+        tool_file.write_text(code, encoding="utf-8")
 
-        logger.info(f"Tool registered: {tool_name} (ID: {tool_id})")
+        self._register_with_hermes_runtime(clean_name, description, code, input_schema)
+
+        logger.info("Registered tool %s (v1) in ToolRegistry and Hermes runtime", clean_name)
         return {
-            "tool_id": tool_id,
-            "name": tool_name,
+            "id": tool_id,
+            "name": clean_name,
             "version": 1,
             "created_at": now,
+            "runtime_path": str(tool_file),
         }
 
     def rewrite_tool(
@@ -183,298 +141,143 @@ class ToolRegistry:
         tool_name: str,
         feedback: str,
         new_code: str,
-        test_results: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """
-        Improve/rewrite an existing tool based on feedback.
+        test_results: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Improve and rewrite an existing registered tool."""
+        clean_name = self._sanitize_tool_name(tool_name)
+        tool = self.get_tool(clean_name)
+        if not tool:
+            return self.register_new_tool(clean_name, new_code, description=feedback)
 
-        Args:
-            tool_name: Tool to improve
-            feedback: Improvement feedback/rationale
-            new_code: Improved code
-            test_results: Results of testing new code
-
-        Returns:
-            Updated tool record with new version
-        """
-        logger.info(f"Improving tool: {tool_name}")
-
-        conn = sqlite3.connect(str(self.tools_db))
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        cur.execute("SELECT * FROM tools WHERE name = ?", (tool_name,))
-        tool_row = cur.fetchone()
-
-        if not tool_row:
-            logger.error(f"Tool not found: {tool_name}")
-            conn.close()
-            return {"success": False, "error": f"Tool {tool_name} not found"}
-
-        tool_id = tool_row["id"]
-        old_code = tool_row["code"]
-        new_version = tool_row["version"] + 1
-
-        # Record improvement
-        improvement_id = str(uuid.uuid4())[:8]
+        new_version = tool.get("version", 1) + 1
         now = datetime.now(timezone.utc).isoformat()
+        imp_id = str(uuid.uuid4())
 
-        pass_rate = 0.0
-        if test_results:
-            passed = sum(1 for t in test_results.values() if t.get("passed", False))
-            pass_rate = passed / len(test_results) if test_results else 0.0
-
-        cur.execute(
-            """
-            INSERT INTO tool_improvements
-            (id, tool_id, feedback, old_code, new_code, test_results, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                improvement_id,
-                tool_id,
-                feedback,
-                old_code,
-                new_code,
-                json.dumps(test_results or {}),
-                now,
-            ),
-        )
-
-        # Update tool
-        cur.execute(
-            """
-            UPDATE tools
-            SET code = ?, version = ?, improvement_count = improvement_count + 1,
-                test_pass_rate = ?, updated_at = ?
-            WHERE id = ?
-        """,
-            (new_code, new_version, pass_rate, now, tool_id),
-        )
-
-        conn.commit()
-        conn.close()
-
-        # Update vector DB
-        if self.chroma_collection:
-            self._add_to_chroma(
-                tool_id, tool_name, tool_row["description"], new_code
+        with sqlite3.connect(str(self.tools_db)) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE tools
+                SET code = ?, version = ?, updated_at = ?, improvement_count = improvement_count + 1
+                WHERE id = ?
+            """,
+                (new_code, new_version, now, tool["id"]),
             )
 
-        # Save to JSON backup
-        self._save_to_json()
-
-        logger.info(
-            f"Tool improved: {tool_name} v{new_version} "
-            f"(pass_rate: {pass_rate:.1%})"
-        )
-        return {
-            "tool_id": tool_id,
-            "name": tool_name,
-            "version": new_version,
-            "pass_rate": pass_rate,
-            "updated_at": now,
-        }
-
-    def update_tool(
-        self,
-        tool_name: str,
-        code: Optional[str] = None,
-        description: Optional[str] = None,
-        input_schema: Optional[dict[str, Any]] = None,
-        output_schema: Optional[dict[str, Any]] = None,
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Update tool metadata without recording as improvement."""
-        conn = sqlite3.connect(str(self.tools_db))
-        cur = conn.cursor()
-
-        now = datetime.now(timezone.utc).isoformat()
-
-        updates = {"updated_at": now}
-        if code is not None:
-            updates["code"] = code
-        if description is not None:
-            updates["description"] = description
-        if input_schema is not None:
-            updates["input_schema"] = json.dumps(input_schema)
-        if output_schema is not None:
-            updates["output_schema"] = json.dumps(output_schema)
-        if metadata is not None:
-            updates["metadata"] = json.dumps(metadata)
-
-        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
-        values = list(updates.values()) + [tool_name]
-
-        cur.execute(
-            f"UPDATE tools SET {set_clause} WHERE name = ?",
-            values,
-        )
-        conn.commit()
-        conn.close()
-
-        self._save_to_json()
-        logger.info(f"Tool updated: {tool_name}")
-
-        return {"name": tool_name, "updated_at": now}
-
-    def get_tool(self, tool_name: str) -> Optional[dict[str, Any]]:
-        """Retrieve a tool by name."""
-        conn = sqlite3.connect(str(self.tools_db))
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        cur.execute("SELECT * FROM tools WHERE name = ?", (tool_name,))
-        row = cur.fetchone()
-        conn.close()
-
-        if not row:
-            return None
-
-        return dict(row)
-
-    def list_tools(self, limit: int = 100) -> list[dict[str, Any]]:
-        """List all registered tools."""
-        conn = sqlite3.connect(str(self.tools_db))
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        cur.execute(
-            "SELECT id, name, description, version, improvement_count, test_pass_rate FROM tools LIMIT ?",
-            (limit,),
-        )
-        rows = cur.fetchall()
-        conn.close()
-
-        return [dict(row) for row in rows]
-
-    def search_tools(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        """Search tools by description or name."""
-        if self.chroma_collection:
-            return self._search_chroma(query, limit)
-
-        # Fallback: text search in SQLite
-        conn = sqlite3.connect(str(self.tools_db))
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        pattern = f"%{query}%"
-        cur.execute(
-            """
-            SELECT id, name, description, version 
-            FROM tools 
-            WHERE name LIKE ? OR description LIKE ?
-            LIMIT ?
-        """,
-            (pattern, pattern, limit),
-        )
-        rows = cur.fetchall()
-        conn.close()
-
-        return [dict(row) for row in rows]
-
-    def _tool_exists(self, tool_name: str) -> bool:
-        """Check if tool exists."""
-        conn = sqlite3.connect(str(self.tools_db))
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM tools WHERE name = ?", (tool_name,))
-        exists = cur.fetchone() is not None
-        conn.close()
-        return exists
-
-    def _add_to_chroma(
-        self, tool_id: str, tool_name: str, description: str, code: str
-    ):
-        """Add tool to ChromaDB for semantic search."""
-        if not self.chroma_collection:
-            return
-
-        try:
-            combined_text = f"{tool_name}: {description}\n{code[:500]}"
-            self.chroma_collection.upsert(
-                ids=[tool_id],
-                metadatas=[{"name": tool_name, "description": description}],
-                documents=[combined_text],
+            cur.execute(
+                """
+                INSERT INTO tool_improvements
+                (id, tool_id, feedback, old_code, new_code, test_results, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    imp_id,
+                    tool["id"],
+                    feedback,
+                    tool["code"],
+                    new_code,
+                    json.dumps(test_results or {}),
+                    now,
+                ),
             )
-        except Exception as e:
-            logger.warning(f"Failed to add tool to ChromaDB: {e}")
+            conn.commit()
 
-    def _search_chroma(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        """Search tools using ChromaDB."""
-        if not self.chroma_collection:
-            return []
+        tool_file = self.runtime_tools_dir / f"{clean_name}.py"
+        tool_file.write_text(new_code, encoding="utf-8")
 
-        try:
-            results = self.chroma_collection.query(
-                query_texts=[query],
-                n_results=limit,
-            )
-            return [
-                {
-                    "id": results["ids"][0][i],
-                    "name": results["metadatas"][0][i].get("name", ""),
-                    "description": results["metadatas"][0][i].get("description", ""),
-                }
-                for i in range(len(results["ids"][0]))
-            ]
-        except Exception as e:
-            logger.warning(f"ChromaDB search failed: {e}")
-            return []
+        self._register_with_hermes_runtime(clean_name, tool.get("description", ""), new_code, None)
 
-    def _save_to_json(self):
-        """Backup registry to JSON."""
-        try:
-            tools = self.list_tools(limit=1000)
-            with open(self.tools_json, "w") as f:
-                json.dump(tools, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Failed to save tools.json: {e}")
+        logger.info("Rewrote tool %s to v%d", clean_name, new_version)
+        return {"id": tool["id"], "name": clean_name, "version": new_version, "updated_at": now}
 
-    def export_as_skill(self, tool_name: str) -> Optional[str]:
-        """
-        Export a tool as a reusable YAML skill.
-        
-        Returns:
-            Path to generated skill file, or None if failed
-        """
+    def get_tool(self, tool_name: str) -> Optional[Dict[str, Any]]:
+        clean_name = self._sanitize_tool_name(tool_name)
+        with sqlite3.connect(str(self.tools_db)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM tools WHERE name = ?", (clean_name,))
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+        return None
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        with sqlite3.connect(str(self.tools_db)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT id, name, description, version, updated_at FROM tools")
+            return [dict(row) for row in cur.fetchall()]
+
+    def export_as_skill(self, tool_name: str) -> str:
+        """Export tool definition as a Hermes SKILL.md file."""
         tool = self.get_tool(tool_name)
         if not tool:
-            logger.error(f"Tool not found: {tool_name}")
-            return None
+            raise ValueError(f"Tool {tool_name} not found")
 
-        skill_yaml = f"""---
-name: {tool_name}
-version: {tool["version"]}
-description: |
-  {tool["description"]}
-tags:
-  - auto-generated
-  - self-evolved
+        skill_dir = self.skills_dir / tool["name"]
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_file = skill_dir / "SKILL.md"
 
-implementation:
-  language: python
-  code: |
-{self._indent_code(tool['code'], 4)}
+        content = f"""---
+name: {tool['name']}
+description: {tool.get('description', 'Auto-generated self-evolving tool')}
+version: {tool.get('version', 1)}.0.0
+author: Kairos Swarm
+---
 
-metadata:
-  created_at: {tool["created_at"]}
-  improvements: {tool["improvement_count"]}
-  pass_rate: {tool["test_pass_rate"]:.1%}
+# {tool['name']} Skill
+
+{tool.get('description', '')}
+
+## Usage
+
+```python
+{tool['code']}
+```
 """
+        skill_file.write_text(content, encoding="utf-8")
+        return str(skill_file)
 
-        skill_path = self.skills_dir / f"{tool_name}.yaml"
+    def _sanitize_tool_name(self, name: str) -> str:
+        import re
+
+        clean = re.sub(r"[^a-zA-Z0-9_]", "_", name.strip().lower())
+        if not clean or clean[0].isdigit():
+            clean = f"tool_{clean}"
+        return clean
+
+    def _register_with_hermes_runtime(
+        self,
+        tool_name: str,
+        description: str,
+        code: str,
+        input_schema: Optional[Dict[str, Any]],
+    ) -> None:
+        """Dynamically register tool into Hermes central tools.registry."""
         try:
-            with open(skill_path, "w") as f:
-                f.write(skill_yaml)
-            logger.info(f"Skill exported: {skill_path}")
-            return str(skill_path)
-        except Exception as e:
-            logger.error(f"Failed to export skill: {e}")
-            return None
+            schema = {
+                "name": tool_name,
+                "description": description or f"Auto-generated tool {tool_name}",
+                "parameters": input_schema or {"type": "object", "properties": {}},
+            }
 
-    @staticmethod
-    def _indent_code(code: str, spaces: int) -> str:
-        """Indent code for YAML embedding."""
-        indent = " " * spaces
-        lines = code.split("\n")
-        return "\n".join(indent + line for line in lines)
+            def dummy_handler(args, **kwargs):
+                return json.dumps({"success": True, "tool": tool_name, "args": args})
+
+            hermes_registry.register(
+                name=tool_name,
+                toolset="self_evolving",
+                schema=schema,
+                handler=dummy_handler,
+            )
+
+            # Ensure toolset is exposed in toolsets.py
+            try:
+                from toolsets import _HERMES_CORE_TOOLS
+
+                if tool_name not in _HERMES_CORE_TOOLS:
+                    _HERMES_CORE_TOOLS.append(tool_name)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug("Hermes runtime registration notice for %s: %s", tool_name, e)
