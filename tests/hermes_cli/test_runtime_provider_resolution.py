@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_constants import get_hermes_home
 from hermes_cli import runtime_provider as rp
 
 
@@ -28,6 +29,27 @@ def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
 
     with pytest.raises(rp.AuthError, match="No usable credentials.*deepseek"):
         rp.resolve_runtime_provider()
+
+
+def test_builtin_provider_config_api_key_precedes_environment(monkeypatch):
+    """An explicit built-in provider key in config.yaml wins over its env key."""
+    (get_hermes_home() / "config.yaml").write_text(
+        "providers:\n"
+        "  deepseek:\n"
+        "    api_key: configured-deepseek-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "environment-deepseek-key")
+
+    from hermes_cli.config import load_config
+
+    assert load_config()["providers"]["deepseek"]["api_key"] == "configured-deepseek-key"
+    resolved = rp.resolve_runtime_provider(requested="deepseek")
+
+    assert resolved["provider"] == "deepseek"
+    assert resolved["base_url"] == "https://api.deepseek.com/v1"
+    assert resolved["api_key"] == "configured-deepseek-key"
+    assert resolved["source"] == "config:providers.deepseek.api_key"
 
 
 def test_noauth_lmstudio_still_resolves(monkeypatch):
