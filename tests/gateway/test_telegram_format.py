@@ -907,6 +907,45 @@ class TestEditMessageStreamingSafety:
         }
 
     @pytest.mark.asyncio
+    async def test_retryafter_fallback_strips_mdv2_and_clears_parse_mode(self):
+        """When edit_message's plain-text fallback itself hits RetryAfter
+        flood control, the retry must send the already-stripped plain text,
+        not the raw MarkdownV2 content.
+
+        Regression: the RetryAfter retry path previously sent ``text=content``
+        (raw ``**bold**`` markers) instead of the stripped fallback text.
+        """
+        from telegram.error import RetryAfter
+
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+        adapter._bot = MagicMock()
+        # Sequence: formatted send → RetryAfter (inner catches, falls back
+        # to plain text) → plain text send → RetryAfter (outer catches,
+        # sleeps, retries) → retry succeeds.
+        retry_err = RetryAfter(retry_after=1.0)
+        adapter._bot.edit_message_text = AsyncMock(
+            side_effect=[retry_err, retry_err, None],
+        )
+
+        result = await adapter.edit_message(
+            "123", "456", "hello **bold** world", finalize=True,
+        )
+
+        assert result.success is True
+        calls = adapter._bot.edit_message_text.await_args_list
+        # First call: MarkdownV2 formatted send.
+        assert calls[0].kwargs["parse_mode"] is not None
+        # Second call: plain text fallback (inner except).
+        assert calls[1].kwargs.get("parse_mode") is None
+        # Third call: RetryAfter retry must use the stripped plain text,
+        # NOT the raw content with ** markers.
+        assert calls[2].kwargs == {
+            "chat_id": 123,
+            "message_id": 456,
+            "text": "hello bold world",
+        }
+
+    @pytest.mark.asyncio
     async def test_message_too_long_splits_into_continuations_not_silent_truncation(self):
         """When edit_message_text exceeds Telegram's 4096 UTF-16 limit on
         finalize, the adapter must split the content across the existing
