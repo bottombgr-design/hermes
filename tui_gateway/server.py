@@ -15121,8 +15121,17 @@ def _(rid, params: dict) -> dict:
         cat_map: dict[str, list[list[str]]] = {}
         cat_order: list[str] = []
 
+        # This catalog feeds BOTH the Ink TUI and the Electron desktop slash
+        # palette. `desktop_only` commands are fulfilled by a desktop overlay
+        # and have no TUI handler, so they're included only when the caller
+        # identifies itself as the desktop surface.
+        want_desktop = str(params.get("surface") or "") == "desktop"
+
         for cmd in COMMAND_REGISTRY:
             if cmd.name in _TUI_HIDDEN or cmd.gateway_only:
+                continue
+
+            if cmd.desktop_only and not want_desktop:
                 continue
 
             c = f"/{cmd.name}"
@@ -16436,7 +16445,7 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"items": []})
 
     try:
-        from hermes_cli.commands import SlashCommandCompleter
+        from hermes_cli.commands import DESKTOP_ONLY_COMMANDS, SlashCommandCompleter
         from prompt_toolkit.document import Document
         from prompt_toolkit.formatted_text import to_plain_text
 
@@ -16475,6 +16484,24 @@ def _(rid, params: dict) -> dict:
             for c in completer.get_completions(doc, None)
         ][:30]
         text_lower = text.lower()
+        # Same desktop opt-in `commands.catalog` uses. `SlashCommandCompleter`
+        # walks `COMMANDS`, which deliberately excludes `desktop_only` commands
+        # so they stay out of CLI/TUI autocomplete — but the Electron popover
+        # completes typed prefixes through THIS method, so the desktop needs
+        # them back or `/con` shows "No matches" for a command it can run.
+        if str(params.get("surface") or "") == "desktop":
+            for cmd, desc in DESKTOP_ONLY_COMMANDS.items():
+                if cmd.startswith(text_lower) and not any(
+                    f"/{item['text']}".rstrip() == cmd for item in items
+                ):
+                    items.append(
+                        {
+                            "text": cmd.lstrip("/"),
+                            "display": cmd,
+                            "meta": desc,
+                            "kind": "command",
+                        }
+                    )
         extras = [
             {
                 "text": "/density",

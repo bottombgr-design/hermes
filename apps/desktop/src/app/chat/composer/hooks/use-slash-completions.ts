@@ -133,7 +133,12 @@ export function useSlashCompletions(options: {
 
       try {
         if (!query) {
-          const catalog = filterDesktopCommandsCatalog(await gateway.request<CommandsCatalogLike>('commands.catalog'))
+          // `surface: 'desktop'` opts this caller into commands the backend
+          // marks desktop-only (`/ctxwindow`), which the Ink TUI must not list
+          // because it has no handler for them.
+          const catalog = filterDesktopCommandsCatalog(
+            await gateway.request<CommandsCatalogLike>('commands.catalog', { surface: 'desktop' })
+          )
 
           // Prefer the categorized layout so the popover renders section headers
           // (Session, Tools & Skills, ...). Fall back to the flat list when the
@@ -153,7 +158,12 @@ export function useSlashCompletions(options: {
         }
 
         const result = await gateway.request<{ items?: CompletionEntry[]; replace_from?: number }>('complete.slash', {
-          text
+          text,
+          // Same desktop opt-in as the empty-query catalog above. Without it a
+          // typed prefix (`/ctxw`) misses desktop-only commands entirely, so
+          // `/ctxwindow` would only be discoverable by opening the bare `/`
+          // list — not "as convenient as /model".
+          surface: 'desktop'
         })
 
         // Arg-completion items (replace_from > 1) carry just the arg stub —
