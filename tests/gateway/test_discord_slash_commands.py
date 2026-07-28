@@ -103,7 +103,7 @@ def adapter():
     adapter._client = SimpleNamespace(
         tree=FakeTree(),
         get_channel=lambda _id: None,
-        fetch_channel=AsyncMock(),
+        fetch_channel=AsyncMock(return_value=None),
         user=SimpleNamespace(id=99999, name="HermesBot"),
     )
     adapter._text_batch_delay_seconds = 0  # disable batching for tests
@@ -659,8 +659,10 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
     thread = SimpleNamespace(id=555, name="Hello")
     seed_message = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
     message = SimpleNamespace(
+        id=123,
         content="Hello",
         create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
+        thread=None,
         channel=SimpleNamespace(send=AsyncMock(return_value=seed_message)),
         author=SimpleNamespace(display_name="Jezza"),
     )
@@ -678,8 +680,10 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
 @pytest.mark.asyncio
 async def test_auto_create_thread_returns_none_when_direct_and_fallback_fail(adapter):
     message = SimpleNamespace(
+        id=123,
         content="Hello",
         create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
+        thread=None,
         channel=SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("send failed"))),
         author=SimpleNamespace(display_name="Jezza"),
     )
