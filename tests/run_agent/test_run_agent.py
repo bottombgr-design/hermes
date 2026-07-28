@@ -2215,6 +2215,9 @@ class TestBuildAssistantMessage:
         assert result["reasoning_details"][0]["text"] == "step1"
 
     def test_empty_content(self, agent):
+        # The builder stores textless turns as-is; wire safety for strict
+        # providers ("assistant must not be empty" 400s) is owned by
+        # repair_empty_non_final_messages at the send boundary, not here.
         msg = _mock_assistant_msg(content=None)
         result = agent._build_assistant_message(msg, "stop")
         assert result["content"] == ""
@@ -2346,6 +2349,8 @@ class TestBuildAssistantMessage:
         result = agent._build_assistant_message(msg, "stop")
         assert "<think>" not in result["content"]
         assert "reasoning that never closes" not in result["content"]
+        # Stripped-to-empty content is stored as-is; wire safety for strict
+        # providers is owned by repair_empty_non_final_messages at send time.
         assert result["content"] == ""
 
 

@@ -332,6 +332,7 @@ class ManagedLlmStream(Iterator[Any]):
         self._stream: Any = None
         self._raw_stream_resource: Any = None
         self._closed = False
+        self._close_error: BaseException | None = None
         self._callback_error: BaseException | None = None
         self._logical: tuple[relay_runtime.RelayTurnContext, Any, str] | None = None
         self._defer_logical_completion = defer_logical_completion
@@ -343,6 +344,11 @@ class ManagedLlmStream(Iterator[Any]):
         self._raw_chunks: list[tuple[Any, Any]] = []
         self.output_modified = False
         callback_context = contextvars.copy_context()
+
+        def run_callback(callback: Callable[..., Any], *args: Any) -> Any:
+            # Relay can invoke stream surfaces while another callback still
+            # owns the captured Context. A fresh copy is safe to enter.
+            return callback_context.copy().run(callback, *args)
 
         runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
         if (
@@ -378,7 +384,7 @@ class ManagedLlmStream(Iterator[Any]):
         async def provider_stream(next_request: Any):
             raw_stream = None
             try:
-                raw_stream = callback_context.run(
+                raw_stream = run_callback(
                     stream_factory,
                     _provider_request(
                         request,
@@ -390,7 +396,7 @@ class ManagedLlmStream(Iterator[Any]):
                 )
                 if (
                     completed_response_predicate is not None
-                    and callback_context.run(
+                    and run_callback(
                         completed_response_predicate,
                         raw_stream,
                     )
@@ -399,14 +405,14 @@ class ManagedLlmStream(Iterator[Any]):
                     self._provider_completed = True
                     return
                 if on_stream_created is not None:
-                    callback_context.run(on_stream_created, raw_stream)
-                raw_iterator = callback_context.run(iter, raw_stream)
+                    run_callback(on_stream_created, raw_stream)
+                raw_iterator = run_callback(iter, raw_stream)
                 while True:
                     try:
-                        chunk = callback_context.run(next, raw_iterator)
+                        chunk = run_callback(next, raw_iterator)
                     except StopIteration:
                         break
-                    if self._accept_chunk is not None and not callback_context.run(
+                    if self._accept_chunk is not None and not run_callback(
                         self._accept_chunk,
                         chunk,
                     ):
@@ -421,17 +427,26 @@ class ManagedLlmStream(Iterator[Any]):
             finally:
                 close = getattr(raw_stream, "close", None)
                 if callable(close):
-                    callback_context.run(close)
+                    try:
+                        run_callback(close)
+                    except BaseException as exc:
+                        self._close_error = exc
+                        raise
 
         def observe_chunk(chunk: Any) -> None:
             if self._on_chunk is not None:
-                callback_context.run(self._on_chunk, _jsonable(chunk))
+                run_callback(self._on_chunk, _jsonable(chunk))
 
         def relay_finalizer() -> Any:
+            # Relay can invoke the finalizer while unwinding a provider-stream
+            # failure. Preserve that original callback error instead of
+            # replacing it with a secondary "missing terminal response" error.
+            if self._callback_error is not None:
+                return None
             try:
                 if self.final_response is not None:
                     return _jsonable(self.final_response)
-                return _jsonable(callback_context.run(finalizer))
+                return _jsonable(run_callback(finalizer))
             except BaseException as exc:
                 self._callback_error = exc
                 raise
@@ -489,10 +504,10 @@ class ManagedLlmStream(Iterator[Any]):
             try:
                 chunk = next(self._stream)
             except StopIteration:
-                self.close()
+                self._close(logical_outcome="cancelled")
                 raise
             if self._accept_chunk is not None and not self._accept_chunk(chunk):
-                self.close()
+                self._close(logical_outcome="cancelled")
                 raise StopIteration
             return chunk
 
@@ -507,7 +522,7 @@ class ManagedLlmStream(Iterator[Any]):
             if not self._defer_logical_completion:
                 _complete_logical(self._logical, outcome="success")
                 self._logical = None
-            self.close()
+            self._close(logical_outcome="cancelled")
             raise StopIteration from None
         except BaseException as exc:
             callback_error = self._callback_error
@@ -547,6 +562,10 @@ class ManagedLlmStream(Iterator[Any]):
     def close(self) -> None:
         """Close an explicitly abandoned stream and cancel its logical call."""
         self._close(logical_outcome="cancelled")
+        close_error = self._close_error
+        self._close_error = None
+        if close_error is not None:
+            raise close_error
 
     def _preserve_pending_provider_chunks(self) -> None:
         """Switch a failed Relay stream to its undelivered provider chunks."""
@@ -596,7 +615,9 @@ class ManagedLlmStream(Iterator[Any]):
                 if callable(close):
                     try:
                         close()
-                    except Exception:
+                    except Exception as exc:
+                        if self._close_error is None:
+                            self._close_error = exc
                         logger.debug(
                             "Provider stream cleanup failed",
                             exc_info=True,
@@ -613,15 +634,16 @@ class ManagedLlmStream(Iterator[Any]):
 
             try:
                 loop.run_until_complete(close_stream())
-            except Exception:
-                pass
+            except Exception as exc:
+                if self._close_error is None:
+                    self._close_error = exc
         if not self._defer_logical_completion:
             _complete_logical(self._logical, outcome=logical_outcome)
             self._logical = None
         loop.close()
 
     def __del__(self) -> None:
-        self.close()
+        self._close(logical_outcome="cancelled")
 
 
 class AnthropicStreamAccumulator:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -178,6 +179,49 @@ def test_deferred_stream_preserves_provider_error_and_logical_scope_for_retry(
 
     assert caught.value is provider_error
     assert "request-2" in turn.logical_llm_calls
+
+
+def test_stream_provider_error_is_not_replaced_by_finalizer_error(relay_turn):
+    _relay, turn = relay_turn
+
+    class ProviderError(Exception):
+        pass
+
+    provider_error = ProviderError("provider failed before first chunk")
+    finalizer_called = False
+
+    def failing_stream(_request):
+        def generate():
+            raise provider_error
+            yield  # pragma: no cover
+
+        return generate()
+
+    def failing_finalizer():
+        nonlocal finalizer_called
+        finalizer_called = True
+        raise RuntimeError("missing terminal response")
+
+    stream = relay_llm.stream(
+        {"model": "test-model", "input": "hi"},
+        failing_stream,
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        finalizer=failing_finalizer,
+        metadata={
+            "api_mode": "codex_responses",
+            "api_request_id": "request-provider-before-finalizer",
+        },
+        defer_logical_completion=True,
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        list(stream)
+
+    assert caught.value is provider_error
+    assert finalizer_called is False
+    assert "request-provider-before-finalizer" in turn.logical_llm_calls
 
 
 def test_non_deferred_partial_stream_close_cancels_logical_call(
@@ -434,6 +478,137 @@ def test_stream_provider_callbacks_preserve_caller_context(relay_turn):
         ("chunk", "caller"),
         ("finalizer", "caller"),
     ]
+
+
+def test_anthropic_stream_callbacks_do_not_reenter_captured_context(
+    relay_turn,
+    monkeypatch,
+):
+    del relay_turn
+    caller_value = contextvars.ContextVar(
+        "anthropic_stream_caller_value",
+        default="default",
+    )
+    caller_value.set("caller")
+    callback_context = contextvars.copy_context()
+    real_copy_context = contextvars.copy_context
+    copy_count = 0
+
+    def capture_callback_context():
+        nonlocal copy_count
+        copy_count += 1
+        if copy_count == 1:
+            return callback_context
+        return real_copy_context()
+
+    monkeypatch.setattr(
+        relay_llm.contextvars,
+        "copy_context",
+        capture_callback_context,
+    )
+    observed = []
+    accumulator = relay_llm.AnthropicStreamAccumulator()
+
+    def observe_chunk(chunk):
+        observed.append(caller_value.get())
+        accumulator.observe(chunk)
+
+    chunks = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "message-1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-test",
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            },
+        },
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+    ]
+    stream = relay_llm.stream(
+        {
+            "model": "claude-test",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        lambda _request: iter(chunks),
+        session_id="session-1",
+        name="anthropic",
+        model_name="claude-test",
+        finalizer=accumulator.finalize,
+        on_chunk=observe_chunk,
+        metadata={
+            "api_mode": "anthropic_messages",
+            "api_request_id": "request-anthropic-context-reentry",
+        },
+    )
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_callback_context() -> None:
+        def wait() -> None:
+            entered.set()
+            assert release.wait(timeout=5)
+
+        callback_context.run(wait)
+
+    holder = threading.Thread(target=hold_callback_context)
+    holder.start()
+    assert entered.wait(timeout=1)
+    try:
+        assert list(stream) == chunks
+    finally:
+        release.set()
+        holder.join(timeout=1)
+
+    assert holder.is_alive() is False
+    assert observed == ["caller", "caller"]
+
+
+def test_explicit_stream_close_surfaces_provider_close_failure(relay_turn):
+    del relay_turn
+
+    class FailingCloseStream:
+        def __init__(self):
+            self._chunks = iter([{"delta": "partial"}])
+            self.close_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._chunks)
+
+        def close(self):
+            self.close_calls += 1
+            raise RuntimeError("provider close failed")
+
+    raw_stream = FailingCloseStream()
+    stream = relay_llm.stream(
+        {"model": "test-model", "messages": []},
+        lambda _request: raw_stream,
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        finalizer=lambda: {"content": "partial"},
+        metadata={
+            "api_mode": "custom",
+            "api_request_id": "request-close-failure",
+        },
+    )
+
+    assert next(stream) == {"delta": "partial"}
+    with pytest.raises(RuntimeError, match="provider close failed"):
+        stream.close()
+
+    assert raw_stream.close_calls == 1
+    stream.close()
 
 
 def test_non_stream_does_not_forward_relay_session_headers(relay_turn):
