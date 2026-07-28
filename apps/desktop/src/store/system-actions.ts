@@ -39,7 +39,12 @@ export async function runGatewayRestart(): Promise<void> {
   $gatewayRestarting.set(true)
 
   try {
-    await awaitAction(await restartGateway())
+    await awaitAction(
+      await restartGateway({
+        confirmation: 'RESTART',
+        idempotency_key: crypto.randomUUID()
+      })
+    )
   } catch (err) {
     notifyError(err, translateNow('commandCenter.gatewayRestartFailed'))
   } finally {
