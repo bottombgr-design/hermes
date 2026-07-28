@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 import types
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import tools.tts_tool as tts
 
@@ -60,6 +60,60 @@ def test_elevenlabs_wss_url_derived_from_base_url(monkeypatch):
 
     tts._elevenlabs_environment_kwargs({"base_url": "https://el-proxy.example"})
     assert captured["wss"] == "wss://el-proxy.example"
+
+
+def test_elevenlabs_base_url_reaches_client_alongside_convert_options(tmp_path, monkeypatch):
+    """Sync path: the environment kwarg and the built convert kwargs coexist."""
+    captured: dict = {}
+    pkg, mod = _fake_elevenlabs_environment_module(captured)
+    monkeypatch.setitem(sys.modules, "elevenlabs", pkg)
+    monkeypatch.setitem(sys.modules, "elevenlabs.environment", mod)
+
+    mock_client = MagicMock()
+    mock_client.text_to_speech.convert.return_value = iter([b"audio"])
+    factory = MagicMock(return_value=mock_client)
+
+    with patch.object(tts, "get_env_value", lambda k, *a: "el-key" if k == "ELEVENLABS_API_KEY" else None), \
+         patch.object(tts, "_import_elevenlabs", return_value=factory):
+        tts._generate_elevenlabs(
+            "hi",
+            str(tmp_path / "out.mp3"),
+            {
+                "elevenlabs": {
+                    "base_url": "https://el-proxy.example",
+                    "language_code": "en",
+                }
+            },
+        )
+
+    assert "environment" in factory.call_args.kwargs
+    assert captured["base"] == "https://el-proxy.example"
+    assert mock_client.text_to_speech.convert.call_args.kwargs["language_code"] == "en"
+
+
+def test_elevenlabs_streamer_base_url_reaches_client_alongside_convert_options(monkeypatch):
+    """Streaming path: the environment kwarg and the built convert kwargs coexist."""
+    from tools import tts_streaming as ts
+
+    captured: dict = {}
+    pkg, mod = _fake_elevenlabs_environment_module(captured)
+    monkeypatch.setitem(sys.modules, "elevenlabs", pkg)
+    monkeypatch.setitem(sys.modules, "elevenlabs.environment", mod)
+
+    mock_client = MagicMock()
+    mock_client.text_to_speech.convert.return_value = iter([b"\x00\x00"])
+    factory = MagicMock(return_value=mock_client)
+
+    with patch.object(ts, "get_env_value", lambda k, *a: "el-key" if k == "ELEVENLABS_API_KEY" else None), \
+         patch.object(tts, "_import_elevenlabs", return_value=factory):
+        streamer = ts.ElevenLabsStreamer(
+            {}, {"base_url": "https://el-proxy.example", "language_code": "en"}
+        )
+        list(streamer.stream("hi"))
+
+    assert "environment" in factory.call_args.kwargs
+    assert captured["base"] == "https://el-proxy.example"
+    assert mock_client.text_to_speech.convert.call_args.kwargs["language_code"] == "en"
 
 
 # ── Mistral: tts.mistral.base_url → SDK server_url ────────────────────────
