@@ -316,6 +316,7 @@ build-backend = "setuptools.build_meta"
 hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
+hermes-provenance-check = "hermes_cli.provenance_check:main"
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
