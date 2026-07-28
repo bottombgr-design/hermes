@@ -8094,26 +8094,7 @@ def invalidate_env_cache() -> None:
     _env_cache = None
 
 
-def _sanitize_env_lines(lines: list) -> list:
-    """Normalize .env line endings without changing assignment semantics.
-
-    Content after the first ``=`` is opaque value data. A known variable name
-    embedded in that value must never be reinterpreted as another assignment;
-    concatenated assignments are ambiguous and therefore remain on one line.
-    """
-    sanitized: list[str] = []
-    for line in lines:
-        raw = line.rstrip("\r\n")
-        stripped = raw.strip()
-
-        # Preserve blank lines and comments
-        if not stripped or stripped.startswith("#"):
-            sanitized.append(raw + "\n")
-            continue
-
-        sanitized.append(stripped + "\n")
-
-    return sanitized
+from hermes_cli.env_loader import _sanitize_env_lines
 
 
 def sanitize_env_file() -> int:
@@ -9430,6 +9411,7 @@ def config_command(args):
 # Runs once at import time.
 
 _profile_env_vars_injected = False
+_profile_env_var_names: set[str] = set()
 
 
 def _inject_profile_env_vars() -> None:
@@ -9458,12 +9440,29 @@ def _inject_profile_env_vars() -> None:
                     "category": "provider",
                     "advanced": True,
                 }
+                _profile_env_var_names.add(_var)
     except Exception:
         pass
 
 
+def _refresh_profile_env_vars() -> None:
+    """Rebuild provider-plugin environment metadata in place."""
+    global _profile_env_vars_injected
+    for name in _profile_env_var_names:
+        OPTIONAL_ENV_VARS.pop(name, None)
+    _profile_env_var_names.clear()
+    _profile_env_vars_injected = False
+    _inject_profile_env_vars()
+
+
 # Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
 _inject_profile_env_vars()
+try:
+    from providers import register_provider_refresh_hook
+
+    register_provider_refresh_hook(_refresh_profile_env_vars)
+except Exception:
+    pass
 
 
 # ── Platform-plugin env var injection ────────────────────────────────────────

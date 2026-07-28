@@ -3,3 +3,6 @@ kind: model-provider
 version: 1.0.0
 description: Moonshot Kimi Coding (global + China)
 author: Nous Research
+provider_ids:
+  - kimi-coding
+  - kimi-coding-cn

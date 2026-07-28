@@ -210,6 +210,21 @@ def test_resolve_runtime_provider_anthropic_keeps_azure_base_url(monkeypatch):
     assert resolved["base_url"] == "https://myhost.azure.com/anthropic"
 
 
+def test_disabled_anthropic_blocks_azure_explicit_short_circuit(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        "providers.is_provider_plugin_active",
+        lambda provider_id: provider_id != "anthropic",
+    )
+
+    with pytest.raises(rp.AuthError, match="disabled by plugin configuration"):
+        rp.resolve_runtime_provider(
+            requested="anthropic",
+            explicit_api_key="azure-key",
+            explicit_base_url="https://myhost.azure.com/anthropic",
+        )
+
+
 def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):
     def _unexpected_pool(provider):
         raise AssertionError(f"load_pool should not be called for {provider}")
@@ -2459,6 +2474,19 @@ class TestAzureAnthropicEnvVarHint:
         base = {"provider": "anthropic", "base_url": self._AZURE_URL}
         base.update(overrides)
         return base
+
+    def test_explicit_azure_endpoint_respects_disabled_plugin(self, monkeypatch):
+        monkeypatch.setattr(
+            "providers.is_provider_plugin_active",
+            lambda provider_id: provider_id != "anthropic",
+        )
+
+        with pytest.raises(rp.AuthError, match="disabled by plugin configuration"):
+            rp.resolve_runtime_provider(
+                requested="anthropic",
+                explicit_api_key="azure-key",
+                explicit_base_url=self._AZURE_URL,
+            )
 
     def test_key_env_hint_picks_custom_var(self, monkeypatch):
         """model.key_env names a non-default env var → that var's value is used."""

@@ -50,6 +50,15 @@ logger = logging.getLogger(__name__)
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
+# Load .env before importing Hermes modules that can transitively initialize
+# provider discovery. Plugin activation lists may use ${VAR} references.
+from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_cli.env_loader import load_hermes_dotenv
+
+_hermes_home = get_hermes_home()
+_project_env = Path(__file__).parent / ".env"
+load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+
 import yaml
 
 from hermes_cli.fallback_config import get_fallback_chain
@@ -213,21 +222,13 @@ from hermes_cli.banner import _format_context_length, format_banner_version_labe
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
 
-# Load .env from ~/.hermes/.env first, then project root as dev fallback.
-# User-managed env files should override stale shell exports on restart.
-from hermes_constants import get_hermes_home, display_hermes_home
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
     is_browser_debug_ready,
     manual_chrome_debug_command,
     try_launch_chrome_debug,
 )
-from hermes_cli.env_loader import load_hermes_dotenv
 from utils import base_url_host_matches, fast_safe_load
-
-_hermes_home = get_hermes_home()
-_project_env = Path(__file__).parent / '.env'
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
 
 _REASONING_TAGS = (
@@ -9759,7 +9760,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _discover_all_plugins,
                     _get_disabled_set,
                     _get_enabled_set,
-                    _plugin_status,
+                    _plugin_status_for_entry,
                 )
 
                 entries = _discover_all_plugins()
@@ -9786,16 +9787,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     try:
                         from hermes_cli.plugins import get_plugin_manager
                         for p in get_plugin_manager().list_plugins():
-                            loaded[p["name"]] = p
+                            loaded[p["key"]] = p
                     except Exception:
                         loaded = {}
 
                     print(f"User plugins ({len(user_entries)}):")
-                    for name, version, _desc, source, _dir, key in sorted(user_entries):
-                        state = _plugin_status(name, enabled, disabled, key=key)
+                    name_counts: dict[str, int] = {}
+                    for entry in user_entries:
+                        name_counts[entry[0]] = name_counts.get(entry[0], 0) + 1
+                    for entry in sorted(user_entries):
+                        name, version, _desc, source, _dir, key, _kind = entry
+                        state = _plugin_status_for_entry(entry, enabled, disabled)
                         glyph = {"enabled": "✓", "disabled": "✗"}.get(state, "○")
                         ver = f" v{version}" if version else ""
-                        info = loaded.get(name) or {}
+                        info = loaded.get(key) or {}
                         bits = []
                         if info.get("tools"):
                             bits.append(f"{info['tools']} tools")
@@ -9806,10 +9811,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         detail = f" ({', '.join(bits)})" if bits else ""
                         label = "" if state == "enabled" else f" [{state}]"
                         error = f" — {info['error']}" if info.get("error") else ""
-                        print(f"  {glyph} {name}{ver}{label}{detail}{error}")
+                        identity = (
+                            f"{name} [{key}]"
+                            if name_counts.get(name, 0) > 1 or key != name
+                            else name
+                        )
+                        print(f"  {glyph} {identity}{ver}{label}{detail}{error}")
                     if bundled_count:
                         print(f"  (+{bundled_count} bundled — see: hermes plugins list)")
-                    print("  Enable/disable: hermes plugins enable/disable <name>")
+                    print("  Enable/disable: hermes plugins enable/disable <key>")
             except Exception as e:
                 print(f"Plugin system error: {e}")
         elif canonical == "rollback":

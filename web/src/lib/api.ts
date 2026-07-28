@@ -2499,6 +2499,7 @@ export interface PluginManifestResponse {
 
 export interface HubAgentPluginRow {
   name: string;
+  key: string;
   version: string;
   description: string;
   source: string;

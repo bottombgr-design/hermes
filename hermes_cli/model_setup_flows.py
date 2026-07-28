@@ -341,7 +341,7 @@ def _model_flow_nous(config, current_model="", args=None):
         AuthError,
         format_auth_error,
         _login_nous,
-        PROVIDER_REGISTRY,
+        get_nous_service_config,
     )
     from hermes_cli.config import (
         get_env_value,
@@ -366,7 +366,7 @@ def _model_flow_nous(config, current_model="", args=None):
                 ca_bundle=getattr(args, "ca_bundle", None),
                 insecure=bool(getattr(args, "insecure", False)),
             )
-            _login_nous(mock_args, PROVIDER_REGISTRY["nous"])
+            _login_nous(mock_args, get_nous_service_config())
             # Offer Tool Gateway enablement for paid subscribers
             try:
                 _refreshed = load_config() or {}
@@ -419,7 +419,7 @@ def _model_flow_nous(config, current_model="", args=None):
                     ca_bundle=None,
                     insecure=False,
                 )
-                _login_nous(mock_args, PROVIDER_REGISTRY["nous"])
+                _login_nous(mock_args, get_nous_service_config())
             except Exception as login_exc:
                 print(f"Re-login failed: {login_exc}")
             return

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
 
 _VARS = ("HERMES_SAFE_MODE", "HERMES_IGNORE_USER_CONFIG", "HERMES_IGNORE_RULES")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(autouse=True)
@@ -51,6 +54,147 @@ def test_cmd_chat_safe_mode_sets_env_before_startup(monkeypatch):
 
     assert captured["ignore_user_config"] is True
     assert captured["ignore_rules"] is True
+
+
+def test_safe_mode_is_applied_before_provider_discovery(tmp_path):
+    hermes_home = tmp_path / "home"
+    plugin_dir = (
+        hermes_home
+        / "plugins"
+        / "model-providers"
+        / "unsafe-provider"
+    )
+    plugin_dir.mkdir(parents=True)
+    marker = tmp_path / "provider-imported"
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: unsafe-provider\n"
+        "kind: model-provider\n"
+        "version: 0.0.1\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('imported')\n",
+        encoding="utf-8",
+    )
+    (hermes_home / ".env").write_text(
+        "HERMES_SAFE_MODE=0\n"
+        "HERMES_IGNORE_USER_CONFIG=0\n"
+        "HERMES_IGNORE_RULES=0\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    for var in _VARS:
+        env.pop(var, None)
+    script = (
+        "import os, sys\n"
+        "sys.argv = ['hermes', 'chat', '--safe-mode']\n"
+        "import hermes_cli.main\n"
+        "assert os.environ['HERMES_SAFE_MODE'] == '1'\n"
+        "assert os.environ['HERMES_IGNORE_USER_CONFIG'] == '1'\n"
+        "assert os.environ['HERMES_IGNORE_RULES'] == '1'\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+def test_dotenv_cannot_clear_truthy_safe_mode(monkeypatch, tmp_path):
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    hermes_home = tmp_path / "home"
+    hermes_home.mkdir()
+    (hermes_home / ".env").write_text(
+        "HERMES_SAFE_MODE=0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SAFE_MODE", "true")
+
+    load_hermes_dotenv(hermes_home=hermes_home)
+
+    assert os.environ["HERMES_SAFE_MODE"] == "true"
+
+
+def test_dotenv_plugin_denylist_is_loaded_before_provider_discovery(tmp_path):
+    hermes_home = tmp_path / "home"
+    plugin_dir = (
+        hermes_home
+        / "plugins"
+        / "model-providers"
+        / "dotenv-disabled-provider"
+    )
+    plugin_dir.mkdir(parents=True)
+    marker = tmp_path / "provider-imported"
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n"
+        "  disabled:\n"
+        "    - ${DISABLED_PROVIDER}\n",
+        encoding="utf-8",
+    )
+    (hermes_home / ".env").write_text(
+        "DISABLED_PROVIDER=model-providers/dotenv-disabled-provider\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: dotenv-disabled-provider\n"
+        "kind: model-provider\n"
+        "version: 0.0.1\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('imported')\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    env.pop("DISABLED_PROVIDER", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.argv = ['hermes', '--version']; import hermes_cli.main",
+        ],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+def test_early_safe_mode_detection_ignores_mcp_child_args():
+    import hermes_cli.main as main_mod
+
+    assert main_mod._safe_mode_requested_early(
+        ["chat", "--safe-mode"]
+    )
+    assert not main_mod._safe_mode_requested_early(
+        [
+            "mcp",
+            "add",
+            "child",
+            "--args",
+            "child-command",
+            "--safe-mode",
+        ]
+    )
 
 
 def test_prepare_agent_startup_applies_safe_mode_before_plugin_discovery(monkeypatch):

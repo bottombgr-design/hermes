@@ -7320,6 +7320,43 @@ def test_plugins_list_surfaces_loader_error(monkeypatch):
     assert "boom" in resp["error"]["message"]
 
 
+def test_plugins_manage_list_uses_runtime_default_status(monkeypatch):
+    entry = (
+        "telegram-platform",
+        "1.0.0",
+        "Telegram",
+        "bundled",
+        None,
+        "telegram-platform",
+        "platform",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins_cmd._discover_all_plugins",
+        lambda: [entry],
+    )
+    monkeypatch.setattr("hermes_cli.plugins_cmd._get_enabled_set", set)
+    monkeypatch.setattr("hermes_cli.plugins_cmd._get_disabled_set", set)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "plugins.manage",
+            "params": {"action": "list"},
+        }
+    )
+
+    assert resp["result"]["plugins"] == [
+        {
+            "name": "telegram-platform",
+            "key": "telegram-platform",
+            "version": "1.0.0",
+            "description": "Telegram",
+            "source": "bundled",
+            "status": "enabled",
+        }
+    ]
+
+
 def test_complete_slash_surfaces_completer_error(monkeypatch):
     with patch(
         "hermes_cli.commands.SlashCommandCompleter",

@@ -73,6 +73,31 @@ suppress_platform_ver_console()
 import os
 import sys
 
+
+def _enable_safe_mode_env() -> None:
+    """Set every process-wide isolation flag implied by safe mode."""
+    os.environ["HERMES_SAFE_MODE"] = "1"
+    os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+    os.environ["HERMES_IGNORE_RULES"] = "1"
+
+
+def _safe_mode_requested_early(argv: list[str]) -> bool:
+    """Detect Hermes' safe-mode flag before config/provider imports."""
+    for index, arg in enumerate(argv):
+        if arg == "--":
+            break
+        if arg == "--args":
+            prefix = argv[:index]
+            if "mcp" in prefix and "add" in prefix:
+                break
+        if arg == "--safe-mode":
+            return True
+    return False
+
+
+if _safe_mode_requested_early(sys.argv[1:]):
+    _enable_safe_mode_env()
+
 # Early venv self-heal — MUST run before any third-party import below.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import
 # files were wiped (#57828 — failed lazy backend refresh), the module-level
@@ -677,9 +702,10 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
-# Load .env from ~/.hermes/.env first, then project root as dev fallback.
-# User-managed env files should override stale shell exports on restart.
-from hermes_cli.config import get_hermes_home
+# Load .env before importing config.py. Config's provider metadata injection
+# may import active provider plugins, and plugin allow/deny lists can reference
+# values supplied by these env files.
+from hermes_constants import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
@@ -15354,9 +15380,7 @@ def _prepare_agent_startup(args) -> None:
 def _apply_safe_mode(args) -> None:
     if not getattr(args, "safe_mode", False):
         return
-    os.environ["HERMES_SAFE_MODE"] = "1"
-    os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
-    os.environ["HERMES_IGNORE_RULES"] = "1"
+    _enable_safe_mode_env()
 
 
 def _set_chat_arg_defaults(args) -> None:

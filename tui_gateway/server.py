@@ -18503,23 +18503,27 @@ def _(rid, params: dict) -> dict:
             _discover_all_plugins,
             _get_disabled_set,
             _get_enabled_set,
-            _plugin_status,
+            _plugin_status_for_entry,
         )
 
         def _rows():
             enabled = _get_enabled_set()
             disabled = _get_disabled_set()
             out = []
-            for name, version, desc, source, _dir, key in sorted(
+            for entry in sorted(
                 _discover_all_plugins()
             ):
+                name, version, desc, source, _dir, key, _kind = entry
                 out.append(
                     {
                         "name": name,
+                        "key": key,
                         "version": str(version or ""),
                         "description": desc or "",
                         "source": source,
-                        "status": _plugin_status(name, enabled, disabled, key=key),
+                        "status": _plugin_status_for_entry(
+                            entry, enabled, disabled
+                        ),
                     }
                 )
             return out
@@ -18546,7 +18550,8 @@ def _(rid, params: dict) -> dict:
             result = dashboard_set_agent_plugin_enabled(name, enabled=enable)
             if not result.get("ok"):
                 return _err(rid, 5026, result.get("error") or "toggle failed")
-            row = next((r for r in _rows() if r["name"] == name), None)
+            canonical_key = result.get("key") or name
+            row = next((r for r in _rows() if r["key"] == canonical_key), None)
             return _ok(
                 rid,
                 {

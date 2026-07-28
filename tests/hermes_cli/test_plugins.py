@@ -104,6 +104,34 @@ class TestPluginDiscovery:
         assert "hello_plugin" in mgr._plugins
         assert mgr._plugins["hello_plugin"].enabled
 
+    def test_canonical_key_matches_runtime_activation(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes_test"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        plugin_dir = hermes_home / "plugins" / "web" / "firecrawl"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            "name: web-firecrawl\n"
+            "kind: standalone\n"
+            "version: 0.1.0\n",
+            encoding="utf-8",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "def register(ctx):\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        (hermes_home / "config.yaml").write_text(
+            "plugins:\n"
+            "  enabled:\n"
+            "    - web/firecrawl\n",
+            encoding="utf-8",
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["web/firecrawl"].enabled
+
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(

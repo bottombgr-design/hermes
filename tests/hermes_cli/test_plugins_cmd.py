@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
+from hermes_cli import plugins_cmd as pc
 from hermes_cli.plugins_cmd import (
     PluginOperationError,
     _copy_example_files,
@@ -24,6 +25,121 @@ from hermes_cli.plugins_cmd import (
 
 
 # ── _sanitize_plugin_name ─────────────────────────────────────────────────
+
+
+def test_plugin_activation_saves_invalidate_provider_discovery(monkeypatch):
+    import providers
+    from hermes_cli import config as config_mod
+
+    config = {"plugins": {}}
+    invalidations = []
+    monkeypatch.setattr(config_mod, "load_config", lambda: config)
+    monkeypatch.setattr(config_mod, "save_config", lambda _config: None)
+    monkeypatch.setattr(
+        providers,
+        "invalidate_provider_discovery",
+        lambda: invalidations.append(True),
+    )
+
+    pc._save_enabled_set({"model-providers/example"})
+    pc._save_disabled_set({"model-providers/other"})
+
+    assert invalidations == [True, True]
+
+
+def test_plugin_activation_batch_invalidates_after_both_lists(monkeypatch):
+    import providers
+    from hermes_cli import config as config_mod
+
+    config = {"plugins": {}}
+    snapshots = []
+    invalidations = []
+    monkeypatch.setattr(config_mod, "load_config", lambda: config)
+    monkeypatch.setattr(
+        config_mod,
+        "save_config",
+        lambda saved: snapshots.append(
+            (
+                list(saved["plugins"].get("enabled", [])),
+                list(saved["plugins"].get("disabled", [])),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        providers,
+        "invalidate_provider_discovery",
+        lambda: invalidations.append(
+            (
+                list(config["plugins"]["enabled"]),
+                list(config["plugins"]["disabled"]),
+            )
+        ),
+    )
+
+    pc._save_activation_sets(
+        {"model-providers/example"},
+        {"model-providers/other"},
+    )
+
+    assert snapshots == [
+        (["model-providers/example"], []),
+        (["model-providers/example"], ["model-providers/other"]),
+    ]
+    assert invalidations == [
+        (["model-providers/example"], ["model-providers/other"])
+    ]
+
+
+def test_disabled_save_drops_internal_fail_closed_marker(monkeypatch):
+    from hermes_cli import config as config_mod
+    from hermes_cli import plugin_config_state
+
+    config = {"plugins": {}}
+    monkeypatch.setattr(config_mod, "load_config", lambda: config)
+    monkeypatch.setattr(config_mod, "save_config", lambda _config: None)
+    monkeypatch.setattr(pc, "_invalidate_provider_discovery", lambda: None)
+
+    pc._save_disabled_set({
+        "tools/blocked",
+        plugin_config_state._POLICY_FAIL_CLOSED_SENTINEL,
+    })
+
+    assert config["plugins"]["disabled"] == ["tools/blocked"]
+
+
+def test_plugin_activation_reads_preserve_valid_mixed_list_entries(
+    monkeypatch,
+):
+    from hermes_cli import plugin_config_state
+
+    monkeypatch.setattr(
+        plugin_config_state,
+        "get_enabled_plugins",
+        lambda: {"tools/valid"},
+    )
+    monkeypatch.setattr(
+        plugin_config_state,
+        "get_disabled_plugins",
+        lambda: {"tools/blocked"},
+    )
+
+    assert pc._get_enabled_set() == {"tools/valid"}
+    assert pc._get_disabled_set() == {"tools/blocked"}
+
+
+def test_basic_auth_reenable_filters_malformed_disabled_entries():
+    config = {
+        "plugins": {
+            "disabled": [
+                "dashboard_auth/basic",
+                "tools/keep",
+                {"bad": "mapping"},
+            ]
+        }
+    }
+
+    assert pc.ensure_basic_auth_plugin_enabled_in_config(config) is True
+    assert config["plugins"]["disabled"] == ["tools/keep"]
 
 
 class TestSanitizePluginName:
@@ -887,8 +1003,6 @@ class TestSubdirInstallE2E:
     def test_installs_only_the_subdir_plugin(self, tmp_path, monkeypatch):
         if shutil.which("git") is None:
             pytest.skip("git not available")
-
-        from hermes_cli import plugins_cmd as pc
 
         repo_root = tmp_path / "monorepo"
         self._make_repo_with_subdir_plugin(repo_root)

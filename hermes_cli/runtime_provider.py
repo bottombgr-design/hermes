@@ -1643,6 +1643,15 @@ def resolve_runtime_provider(
     """
     requested_provider = resolve_requested_provider(requested)
 
+    def require_plugin_provider(provider_id: str) -> None:
+        from providers import is_provider_plugin_active
+
+        if not is_provider_plugin_active(provider_id):
+            raise AuthError(
+                f"Provider '{provider_id}' is disabled by plugin configuration.",
+                code="invalid_provider",
+            )
+
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /
     # openrouter / gemini / ...). The earlier ``_get_named_custom_provider``
@@ -1664,6 +1673,34 @@ def resolve_runtime_provider(
                 f"(providers.{requested_provider}.enabled: false)"
             )
 
+    if requested_provider.startswith("custom:"):
+        require_plugin_provider("custom")
+    elif requested_provider in {
+        "custom",
+        "local",
+        "ollama",
+        "vllm",
+        "llamacpp",
+        "llama.cpp",
+        "llama-cpp",
+    }:
+        require_plugin_provider("custom")
+    elif requested_provider in {
+        "vertex",
+        "google-vertex",
+        "vertex-ai",
+        "gcp-vertex",
+        "vertexai",
+    }:
+        require_plugin_provider("vertex")
+    elif requested_provider in {
+        "azure-foundry",
+        "azure",
+        "azure-ai-foundry",
+        "azure-ai",
+    }:
+        require_plugin_provider("azure-foundry")
+
     if requested_provider == "moa":
         return {
             "provider": "moa",
@@ -1680,6 +1717,7 @@ def resolve_runtime_provider(
     # Instead, use the Azure key directly with anthropic_messages api_mode.
     _eff_base = (explicit_base_url or "").strip()
     if requested_provider == "anthropic" and "azure.com" in _eff_base:
+        require_plugin_provider("anthropic")
         _azure_key = (
             (explicit_api_key or "").strip()
             or _getenv("AZURE_ANTHROPIC_KEY", "").strip()
@@ -1748,6 +1786,7 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
     )
     if custom_runtime:
+        require_plugin_provider("custom")
         custom_runtime["requested_provider"] = requested_provider
         return custom_runtime
 
@@ -1780,6 +1819,7 @@ def resolve_runtime_provider(
                 base_url_host_matches(cfg_base_url, host)
                 for host in _known_cloud_hosts
             ):
+                require_plugin_provider("custom")
                 runtime = _resolve_openrouter_runtime(
                     requested_provider=requested_provider,
                     explicit_api_key=explicit_api_key,
