@@ -1,5 +1,6 @@
 """Tests for the /voice command and auto voice reply in the gateway."""
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -353,6 +354,13 @@ class TestAutoVoiceReply:
         """voice_only + text input: neither fires."""
         assert self._call(runner, "voice_only", MessageType.TEXT) is False
 
+    def test_realtime_voice_marker_preserves_voice_only_semantics(self, runner):
+        runner._voice_mode["telegram:123"] = "voice_only"
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+
+        assert runner._should_send_voice_reply(event, "Hello!", []) is True
+
     # -- Mode off: nothing fires -------------------------------------------
 
     def test_off_mode_voice(self, runner):
@@ -390,6 +398,22 @@ class TestAutoVoiceReply:
             }],
         }]
         assert self._call(runner, "all", MessageType.TEXT, agent_messages=messages) is False
+
+    def test_realtime_voice_tts_tool_cannot_suppress_vc_reply(self, runner):
+        """A model-side TTS call must not steal a live VC reply into chat media."""
+        runner._voice_mode["telegram:123"] = "voice_only"
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        messages = [{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "text_to_speech", "arguments": "{}"},
+            }],
+        }]
+
+        assert runner._should_send_voice_reply(event, "Hoi Maikel", messages) is True
 
     def test_no_dedup_for_other_tools(self, runner):
         messages = [{
@@ -436,6 +460,222 @@ class TestSendVoiceReply:
         assert mock_tts.call_args.kwargs["output_path"].endswith(".ogg")
         call_args = mock_adapter.send_voice.call_args
         assert call_args.kwargs.get("chat_id") == "123"
+
+    @pytest.mark.asyncio
+    async def test_discord_realtime_session_speaks_through_codex_without_local_tts(self, runner):
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.classic_fallback_enabled.return_value = True
+        manager.append_speech = AsyncMock(return_value=True)
+        runner._codex_realtime_voice = manager
+
+        with patch("tools.tts_tool.text_to_speech_tool") as local_tts:
+            await runner._send_voice_reply(event, "Hoi Maikel")
+
+        manager.append_speech.assert_awaited_once_with(
+            adapter, 111, "Hoi Maikel", transcript_generation=None
+        )
+        local_tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_realtime_no_audio_failure_uses_classic_tts_fallback(self, runner):
+        from agent.transports.codex_realtime_voice import CodexRealtimeUnavailable
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        adapter.is_in_voice_channel.return_value = True
+        adapter.play_in_voice_channel = AsyncMock(return_value=True)
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.classic_fallback_enabled.return_value = True
+        manager.append_speech = AsyncMock(
+            side_effect=CodexRealtimeUnavailable(
+                "Codex realtime speech produced no audio"
+            )
+        )
+        runner._codex_realtime_voice = manager
+
+        tts_result = '{"success": true, "file_path": "/tmp/fallback.mp3"}'
+        with patch(
+            "tools.tts_tool.text_to_speech_tool", return_value=tts_result
+        ) as local_tts, patch("os.path.isfile", return_value=True), patch("os.unlink"):
+            await runner._send_voice_reply(event, "Hoi Maikel")
+
+        manager.append_speech.assert_awaited_once_with(
+            adapter, 111, "Hoi Maikel", transcript_generation=None
+        )
+        local_tts.assert_called_once()
+        adapter.play_in_voice_channel.assert_awaited_once_with(
+            111, "/tmp/fallback.mp3"
+        )
+
+    @pytest.mark.asyncio
+    async def test_realtime_vc_disconnect_never_falls_back_to_chat_voice_attachment(
+        self, runner
+    ):
+        from agent.transports.codex_realtime_voice import CodexRealtimeUnavailable
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        adapter.is_in_voice_channel.return_value = False
+        adapter.send_voice = AsyncMock()
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(
+            guild_id=111,
+            guild=None,
+            codex_realtime_voice=True,
+        )
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.classic_fallback_enabled.return_value = True
+        manager.append_speech = AsyncMock(
+            side_effect=CodexRealtimeUnavailable("voice route disconnected")
+        )
+        runner._codex_realtime_voice = manager
+
+        with patch("tools.tts_tool.text_to_speech_tool") as local_tts:
+            await runner._send_voice_reply(event, "Hoi Maikel")
+
+        manager.append_speech.assert_not_awaited()
+        local_tts.assert_not_called()
+        adapter.send_voice.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_realtime_reply_uses_tts_clean_text_and_drops_stale_generation(
+        self, runner
+    ):
+        from agent.transports.codex_realtime_voice import CodexRealtimeStaleSpeech
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(
+            guild_id=111,
+            guild=None,
+            codex_realtime_voice=True,
+            codex_realtime_generation=7,
+        )
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.classic_fallback_enabled.return_value = True
+        manager.append_speech = AsyncMock(side_effect=CodexRealtimeStaleSpeech())
+        runner._codex_realtime_voice = manager
+
+        with patch(
+            "tools.tts_tool._strip_markdown_for_tts", return_value="Hoi Maikel"
+        ), patch("tools.tts_tool.text_to_speech_tool") as local_tts:
+            await runner._send_voice_reply(event, "**Hoi** [Maikel](https://example.com)")
+
+        manager.append_speech.assert_awaited_once_with(
+            adapter, 111, "Hoi Maikel", transcript_generation=7
+        )
+        local_tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_realtime_speech_failure_stays_silent_when_classic_fallback_is_disabled(
+        self, runner, caplog
+    ):
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.classic_fallback_enabled.return_value = False
+        manager.append_speech = AsyncMock(
+            side_effect=RuntimeError(
+                "speech failed at https://user:secret@example.test/realtime, "
+                "request id: deadbeef"
+            )
+        )
+        runner._codex_realtime_voice = manager
+
+        with patch("tools.tts_tool.text_to_speech_tool") as local_tts:
+            await runner._send_voice_reply(event, "Hoi Maikel")
+
+        manager.append_speech.assert_awaited_once_with(
+            adapter, 111, "Hoi Maikel", transcript_generation=None
+        )
+        local_tts.assert_not_called()
+        assert "secret" not in caplog.text
+        assert "deadbeef" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_removed_no_fallback_realtime_session_does_not_leak_local_tts(
+        self, runner
+    ):
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(
+            guild_id=111,
+            guild=None,
+            codex_realtime_voice=True,
+        )
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = False
+        manager.configured_fallback_enabled.return_value = False
+        manager.append_speech = AsyncMock()
+        runner._codex_realtime_voice = manager
+
+        with patch("tools.tts_tool.text_to_speech_tool") as local_tts:
+            await runner._send_voice_reply(event, "Hoi Maikel")
+
+        manager.append_speech.assert_not_awaited()
+        local_tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discord_realtime_does_not_speak_reply_from_unlinked_text_channel(self, runner):
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter._voice_text_channels = {111: 999}
+        adapter.send_voice = AsyncMock()
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.append_speech = AsyncMock(return_value=True)
+        runner._codex_realtime_voice = manager
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.mp3"})
+
+        with patch(
+            "tools.tts_tool.text_to_speech_tool",
+            return_value=tts_result,
+        ) as local_tts, patch("os.path.isfile", return_value=False):
+            await runner._send_voice_reply(event, "Niet voor de VC")
+
+        manager.append_speech.assert_not_awaited()
+        local_tts.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_non_telegram_auto_voice_reply_uses_mp3(self, runner):
@@ -624,7 +864,7 @@ class TestVoiceInHelp:
 class TestVoiceReceiver:
     """Test VoiceReceiver silence detection, SSRC mapping, and lifecycle."""
 
-    def _make_receiver(self):
+    def _make_receiver(self, pcm_callback=None, *, allowed_user_ids=None, members=None):
         from plugins.platforms.discord.adapter import VoiceReceiver
         mock_vc = MagicMock()
         mock_vc._connection.secret_key = [0] * 32
@@ -633,7 +873,13 @@ class TestVoiceReceiver:
         mock_vc._connection.add_socket_listener = MagicMock()
         mock_vc._connection.remove_socket_listener = MagicMock()
         mock_vc._connection.hook = None
-        receiver = VoiceReceiver(mock_vc)
+        mock_vc.user = SimpleNamespace(id=9999)
+        mock_vc.channel = SimpleNamespace(members=members or [])
+        receiver = VoiceReceiver(
+            mock_vc,
+            pcm_callback=pcm_callback,
+            allowed_user_ids=allowed_user_ids,
+        )
         return receiver
 
     def test_initial_state(self):
@@ -670,6 +916,73 @@ class TestVoiceReceiver:
         receiver.map_ssrc(100, 42)
         receiver.map_ssrc(100, 99)
         assert receiver._ssrc_to_user[100] == 99
+
+    def test_realtime_pcm_callback_can_consume_frame_before_classic_stt_buffer(self):
+        consumed = []
+        receiver = self._make_receiver(
+            pcm_callback=lambda user_id, pcm: consumed.append((user_id, pcm)) or True
+        )
+        receiver.map_ssrc(100, 42)
+
+        receiver.handle_decoded_pcm(100, b"pcm")
+
+        assert consumed == [(42, b"pcm")]
+        assert receiver._buffers[100] == bytearray()
+
+    def test_realtime_pcm_callback_can_consume_unmapped_early_frame(self):
+        consumed = []
+        receiver = self._make_receiver(
+            pcm_callback=lambda user_id, pcm: consumed.append((user_id, pcm)) or True
+        )
+
+        receiver.handle_decoded_pcm(100, b"early")
+
+        assert consumed == [(0, b"early")]
+        assert receiver._buffers[100] == bytearray()
+
+    def test_realtime_pcm_infers_sole_allowed_member_when_speaking_event_is_missing(self):
+        consumed = []
+        receiver = self._make_receiver(
+            pcm_callback=lambda user_id, pcm: consumed.append((user_id, pcm)) or True,
+            allowed_user_ids={"42"},
+            members=[
+                SimpleNamespace(id=9999),
+                SimpleNamespace(id=42),
+            ],
+        )
+
+        receiver.handle_decoded_pcm(100, b"pcm")
+
+        assert consumed == [(42, b"pcm")]
+        assert receiver._ssrc_to_user[100] == 42
+        assert receiver._buffers[100] == bytearray()
+
+    def test_realtime_pcm_does_not_guess_between_multiple_allowed_members(self):
+        consumed = []
+        receiver = self._make_receiver(
+            pcm_callback=lambda user_id, pcm: consumed.append((user_id, pcm)) or True,
+            allowed_user_ids={"42", "43"},
+            members=[
+                SimpleNamespace(id=9999),
+                SimpleNamespace(id=42),
+                SimpleNamespace(id=43),
+            ],
+        )
+
+        receiver.handle_decoded_pcm(100, b"pcm")
+
+        assert consumed == [(0, b"pcm")]
+        assert 100 not in receiver._ssrc_to_user
+        assert receiver._buffers[100] == bytearray()
+
+    def test_unconsumed_pcm_falls_back_to_classic_stt_buffer(self):
+        receiver = self._make_receiver(pcm_callback=lambda _user_id, _pcm: False)
+        receiver.map_ssrc(100, 42)
+
+        receiver.handle_decoded_pcm(100, b"pcm")
+
+        assert receiver._buffers[100] == bytearray(b"pcm")
+        assert 100 in receiver._last_packet_time
 
     def test_pause_resume(self):
         receiver = self._make_receiver()
@@ -847,6 +1160,113 @@ class TestVoiceChannelCommands:
         assert mock_adapter._voice_sources[111]["chat_type"] == "group"
 
     @pytest.mark.asyncio
+    async def test_join_starts_opt_in_realtime_after_binding_and_wires_pcm_before_connect(self, runner):
+        mock_channel = MagicMock()
+        mock_channel.name = "General"
+        mock_adapter = AsyncMock()
+        mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
+        mock_adapter._voice_text_channels = {}
+        mock_adapter._voice_sources = {}
+        mock_adapter._voice_input_callback = None
+        mock_adapter._voice_pcm_callback = None
+
+        manager = MagicMock()
+        manager.prepare_for_voice_channel.return_value = True
+        manager.push_discord_pcm.return_value = True
+        manager.start_for_voice_channel = AsyncMock(
+            return_value=SimpleNamespace(
+                enabled=True,
+                active=True,
+                fallback_to_classic=True,
+                reason=None,
+                capabilities=SimpleNamespace(protocol_version="v1"),
+            )
+        )
+        runner._codex_realtime_voice = manager
+        runner._handle_voice_channel_input = AsyncMock()
+
+        async def _join(_channel):
+            manager.prepare_for_voice_channel.assert_called_once_with(
+                mock_adapter, 111
+            )
+            assert callable(mock_adapter._voice_pcm_callback)
+            assert mock_adapter._voice_pcm_callback(111, 42, b"pcm") is True
+            return True
+
+        mock_adapter.join_voice_channel = AsyncMock(side_effect=_join)
+        event = self._make_discord_event(user_id="42")
+        runner.adapters[event.source.platform] = mock_adapter
+
+        result = await runner._handle_voice_channel_join(event)
+
+        assert "codex live" in result.lower()
+        manager.start_for_voice_channel.assert_awaited_once()
+        manager.cancel_voice_channel_start.assert_called_once_with(mock_adapter, 111)
+        kwargs = manager.start_for_voice_channel.await_args.kwargs
+        assert kwargs["adapter"] is mock_adapter
+        assert kwargs["guild_id"] == 111
+        assert kwargs["user_id"] == 42
+        assert callable(kwargs["on_transcript"])
+        await kwargs["on_transcript"](42, "realtime transcript", 8)
+        runner._handle_voice_channel_input.assert_any_await(
+            111,
+            42,
+            "realtime transcript",
+            realtime=True,
+            realtime_generation=8,
+            adapter=mock_adapter,
+        )
+        assert callable(kwargs["on_runtime_failure"])
+        await kwargs["on_runtime_failure"]("temporary failure", True)
+        assert runner._voice_mode["discord:123"] == "all"
+        await mock_adapter._voice_input_callback(111, 42, "classic fallback")
+        runner._handle_voice_channel_input.assert_awaited_with(
+            111,
+            42,
+            "classic fallback",
+            adapter=mock_adapter,
+        )
+
+    @pytest.mark.asyncio
+    async def test_join_without_classic_fallback_clears_state_when_leave_fails(self, runner):
+        mock_channel = MagicMock()
+        mock_channel.name = "General"
+        mock_adapter = AsyncMock()
+        mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
+        mock_adapter.join_voice_channel = AsyncMock(return_value=True)
+        mock_adapter.leave_voice_channel = AsyncMock(
+            side_effect=RuntimeError("Discord disconnect failed")
+        )
+        mock_adapter._voice_text_channels = {}
+        mock_adapter._voice_sources = {}
+        mock_adapter._voice_input_callback = None
+        mock_adapter._voice_pcm_callback = None
+
+        manager = MagicMock()
+        manager.push_discord_pcm.return_value = False
+        manager.start_for_voice_channel = AsyncMock(
+            return_value=SimpleNamespace(
+                enabled=True,
+                active=False,
+                fallback_to_classic=False,
+                reason="not entitled",
+                capabilities=None,
+            )
+        )
+        runner._codex_realtime_voice = manager
+        event = self._make_discord_event(user_id="42")
+        runner.adapters[event.source.platform] = mock_adapter
+
+        result = await runner._handle_voice_channel_join(event)
+
+        assert "fallback is disabled" in result
+        assert "not entitled" in result
+        mock_adapter.leave_voice_channel.assert_awaited_once_with(111)
+        assert runner._voice_mode["discord:123"] == "off"
+        assert mock_adapter._voice_input_callback is None
+        assert mock_adapter._voice_pcm_callback is None
+
+    @pytest.mark.asyncio
     async def test_join_failure(self, runner):
         """Failed join returns permissions error."""
         mock_channel = MagicMock()
@@ -865,12 +1285,16 @@ class TestVoiceChannelCommands:
         mock_channel = MagicMock()
         mock_channel.name = "General"
         mock_adapter = AsyncMock()
+        mock_adapter._voice_input_callback = None
+        mock_adapter._voice_pcm_callback = None
         mock_adapter.join_voice_channel = AsyncMock(side_effect=RuntimeError("No permission"))
         mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
         event = self._make_discord_event()
         runner.adapters[event.source.platform] = mock_adapter
         result = await runner._handle_voice_channel_join(event)
         assert "failed" in result.lower()
+        assert mock_adapter._voice_input_callback is None
+        assert mock_adapter._voice_pcm_callback is None
 
     @pytest.mark.asyncio
     async def test_join_missing_voice_dependencies(self, runner):
@@ -926,6 +1350,24 @@ class TestVoiceChannelCommands:
         assert runner._voice_mode["discord:123"] == "off"
         mock_adapter.leave_voice_channel.assert_called_once_with(111)
 
+    @pytest.mark.asyncio
+    async def test_leave_still_disconnects_when_realtime_cleanup_fails(self, runner):
+        mock_adapter = AsyncMock()
+        mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
+        mock_adapter.leave_voice_channel = AsyncMock()
+        manager = MagicMock()
+        manager.stop_for_voice_channel = AsyncMock(
+            side_effect=RuntimeError("provider teardown failed")
+        )
+        runner._codex_realtime_voice = manager
+        event = self._make_discord_event("/voice leave")
+        runner.adapters[event.source.platform] = mock_adapter
+
+        result = await runner._handle_voice_channel_leave(event)
+
+        assert "left" in result.lower()
+        mock_adapter.leave_voice_channel.assert_awaited_once_with(111)
+
     # -- _handle_voice_channel_input --
 
     @pytest.mark.asyncio
@@ -963,6 +1405,557 @@ class TestVoiceChannelCommands:
         assert event.message_type == MessageType.VOICE
         assert event.source.chat_id == "123"
         assert event.source.chat_type == "channel"
+
+    @pytest.mark.asyncio
+    async def test_realtime_transcript_uses_bound_adapter_text_pipeline(self, runner):
+        from gateway.config import Platform
+
+        primary_adapter = AsyncMock()
+        primary_adapter.handle_message = AsyncMock()
+        bound_adapter = AsyncMock()
+        bound_adapter._voice_text_channels = {111: 123}
+        bound_adapter._voice_sources = {}
+        bound_adapter.config = SimpleNamespace(extra={
+            "codex_realtime_voice": {"spoken_language": "nl-NL"}
+        })
+        bound_adapter._client = MagicMock()
+        bound_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        bound_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = primary_adapter
+
+        await runner._handle_voice_channel_input(
+            111,
+            42,
+            "Realtime transcript",
+            realtime=True,
+            adapter=bound_adapter,
+        )
+
+        event = bound_adapter.handle_message.call_args.args[0]
+        assert event.message_type == MessageType.TEXT
+        assert "connected Discord voice channel" in event.text
+        assert "nl-NL" in event.text
+        assert "Return only your final response text" in event.text
+        assert "Do not call text_to_speech" in event.text
+        assert event.text.endswith("Realtime transcript")
+        assert event.raw_message.guild_id == 111
+        primary_adapter.handle_message.assert_not_called()
+
+    def test_realtime_voice_drops_audio_media_but_preserves_other_media(self, runner):
+        """Live VC turns may not become clickable audio attachments in text chat."""
+        from gateway.config import Platform
+
+        event = _make_event(message_type=MessageType.TEXT)
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        adapter.extract_media.return_value = (
+            [
+                ("/tmp/hermes_voice/reply.ogg", True),
+                ("/tmp/generated/chart.png", False),
+            ],
+            "Hier is mijn antwoord.",
+        )
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            "Hier is mijn antwoord.\nMEDIA:/tmp/hermes_voice/reply.ogg",
+            adapter,
+        )
+
+        assert cleaned == "Hier is mijn antwoord.\nMEDIA:/tmp/generated/chart.png"
+        assert "reply.ogg" not in cleaned
+
+    def test_non_realtime_reply_keeps_audio_media(self, runner):
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=False)
+        adapter = MagicMock()
+        response = "Luister hiernaar.\nMEDIA:/tmp/reply.ogg"
+
+        assert runner._strip_realtime_voice_audio_media(event, response, adapter) == response
+        adapter.extract_media.assert_not_called()
+
+    def test_realtime_voice_preserves_non_voice_audio_artifact_without_tts_call(self, runner):
+        """A requested music/audio file is not the forbidden reply voice memo."""
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        adapter.extract_media.return_value = (
+            [("/tmp/generated/song.mp3", False)],
+            "Je audiobestand staat klaar.",
+        )
+        response = "Je audiobestand staat klaar.\nMEDIA:/tmp/generated/song.mp3"
+
+        assert (
+            runner._strip_realtime_voice_audio_media(
+                event,
+                response,
+                adapter,
+                agent_messages=[],
+            )
+            == response
+        )
+
+    def test_realtime_voice_suppresses_mp3_from_current_tts_turn(self, runner):
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        response = "Je audiobestand staat klaar.\nMEDIA:/tmp/generated/song.mp3"
+        adapter.extract_media.return_value = (
+            [("/tmp/generated/song.mp3", False)],
+            "Je audiobestand staat klaar.",
+        )
+        adapter.extract_local_files.return_value = ([], response)
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": {"text": "Hier is je audiobestand."},
+                        },
+                    }
+                ],
+            }
+        ]
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            response,
+            adapter,
+            agent_messages=messages,
+        )
+
+        assert cleaned == "Je audiobestand staat klaar."
+        assert "song.mp3" not in cleaned
+
+    def test_realtime_tts_without_voice_media_does_not_duplicate_other_media(
+        self, runner
+    ):
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        response = "Hier is de grafiek.\nMEDIA:/tmp/chart.png"
+        adapter.extract_media.return_value = (
+            [("/tmp/chart.png", False)],
+            "Hier is de grafiek.",
+        )
+        adapter.extract_local_files.return_value = ([], response)
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": {"text": "Hier is de grafiek."},
+                        },
+                    }
+                ],
+            }
+        ]
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            response,
+            adapter,
+            agent_messages=messages,
+        )
+
+        assert cleaned == response
+        assert cleaned.count("MEDIA:/tmp/chart.png") == 1
+
+    def test_realtime_media_only_reply_recovers_tts_text_for_vc(self, runner):
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        adapter.extract_media.side_effect = [
+            ([("/tmp/hermes_voice/reply.ogg", True)], ""),
+            ([], "Ik praat rechtstreeks in de voicechannel."),
+        ]
+        adapter.extract_local_files.return_value = (
+            [],
+            "Ik praat rechtstreeks in de voicechannel.",
+        )
+        messages = [{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "text_to_speech",
+                    "arguments": '{"text":"Ik praat rechtstreeks in de voicechannel."}',
+                },
+            }],
+        }]
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            "MEDIA:/tmp/hermes_voice/reply.ogg",
+            adapter,
+            agent_messages=messages,
+        )
+
+        assert cleaned == "Ik praat rechtstreeks in de voicechannel."
+
+    def test_realtime_empty_reply_recovers_current_turn_tts_text(self, runner):
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        adapter.extract_media.side_effect = [
+            ([], ""),
+            ([], "Ik praat rechtstreeks in de voicechannel."),
+        ]
+        adapter.extract_local_files.return_value = (
+            [],
+            "Ik praat rechtstreeks in de voicechannel.",
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": {
+                                "text": "Ik praat rechtstreeks in de voicechannel."
+                            },
+                        },
+                    }
+                ],
+            }
+        ]
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            "",
+            adapter,
+            agent_messages=messages,
+        )
+
+        assert cleaned == "Ik praat rechtstreeks in de voicechannel."
+
+    def test_realtime_recovered_tts_text_cannot_reintroduce_media(self, runner):
+        from gateway.config import Platform
+
+        event = _make_event(message_type=MessageType.TEXT)
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        adapter.extract_media.side_effect = [
+            ([("/tmp/hermes_voice/reply.ogg", True)], ""),
+            ([("/tmp/hermes_voice/reply.ogg", False)], "Ik praat live."),
+        ]
+        adapter.extract_local_files.return_value = ([], "Ik praat live.")
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": json.dumps(
+                                {
+                                    "text": "Ik praat live. MEDIA:/tmp/hermes_voice/reply.ogg"
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        ]
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            "MEDIA:/tmp/hermes_voice/reply.ogg",
+            adapter,
+            agent_messages=messages,
+        )
+
+        assert cleaned == "Ik praat live."
+        assert "MEDIA:" not in cleaned
+
+    def test_realtime_tts_bare_audio_path_is_not_delivered(self, runner):
+        from gateway.config import Platform
+
+        event = _make_event(message_type=MessageType.TEXT)
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        response = "Ik praat live. /tmp/hermes_voice/reply.ogg"
+        adapter.extract_media.return_value = ([], response)
+        adapter.extract_local_files.return_value = (
+            ["/tmp/hermes_voice/reply.ogg"],
+            "Ik praat live.",
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": {"text": "Ik praat live."},
+                        },
+                    }
+                ],
+            }
+        ]
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            response,
+            adapter,
+            agent_messages=messages,
+        )
+
+        assert cleaned == "Ik praat live."
+
+    def test_realtime_tts_bare_audio_only_returns_failure_text(self, runner):
+        from gateway.config import Platform
+
+        event = _make_event(message_type=MessageType.TEXT)
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        response = "/tmp/hermes_voice/reply.ogg"
+        adapter.extract_media.return_value = ([], response)
+        adapter.extract_local_files.return_value = (
+            ["/tmp/hermes_voice/reply.ogg"],
+            "",
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": {},
+                        },
+                    }
+                ],
+            }
+        ]
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            response,
+            adapter,
+            agent_messages=messages,
+        )
+
+        assert cleaned == "Sorry, I couldn't prepare the spoken reply."
+
+    def test_realtime_recovered_tts_text_cannot_attach_bare_file(self, runner):
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        adapter.extract_media.side_effect = [
+            ([("/tmp/hermes_voice/reply.ogg", True)], ""),
+            ([], "Ik praat live. /tmp/chart.png"),
+        ]
+        adapter.extract_local_files.side_effect = [
+            (["/tmp/chart.png"], "Ik praat live."),
+            ([], "Ik praat live."),
+        ]
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": {"text": "Ik praat live. /tmp/chart.png"},
+                        },
+                    }
+                ],
+            }
+        ]
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            "MEDIA:/tmp/hermes_voice/reply.ogg",
+            adapter,
+            agent_messages=messages,
+        )
+
+        assert cleaned == "Ik praat live."
+        assert "/tmp/chart.png" not in cleaned
+
+    def test_realtime_adapter_unavailable_still_strips_voice_media(
+        self, runner, tmp_path
+    ):
+        from gateway.config import Platform
+
+        audio = tmp_path / "reply.ogg"
+        audio.write_bytes(b"not real audio")
+        event = _make_event(message_type=MessageType.TEXT)
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        response = f"[[audio_as_voice]]\nMEDIA:{audio}"
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            response,
+            None,
+            agent_messages=[],
+        )
+
+        assert str(audio) not in cleaned
+        assert cleaned == "Sorry, I couldn't prepare the spoken reply."
+
+    def test_realtime_sanitized_reply_has_no_audio_for_normal_or_stream_delivery(
+        self, runner, tmp_path
+    ):
+        from gateway.config import Platform
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            should_send_media_as_audio,
+        )
+
+        audio = tmp_path / "reply.ogg"
+        image = tmp_path / "chart.png"
+        audio.write_bytes(b"not real audio")
+        image.write_bytes(b"not real image")
+        event = _make_event(message_type=MessageType.TEXT)
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        response = (
+            f"Hier is de grafiek.\n[[audio_as_voice]]\nMEDIA:{audio}\nMEDIA:{image}"
+        )
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            response,
+            None,
+            agent_messages=[],
+        )
+
+        explicit_media, visible = BasePlatformAdapter.extract_media(cleaned)
+        bare_media, _visible = BasePlatformAdapter.extract_local_files(visible)
+        delivered_paths = [path for path, _is_voice in explicit_media] + bare_media
+        assert str(audio) not in delivered_paths
+        assert str(image) in delivered_paths
+        assert not any(
+            should_send_media_as_audio(
+                Platform.DISCORD,
+                os.path.splitext(path)[1],
+                is_voice=is_voice,
+            )
+            for path, is_voice in explicit_media
+        )
+
+    def test_realtime_parser_failure_strips_inline_media_directive(self, runner):
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        adapter.extract_media.side_effect = RuntimeError("parser failed")
+        response = "Ik praat live. MEDIA:/tmp/hermes_voice/reply.ogg"
+
+        cleaned = runner._strip_realtime_voice_audio_media(event, response, adapter)
+
+        assert "MEDIA:" not in cleaned
+        assert "Ik praat live." in cleaned
+
+    def test_realtime_parser_failure_still_strips_bare_tts_audio(
+        self, runner, tmp_path
+    ):
+        from gateway.config import Platform
+
+        audio = tmp_path / "reply.ogg"
+        audio.write_bytes(b"not real audio")
+        event = _make_event(message_type=MessageType.TEXT)
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        adapter.extract_media.side_effect = RuntimeError("parser failed")
+        response = f"Ik praat live. {audio}"
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": {"text": "Ik praat live."},
+                        },
+                    }
+                ],
+            }
+        ]
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            response,
+            adapter,
+            agent_messages=messages,
+        )
+
+        assert str(audio) not in cleaned
+        assert cleaned == "Ik praat live."
+
+    def test_realtime_preserved_document_keeps_as_document_marker(self, runner):
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        adapter.extract_media.return_value = (
+            [
+                ("/tmp/hermes_voice/reply.ogg", True),
+                ("/tmp/chart.png", False),
+            ],
+            "Hier is de grafiek.",
+        )
+        response = (
+            "Hier is de grafiek.\n[[as_document]]\n"
+            "MEDIA:/tmp/hermes_voice/reply.ogg\nMEDIA:/tmp/chart.png"
+        )
+
+        cleaned = runner._strip_realtime_voice_audio_media(event, response, adapter)
+
+        assert "[[as_document]]" in cleaned
+        assert "MEDIA:/tmp/chart.png" in cleaned
+        assert "reply.ogg" not in cleaned
+
+    def test_realtime_media_only_reply_never_reuses_stale_tts_text(self, runner):
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+        adapter = MagicMock()
+        adapter.extract_media.return_value = (
+            [("/tmp/hermes_voice/reply.ogg", True)],
+            "",
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "function": {
+                        "name": "text_to_speech",
+                        "arguments": '{"text":"Oude zin van een vorige beurt."}',
+                    },
+                }],
+            },
+            {"role": "user", "content": "Nieuwe gesproken beurt"},
+            {"role": "assistant", "content": ""},
+        ]
+
+        cleaned = runner._strip_realtime_voice_audio_media(
+            event,
+            "MEDIA:/tmp/hermes_voice/reply.ogg",
+            adapter,
+            agent_messages=messages,
+        )
+
+        assert cleaned == "Sorry, I couldn't prepare the spoken reply."
 
     @pytest.mark.asyncio
     async def test_input_reuses_bound_source_metadata(self, runner):
@@ -1013,6 +2006,26 @@ class TestVoiceChannelCommands:
         msg = mock_channel.send.call_args[0][0]
         assert "Test transcript" in msg
         assert "42" in msg  # user_id in mention
+
+    @pytest.mark.asyncio
+    async def test_input_respects_disabled_transcript_echo(self, runner):
+        """Voice input remains actionable without posting raw STT into chat."""
+        from gateway.config import Platform
+
+        runner.config = SimpleNamespace(stt_echo_transcripts=False)
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        await runner._handle_voice_channel_input(111, 42, "Quiet transcript")
+
+        mock_channel.send.assert_not_awaited()
+        mock_adapter.handle_message.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_input_suppresses_duplicate_transcript(self, runner):
@@ -1351,22 +2364,35 @@ class TestVoiceReceiverThreadSafety:
             "check_silence must hold self._lock while iterating buffers"
         )
 
-    def test_on_packet_buffer_write_holds_lock(self):
-        """_on_packet must hold lock when writing to buffers."""
-        import ast, inspect, textwrap
-        from plugins.platforms.discord.adapter import VoiceReceiver
-        source = textwrap.dedent(inspect.getsource(VoiceReceiver._on_packet))
-        tree = ast.parse(source)
-        # Find 'with self._lock:' that contains buffer extend
-        found_lock_with_extend = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.With):
-                src_fragment = ast.dump(node)
-                if "lock" in src_fragment and "extend" in src_fragment:
-                    found_lock_with_extend = True
-        assert found_lock_with_extend, (
-            "_on_packet must hold self._lock when extending buffers"
-        )
+    def test_decoded_pcm_fallback_writes_buffer_under_lock(self):
+        """Decoded PCM fallback must hold the lock while extending buffers."""
+        receiver = self._make_receiver()
+
+        class RecordingLock:
+            def __init__(self):
+                self.depth = 0
+
+            def __enter__(self):
+                self.depth += 1
+                return self
+
+            def __exit__(self, *_args):
+                self.depth -= 1
+
+        lock = RecordingLock()
+
+        class GuardedBuffer(bytearray):
+            def extend(self, data):
+                assert lock.depth > 0, "buffer write happened outside receiver lock"
+                super().extend(data)
+
+        setattr(receiver, "_lock", lock)
+        receiver._ssrc_to_user[100] = 42
+        receiver._buffers[100] = GuardedBuffer()
+
+        receiver.handle_decoded_pcm(100, b"pcm")
+
+        assert receiver._buffers[100] == bytearray(b"pcm")
 
     def test_concurrent_buffer_access_safe(self):
         """Simulate concurrent buffer writes and reads under lock."""
@@ -1963,6 +2989,20 @@ class TestVoiceTimeoutCleansRunnerState:
 
         assert runner._voice_mode["discord:999"] == "off", \
             "voice_mode must persist explicit off state after timeout cleanup"
+
+    @pytest.mark.asyncio
+    async def test_runner_timeout_cleanup_stops_realtime_for_bound_guild(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 999}
+        manager = MagicMock()
+        manager.stop_for_voice_channel = AsyncMock()
+        runner._codex_realtime_voice = manager
+
+        runner._handle_voice_timeout_cleanup("999", adapter=adapter)
+        await asyncio.sleep(0)
+
+        manager.stop_for_voice_channel.assert_awaited_once_with(adapter, 111)
 
     @pytest.mark.asyncio
     async def test_timeout_without_callback_does_not_crash(self, adapter):

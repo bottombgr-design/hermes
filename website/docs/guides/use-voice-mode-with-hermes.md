@@ -387,6 +387,46 @@ In a Discord text channel where the bot is present:
 - use a dedicated bot/testing channel at first
 - verify STT and TTS work in ordinary text-chat voice mode before trying VC mode
 
+### Experimental Codex GPT-Live speech interface
+
+Hermes can optionally replace the completed-utterance STT/TTS edges of a Discord VC session with a low-latency Codex realtime WebRTC connection. Hermes still owns the conversation, tools, memory, and approvals: user transcripts enter the normal Hermes pipeline, and only Hermes' final response is sent back to Codex with `thread/realtime/appendSpeech` for speech synthesis. Codex startup context is excluded and the realtime session receives a speech-interface-only prompt. Unsolicited model audio is additionally dropped as a defense-in-depth boundary.
+
+This route is disabled by default and currently supports one explicitly bound Discord user per VC session:
+
+```yaml
+discord:
+  codex_realtime_voice:
+    enabled: true
+    user_id: "123456789012345678"
+    voice: ""                    # empty = selected protocol's default
+    spoken_language: ""          # e.g. nl-NL; empty preserves spoken language
+    protocol_version: "v3"       # WebRTC supports v1 or v3
+    fallback_to_classic: true
+    codex_bin: "codex"
+    codex_home: ""               # optional isolated CODEX_HOME
+```
+
+Requirements and limits:
+
+- Codex CLI `0.145.0` or newer, authenticated in its own `CODEX_HOME`
+- the optional `codex-realtime-voice` dependencies; Hermes installs them lazily when allowed, or install `hermes-agent[codex-realtime-voice]` yourself
+- account entitlement to Codex realtime voice; availability is checked when `/voice join` starts
+- WebRTC protocol `v3` by default; `v1` remains available as an explicit compatibility option, while `v2` does not support this WebRTC route
+- supported voices are queried from Codex at runtime; V3 preserves the V1 Codex Voice family
+- `spoken_language` optionally pins Hermes' reply and synthesized speech to a language such as `nl-NL`; input transcription still preserves the language the user spoke
+- `spoken_language` is a prompt preference, because Codex app-server does not expose a native language/locale field for this route
+- each voice session uses an ephemeral Codex app-server thread rather than a persisted Codex conversation
+- decoded Discord audio and Hermes' synthesized reply text are sent to Codex/OpenAI for the duration of the session; do not enable this route in channels where that external processing is inappropriate
+- while realtime is active, PCM from other VC users is ignored rather than routed through a parallel classic-STT path
+- no realtime reasoning-effort control or native provider language/locale selector; automatic language detection is not a contractual guarantee
+- no extra OpenAI API key is required for the WebRTC route when the Codex account is entitled
+
+If dependency loading, Codex capability checks, account entitlement, SDP negotiation, or the realtime transport fails, `fallback_to_classic: true` keeps the existing Whisper/STT → Hermes → TTS path active. The join response states which path is active.
+
+:::warning Experimental availability
+Codex may return `Voice session access denied` for an otherwise valid ChatGPT/Codex login. That is an account/backend entitlement result, not a Discord configuration error. Classic voice continues when fallback is enabled.
+:::
+
 ## Voice quality recommendations
 
 ### Best quality setup

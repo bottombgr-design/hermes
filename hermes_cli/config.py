@@ -2738,6 +2738,20 @@ DEFAULT_CONFIG = {
                 "On it.",
             ],
         },
+        # Experimental Codex GPT-Live speech interface for Discord VC audio.
+        # Disabled by default. Requires Codex CLI >=0.145 with its own login and
+        # one explicit Discord user binding; all failures fall back to classic
+        # STT → Hermes → TTS unless fallback_to_classic is set false.
+        "codex_realtime_voice": {
+            "enabled": False,
+            "user_id": "",            # one Discord user ID; quote snowflakes in YAML
+            "voice": "",              # empty = protocol default; queried at runtime
+            "spoken_language": "",    # e.g. nl-NL; empty preserves detected language
+            "protocol_version": "v3", # WebRTC supports v1 or v3; v3 is current
+            "fallback_to_classic": True,
+            "codex_bin": "codex",
+            "codex_home": "",         # optional isolated CODEX_HOME
+        },
     },
 
     # WhatsApp platform settings (gateway mode)

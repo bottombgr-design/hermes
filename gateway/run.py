@@ -3725,6 +3725,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Protects against the same utterance being emitted twice by the voice
         # capture / STT pipeline, which otherwise produces a second delayed reply.
         self._recent_voice_transcripts: Dict[tuple[int, int], List[tuple[float, str]]] = {}
+        # Experimental Codex GPT-Live route. Constructed lazily on the first
+        # Discord VC join; WebRTC dependencies remain opt-in after that.
+        self._codex_realtime_voice = None
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
@@ -9907,6 +9910,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _agent, context="shutdown idle-cache"
                     )
 
+            realtime_voice = getattr(self, "_codex_realtime_voice", None)
+            if realtime_voice is not None:
+                try:
+                    await realtime_voice.close()
+                except Exception:
+                    logger.debug("Codex realtime voice shutdown failed", exc_info=True)
+
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
 
@@ -14730,6 +14740,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = ""
 
             # Auto voice reply: send TTS audio before the text response
+            # A realtime Discord VC turn owns one spoken-output route. If the
+            # model nevertheless called the generic text_to_speech tool, drop
+            # that tool's audio MEDIA tag before both VC synthesis and normal
+            # platform delivery. Otherwise the generic dedup path below skips
+            # the VC reply and Discord receives a clickable voice attachment
+            # in the linked text channel instead of live channel audio.
+            response = self._strip_realtime_voice_audio_media(
+                event,
+                response,
+                self._adapter_for_source(source),
+                agent_messages=agent_messages,
+            )
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
@@ -15482,6 +15504,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
 
+    def _get_codex_realtime_voice_manager(self):
+        manager = getattr(self, "_codex_realtime_voice", None)
+        if manager is None:
+            from gateway.codex_realtime_voice import CodexRealtimeVoiceManager
+
+            manager = CodexRealtimeVoiceManager()
+            self._codex_realtime_voice = manager
+        return manager
+
+    async def _handle_codex_realtime_runtime_failure(
+        self,
+        adapter,
+        guild_id: int,
+        source: SessionSource,
+        reason: str,
+        fallback_to_classic: bool,
+    ) -> None:
+        if fallback_to_classic:
+            return
+        logger.warning(
+            "Codex realtime voice stopped without classic fallback: %s",
+            reason,
+        )
+        try:
+            await adapter.leave_voice_channel(guild_id)
+        except Exception:
+            logger.warning(
+                "Discord leave failed after Codex realtime failure",
+                exc_info=True,
+            )
+        finally:
+            self._voice_mode[
+                self._voice_key(source.platform, source.chat_id)
+            ] = "off"
+            self._save_voice_modes()
+            self._set_adapter_auto_tts_disabled(
+                adapter,
+                source.chat_id,
+                disabled=True,
+            )
+            if hasattr(adapter, "_voice_input_callback"):
+                setattr(adapter, "_voice_input_callback", None)
+            if hasattr(adapter, "_voice_pcm_callback"):
+                setattr(adapter, "_voice_pcm_callback", None)
+
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
         adapter = self._adapter_for_source(event.source)
@@ -15501,9 +15568,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Wire callbacks BEFORE join so voice input arriving immediately
         # after connection is not lost.
         if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = self._handle_voice_channel_input
+            adapter._voice_input_callback = (
+                lambda callback_guild_id, callback_user_id, transcript: (
+                    self._handle_voice_channel_input(
+                        callback_guild_id,
+                        callback_user_id,
+                        transcript,
+                        adapter=adapter,
+                    )
+                )
+            )
+        realtime_manager = self._get_codex_realtime_voice_manager()
+        if hasattr(adapter, "_voice_pcm_callback"):
+            setattr(
+                adapter,
+                "_voice_pcm_callback",
+                lambda callback_guild_id, callback_user_id, pcm: (
+                    realtime_manager.push_discord_pcm(
+                        adapter,
+                        callback_guild_id,
+                        callback_user_id,
+                        pcm,
+                    )
+                ),
+            )
         if hasattr(adapter, "_on_voice_disconnect"):
-            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+            adapter._on_voice_disconnect = lambda chat_id: self._handle_voice_timeout_cleanup(
+                chat_id, adapter=adapter
+            )
         # Let the adapter's inactivity timer see the live voice-reply mode so it
         # doesn't disconnect a deliberately text-only (/voice off) session.
         if hasattr(adapter, "_voice_mode_getter"):
@@ -15511,11 +15603,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._voice_key(Platform.DISCORD, str(chat_id)), "off"
             )
 
+        realtime_manager.prepare_for_voice_channel(adapter, guild_id)
         try:
             success = await adapter.join_voice_channel(voice_channel)
         except Exception as e:
+            realtime_manager.cancel_voice_channel_start(adapter, guild_id)
             logger.warning("Failed to join voice channel: %s", e)
             adapter._voice_input_callback = None
+            if hasattr(adapter, "_voice_pcm_callback"):
+                setattr(adapter, "_voice_pcm_callback", None)
             err_lower = str(e).lower()
             if "pynacl" in err_lower or "nacl" in err_lower or "davey" in err_lower:
                 return (
@@ -15531,12 +15627,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+
+            try:
+                realtime_user_id = int(event.source.user_id or "0")
+            except (TypeError, ValueError):
+                realtime_user_id = 0
+            try:
+                realtime_result = await realtime_manager.start_for_voice_channel(
+                    adapter=adapter,
+                    guild_id=guild_id,
+                    user_id=realtime_user_id,
+                    on_transcript=lambda transcript_user_id, text, generation: (
+                        self._handle_voice_channel_input(
+                            guild_id,
+                            transcript_user_id,
+                            text,
+                            realtime=True,
+                            realtime_generation=generation,
+                            adapter=adapter,
+                        )
+                    ),
+                    on_runtime_failure=lambda reason, fallback_to_classic: (
+                        self._handle_codex_realtime_runtime_failure(
+                            adapter,
+                            guild_id,
+                            event.source,
+                            reason,
+                            fallback_to_classic,
+                        )
+                    ),
+                )
+            finally:
+                realtime_manager.cancel_voice_channel_start(adapter, guild_id)
+            if realtime_result.enabled and not realtime_result.active:
+                realtime_reason = str(
+                    realtime_result.reason or "Codex realtime startup failed"
+                )
+                if not realtime_result.fallback_to_classic:
+                    await self._handle_codex_realtime_runtime_failure(
+                        adapter,
+                        guild_id,
+                        event.source,
+                        realtime_reason,
+                        False,
+                    )
+                    return (
+                        f"Codex Live could not start ({realtime_reason}) and "
+                        "classic fallback is disabled."
+                    )
+                realtime_line = (
+                    f"\nCodex Live unavailable ({realtime_reason}); "
+                    "using classic STT/TTS voice."
+                )
+            elif realtime_result.active:
+                realtime_line = "\nCodex Live realtime voice is active (experimental)."
+            else:
+                realtime_line = ""
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
-                f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
+                "I'll speak my replies and listen to you. Use /voice leave to disconnect."
+                f"{realtime_line}"
             )
-        # Join failed — clear callback
+        # Join failed — clear callbacks
+        realtime_manager.cancel_voice_channel_start(adapter, guild_id)
         adapter._voice_input_callback = None
+        if hasattr(adapter, "_voice_pcm_callback"):
+            setattr(adapter, "_voice_pcm_callback", None)
         return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
@@ -15551,26 +15707,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "Not in a voice channel."
 
         try:
+            await self._get_codex_realtime_voice_manager().stop_for_voice_channel(
+                adapter, guild_id
+            )
+        except Exception:
+            logger.warning(
+                "Codex realtime voice cleanup failed before Discord leave",
+                exc_info=True,
+            )
+        try:
             await adapter.leave_voice_channel(guild_id)
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
-        # Always clean up state even if leave raised an exception
-        self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "off"
+        # Always clean up runner state even if Discord teardown raised.
+        self._voice_mode[
+            self._voice_key(event.source.platform, event.source.chat_id)
+        ] = "off"
         self._save_voice_modes()
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
+        if hasattr(adapter, "_voice_pcm_callback"):
+            setattr(adapter, "_voice_pcm_callback", None)
         return "Left voice channel."
 
-    def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
-        """Called by the adapter when a voice channel times out.
+    def _handle_voice_timeout_cleanup(self, chat_id: str, *, adapter=None) -> None:
+        """Clean runner/provider state after Discord voice inactivity timeout."""
+        if adapter is not None:
+            guild_ids = [
+                guild_id
+                for guild_id, linked_chat_id in getattr(
+                    adapter, "_voice_text_channels", {}
+                ).items()
+                if str(linked_chat_id) == str(chat_id)
+            ]
+            manager = self._get_codex_realtime_voice_manager()
 
-        Cleans up runner-side voice_mode state that the adapter cannot reach.
-        """
+            async def _stop_realtime_voice(guild_id: int) -> None:
+                try:
+                    await manager.stop_for_voice_channel(adapter, guild_id)
+                except Exception:
+                    logger.warning(
+                        "Codex realtime voice timeout cleanup failed",
+                        exc_info=True,
+                    )
+
+            for guild_id in guild_ids:
+                task = asyncio.create_task(_stop_realtime_voice(guild_id))
+                background_tasks = getattr(self, "_background_tasks", None)
+                if isinstance(background_tasks, set):
+                    background_tasks.add(task)
+                    task.add_done_callback(background_tasks.discard)
+
         self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
         self._save_voice_modes()
-        adapter = self.adapters.get(Platform.DISCORD)
-        self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+        resolved_adapter = adapter or self.adapters.get(Platform.DISCORD)
+        self._set_adapter_auto_tts_disabled(
+            resolved_adapter, chat_id, disabled=True
+        )
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.
@@ -15614,14 +15808,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self,
+        guild_id: int,
+        user_id: int,
+        transcript: str,
+        *,
+        realtime: bool = False,
+        realtime_generation: Optional[int] = None,
+        adapter=None,
     ):
         """Handle transcribed voice from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
-        adapter's full message pipeline (session, typing, agent, TTS reply).
+        adapter's full message pipeline. Realtime transcripts use a TEXT event
+        so the classic base-adapter TTS path cannot speak a duplicate reply;
+        the runner routes the final text back through Codex appendSpeech.
         """
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = adapter or self.adapters.get(Platform.DISCORD)
         if not adapter:
             return
 
@@ -15659,24 +15862,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
-        # Show transcript in text channel (after auth, with mention sanitization)
-        try:
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
-        except Exception:
-            pass
+        # Show transcript in text channel only when raw STT echo is enabled.
+        if self._should_echo_stt_transcripts():
+            try:
+                channel = adapter._client.get_channel(text_ch_id)
+                if channel:
+                    safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+                    await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+            except Exception:
+                pass
 
         # Build a synthetic MessageEvent and feed through the normal pipeline
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
         # guild_id and _send_voice_reply() plays audio in the voice channel.
         from types import SimpleNamespace
+        agent_input = transcript
+        if realtime:
+            spoken_language = self._get_codex_realtime_voice_manager().configured_spoken_language(
+                adapter
+            )
+            language_context = (
+                f" The configured spoken language is {spoken_language}; "
+                "reply naturally in that language."
+                if spoken_language
+                else " Reply naturally in the language the user spoke."
+            )
+            # Realtime audio is represented as a TEXT event to avoid the base
+            # adapter's classic auto-TTS path. Preserve the otherwise-lost
+            # modality and language context for the normal Hermes turn.
+            agent_input = (
+                "[This was spoken live in the connected Discord voice channel. "
+                "Reply naturally as part of that live spoken conversation. "
+                f"{language_context.strip()} "
+                "Return only your final response text. Do not call text_to_speech "
+                "or attach a voice memo for your reply; the gateway will speak "
+                "your final text directly in the connected voice channel. Media "
+                "artifacts explicitly requested by the user remain allowed.]\n"
+                f"{transcript}"
+            )
         event = MessageEvent(
             source=source,
-            text=transcript,
-            message_type=MessageType.VOICE,
-            raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
+            text=agent_input,
+            message_type=MessageType.TEXT if realtime else MessageType.VOICE,
+            raw_message=SimpleNamespace(
+                guild_id=guild_id,
+                guild=None,
+                codex_realtime_voice=realtime,
+                codex_realtime_generation=realtime_generation,
+            ),
         )
 
         await adapter.handle_message(event)
@@ -15704,7 +15937,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         chat_id = event.source.chat_id
         voice_mode = self._voice_mode.get(self._voice_key(event.source.platform, chat_id), "off")
-        is_voice_input = (event.message_type == MessageType.VOICE)
+        is_realtime_voice_input = bool(
+            getattr(event.raw_message, "codex_realtime_voice", False)
+        )
+        is_voice_input = (
+            event.message_type == MessageType.VOICE or is_realtime_voice_input
+        )
 
         should = (
             (voice_mode == "all")
@@ -15722,7 +15960,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             for msg in agent_messages
         )
-        if has_agent_tts:
+        if has_agent_tts and not is_realtime_voice_input:
             return False
 
         # Dedup: base adapter auto-TTS already handles voice input
@@ -15730,17 +15968,303 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When streaming already delivered the text (already_sent=True),
         # the base adapter will receive None and can't run auto-TTS,
         # so the runner must take over.
-        if is_voice_input and not already_sent:
+        if is_voice_input and not is_realtime_voice_input and not already_sent:
             return False
 
         return True
 
+    def _strip_realtime_voice_audio_media(
+        self,
+        event: MessageEvent,
+        response: str,
+        adapter,
+        agent_messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Prevent live Discord VC replies from becoming chat audio files.
+
+        The generic gateway media collector auto-appends ``MEDIA:`` tags from
+        text_to_speech tool results. That is correct for ordinary messaging,
+        but a Codex realtime VC turn has a single owner for spoken output:
+        ``_send_voice_reply``. Keep non-audio artifacts available while
+        dropping audio attachments from this specific synthetic turn.
+        """
+        if not bool(getattr(event.raw_message, "codex_realtime_voice", False)):
+            return response
+
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            should_send_media_as_audio,
+        )
+        extract_media_candidate = getattr(adapter, "extract_media", None)
+        extract_media: Callable[[str], Any] = cast(
+            Callable[[str], Any],
+            extract_media_candidate
+            if callable(extract_media_candidate)
+            else BasePlatformAdapter.extract_media,
+        )
+        extract_local_files_candidate = getattr(adapter, "extract_local_files", None)
+        extract_local_files: Callable[[str], Any] = cast(
+            Callable[[str], Any],
+            extract_local_files_candidate
+            if callable(extract_local_files_candidate)
+            else BasePlatformAdapter.extract_local_files,
+        )
+
+        try:
+            force_document_attachments = "[[as_document]]" in response
+            media_files, cleaned = extract_media(response)
+            suppressed_audio = 0
+            preserved_media = []
+            current_turn_called_tts = self._current_turn_has_tts_tool(
+                agent_messages or []
+            )
+            for media_path, is_voice in media_files:
+                ext = Path(media_path).suffix.lower()
+                is_audio = should_send_media_as_audio(
+                    event.source.platform,
+                    ext,
+                    is_voice=is_voice,
+                )
+                # Automatic reply speech may be OGG voice media or an unmarked
+                # MP3. During a current TTS turn both are owned by the live VC;
+                # audio from unrelated artifact flows remains deliverable.
+                if is_audio and (is_voice or current_turn_called_tts):
+                    suppressed_audio += 1
+                else:
+                    preserved_media.append(media_path)
+
+            changed = bool(suppressed_audio)
+            rebuilt = cleaned.rstrip() if suppressed_audio else response
+            if suppressed_audio:
+                logger.warning(
+                    "Suppressed %d model-generated audio attachment(s) for a live Discord VC reply",
+                    suppressed_audio,
+                )
+            if (suppressed_audio or current_turn_called_tts) and not rebuilt:
+                changed = True
+                recovered = self._latest_tts_tool_text(agent_messages or [])
+                if recovered:
+                    # TTS arguments are speech content, never a second channel
+                    # through which attachment directives may re-enter delivery.
+                    _recovered_media, recovered = extract_media(recovered)
+                    # Bare paths in recovered speech are also tool payload, not
+                    # a fresh attachment request. Strip all of them here.
+                    _recovered_files, recovered = extract_local_files(recovered)
+                    rebuilt = recovered.rstrip()
+                else:
+                    rebuilt = self._realtime_voice_failure_text(adapter)
+            if suppressed_audio and preserved_media:
+                preserved = "\n".join(f"MEDIA:{path}" for path in preserved_media)
+                if force_document_attachments:
+                    preserved = f"[[as_document]]\n{preserved}"
+                rebuilt = f"{rebuilt}\n{preserved}" if rebuilt else preserved
+
+            if current_turn_called_tts:
+                local_files, local_cleaned = extract_local_files(rebuilt)
+                suppressed_local_audio = []
+                preserved_local_files = []
+                for local_path in local_files:
+                    ext = Path(local_path).suffix.lower()
+                    if should_send_media_as_audio(
+                        event.source.platform,
+                        ext,
+                        is_voice=False,
+                    ):
+                        suppressed_local_audio.append(local_path)
+                    else:
+                        preserved_local_files.append(local_path)
+                if suppressed_local_audio:
+                    changed = True
+                    rebuilt = local_cleaned.rstrip()
+                    if preserved_local_files:
+                        preserved = "\n".join(
+                            f"MEDIA:{path}" for path in preserved_local_files
+                        )
+                        if force_document_attachments:
+                            preserved = f"[[as_document]]\n{preserved}"
+                        rebuilt = f"{rebuilt}\n{preserved}" if rebuilt else preserved
+                    logger.warning(
+                        "Suppressed %d model-generated bare audio path(s) for a live Discord VC reply",
+                        len(suppressed_local_audio),
+                    )
+            if changed and not rebuilt:
+                rebuilt = self._realtime_voice_failure_text(adapter)
+            return rebuilt if changed else response
+        except Exception:
+            # Fail closed for the live-voice contract: if media parsing itself
+            # breaks, retain visible text but never leak an explicit MEDIA tag
+            # into the linked text channel as a faux voice fallback.
+            logger.warning(
+                "Failed to classify live Discord VC media; suppressing explicit media directives",
+                exc_info=True,
+            )
+            cleaned = BasePlatformAdapter.strip_media_directives_for_display(response)
+            current_turn_called_tts = self._current_turn_has_tts_tool(
+                agent_messages or []
+            )
+            if current_turn_called_tts:
+                local_files, local_cleaned = BasePlatformAdapter.extract_local_files(
+                    cleaned
+                )
+                preserved_local_files = [
+                    path
+                    for path in local_files
+                    if not should_send_media_as_audio(
+                        event.source.platform,
+                        Path(path).suffix.lower(),
+                        is_voice=False,
+                    )
+                ]
+                if len(preserved_local_files) != len(local_files):
+                    cleaned = local_cleaned.rstrip()
+                    if preserved_local_files:
+                        preserved = "\n".join(
+                            f"MEDIA:{path}" for path in preserved_local_files
+                        )
+                        cleaned = f"{cleaned}\n{preserved}" if cleaned else preserved
+            return cleaned.rstrip() or self._realtime_voice_failure_text(adapter)
+
+    @staticmethod
+    def _realtime_voice_failure_text(adapter) -> str:
+        """Return a visible/spoken failure sentence in the configured language."""
+        config = getattr(adapter, "config", None)
+        extra = getattr(config, "extra", None)
+        realtime = extra.get("codex_realtime_voice") if isinstance(extra, dict) else None
+        language = realtime.get("spoken_language", "") if isinstance(realtime, dict) else ""
+        if str(language).lower().startswith("nl"):
+            return "Sorry, ik kon het gesproken antwoord niet afmaken."
+        return "Sorry, I couldn't prepare the spoken reply."
+
+    @staticmethod
+    def _current_turn_has_tts_tool(agent_messages: List[Dict[str, Any]]) -> bool:
+        """Return whether the current turn, not history, invoked TTS."""
+        for message in reversed(agent_messages):
+            role = message.get("role")
+            if role == "user":
+                break
+            if role != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                if (call.get("function") or {}).get("name") == "text_to_speech":
+                    return True
+        return False
+
+    @staticmethod
+    def _latest_tts_tool_text(agent_messages: List[Dict[str, Any]]) -> str:
+        """Recover intended speech text when a TTS-only reply has no final text."""
+        for message in reversed(agent_messages):
+            role = message.get("role")
+            if role == "user":
+                break
+            if role != "assistant":
+                continue
+            for call in reversed(message.get("tool_calls") or []):
+                function = call.get("function") or {}
+                if function.get("name") != "text_to_speech":
+                    continue
+                arguments = function.get("arguments") or {}
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except (TypeError, ValueError):
+                        continue
+                if isinstance(arguments, dict):
+                    text = arguments.get("text")
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
+        return ""
+
     def _should_echo_stt_transcripts(self) -> bool:
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
-        return bool(getattr(self.config, "stt_echo_transcripts", True))
+        config = getattr(self, "config", None)
+        return bool(getattr(config, "stt_echo_transcripts", True))
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
+        if event.source.platform == Platform.DISCORD:
+            guild_id = self._get_guild_id(event)
+            adapter = self._adapter_for_source(event.source)
+            realtime_manager = self._get_codex_realtime_voice_manager()
+            voice_text_channels = getattr(adapter, "_voice_text_channels", {})
+            linked_chat_id = (
+                voice_text_channels.get(guild_id)
+                if isinstance(voice_text_channels, dict) and guild_id
+                else None
+            )
+            is_realtime_voice_input = bool(
+                getattr(event.raw_message, "codex_realtime_voice", False)
+            )
+            is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None)
+            if is_realtime_voice_input and (
+                not guild_id
+                or not callable(is_in_voice_channel)
+                or not is_in_voice_channel(guild_id)
+            ):
+                logger.warning(
+                    "Suppressing live Discord VC speech because the voice channel is disconnected"
+                )
+                return
+            linked_voice_session = (
+                guild_id
+                and adapter is not None
+                and str(linked_chat_id) == str(event.source.chat_id)
+            )
+            if (
+                linked_voice_session
+                and realtime_manager.is_active(adapter, guild_id)
+            ):
+                from agent.transports.codex_realtime_voice import (
+                    CodexRealtimeStaleSpeech,
+                    safe_realtime_error,
+                )
+
+                fallback_to_classic = realtime_manager.classic_fallback_enabled(
+                    adapter, guild_id
+                )
+                try:
+                    from tools.tts_tool import _strip_markdown_for_tts
+
+                    speech_text = _strip_markdown_for_tts(text[:4000])
+                    if not speech_text:
+                        return
+                    if await realtime_manager.append_speech(
+                        adapter,
+                        guild_id,
+                        speech_text,
+                        transcript_generation=getattr(
+                            event.raw_message,
+                            "codex_realtime_generation",
+                            None,
+                        ),
+                    ):
+                        return
+                except CodexRealtimeStaleSpeech:
+                    logger.debug(
+                        "Suppressing stale Codex realtime voice reply after barge-in"
+                    )
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "Codex realtime speech failed (%s): %s",
+                        (
+                            "using classic TTS fallback"
+                            if fallback_to_classic
+                            else "classic TTS fallback disabled"
+                        ),
+                        safe_realtime_error(exc),
+                    )
+                if not fallback_to_classic:
+                    return
+            elif (
+                linked_voice_session
+                and is_realtime_voice_input
+                and not realtime_manager.configured_fallback_enabled(adapter)
+            ):
+                # A no-fallback realtime route may fail while Hermes is still
+                # processing its last transcript. Do not leak that reply into
+                # local TTS after the failed session has already been removed.
+                return
+
         import uuid as _uuid
         audio_path = None
         actual_path = None
@@ -15784,6 +16308,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
                 await adapter.play_in_voice_channel(guild_id, actual_path)
+            elif (
+                event.source.platform == Platform.DISCORD
+                and bool(getattr(event.raw_message, "codex_realtime_voice", False))
+            ):
+                logger.warning(
+                    "Suppressing Discord chat voice attachment fallback for a live VC reply"
+                )
+                return
             elif adapter and hasattr(adapter, "send_voice"):
                 reply_anchor = self._reply_anchor_for_event(event)
                 thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
