@@ -446,4 +446,3 @@ class TestStripAnthropicCacheControl:
         api_content = api_messages[0]["content"]
         if isinstance(api_content, list):
             assert all("cache_control" not in p for p in api_content)
-

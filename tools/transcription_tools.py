@@ -1354,7 +1354,9 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
 
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
-        client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=30, max_retries=0)
+        from agent.client_headers import get_model_custom_headers
+        client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=30, max_retries=0,
+                         default_headers=get_model_custom_headers())
         try:
             create_kwargs = {
                 "model": model_name,
@@ -1434,7 +1436,9 @@ def _transcribe_openai(
 
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
-        client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
+        from agent.client_headers import get_model_custom_headers
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0,
+                         default_headers=get_model_custom_headers())
         try:
             with open(file_path, "rb") as audio_file:
                 create_kwargs = {
