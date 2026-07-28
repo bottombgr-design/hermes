@@ -83,6 +83,10 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # wall deadlines plus readiness; other platforms retain the 30s isolation bound.
 _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+# Maximum time a platform can stay in the reconnect queue before the gateway
+# exits to let launchd/systemd perform a clean restart.  Default 30 minutes.
+# Override with HERMES_GATEWAY_MAX_RECONNECT_AGE_SECS env var.
+_MAX_RECONNECT_AGE_SECS_DEFAULT = 1800.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -4125,6 +4129,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT
         return _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT
 
+    def _max_reconnect_age_secs(self) -> float:
+        """Maximum time a platform can stay in the reconnect queue before
+        the gateway exits to let launchd/systemd perform a clean restart."""
+        raw = os.getenv("HERMES_GATEWAY_MAX_RECONNECT_AGE_SECS", "").strip()
+        if raw:
+            try:
+                timeout = float(raw)
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid HERMES_GATEWAY_MAX_RECONNECT_AGE_SECS=%r",
+                    raw,
+                )
+            else:
+                return max(0.0, timeout)
+        return _MAX_RECONNECT_AGE_SECS_DEFAULT
+
     async def _connect_adapter_with_timeout(
         self, adapter, platform, *, is_reconnect: bool = False
     ) -> bool:
@@ -4812,20 +4832,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             error_message=adapter.fatal_error_message,
         )
 
-        if existing is adapter:
-            # Claim this adapter for teardown before awaiting disconnect() —
-            # a second fatal-error notification for the same adapter (e.g.
-            # from a concurrent recovery path) would otherwise still see
-            # itself as "existing" during the await below and disconnect()
-            # the same object twice.
-            self.adapters.pop(adapter.platform, None)
-            self.delivery_router.adapters = self.adapters
-            # A half-closed transport can wedge an adapter's native close()
-            # indefinitely. Reuse the shutdown-path timeout so this runtime
-            # fatal handler always reaches the reconnect queue.
-            await self._safe_adapter_disconnect(adapter, adapter.platform)
-
-        # Queue retryable failures for background reconnection
+        # Queue retryable failures for background reconnection BEFORE
+        # awaiting disconnect().  A half-closed transport can wedge an
+        # adapter's native close() indefinitely.  If disconnect() hangs or
+        # is cancelled while awaiting, the platform must already be in the
+        # retry queue so the reconnect watcher can pick it up.
         if adapter.fatal_error_retryable:
             platform_config = self.config.platforms.get(adapter.platform)
             if platform_config and adapter.platform not in self._failed_platforms:
@@ -4833,6 +4844,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "config": platform_config,
                     "attempts": 0,
                     "next_retry": time.monotonic(),
+                    "queued_at": time.monotonic(),
                 }
                 logger.info(
                     "%s queued for background reconnection",
@@ -4842,6 +4854,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # exhausting its restart budget), respawn it so queued platforms
                 # are not permanently stranded (#70344).
                 self._ensure_reconnect_watcher_running()
+
+        if existing is adapter:
+            self.adapters.pop(adapter.platform, None)
+            self.delivery_router.adapters = self.adapters
+            await self._safe_adapter_disconnect(adapter, adapter.platform)
 
         if not self.adapters and not self._failed_platforms:
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
@@ -8421,6 +8438,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "config": platform_config,
                                 "attempts": 1,
                                 "next_retry": time.monotonic() + 30,
+                                "queued_at": time.monotonic(),
                             }
                     else:
                         self._update_platform_runtime_status(
@@ -8437,6 +8455,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "config": platform_config,
                             "attempts": 1,
                             "next_retry": time.monotonic() + 30,
+                            "queued_at": time.monotonic(),
                         }
             except Exception as e:
                 logger.error("✗ %s error: %s", platform.value, e)
@@ -8456,6 +8475,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "config": platform_config,
                     "attempts": 1,
                     "next_retry": time.monotonic() + 30,
+                    "queued_at": time.monotonic(),
                 }
             if await self._abort_startup_if_shutdown_requested():
                 return True
@@ -9401,6 +9421,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 if now < info["next_retry"]:
                     continue  # not time yet
+
+                # Circuit breaker: if a platform has been in the reconnect
+                # queue for longer than the max age without recovering, exit
+                # so launchd/systemd can perform a clean restart.  A hung
+                # adapter, proxy pool exhaustion, or event-loop stall can
+                # prevent the watcher from ever reconnecting; a fresh process
+                # is the only reliable recovery (#48495, #31599).
+                queued_at = info.get("queued_at")
+                if queued_at is not None:
+                    age = now - queued_at
+                    max_age = self._max_reconnect_age_secs()
+                    if age > max_age:
+                        logger.error(
+                            "Reconnect %s: platform has been queued for "
+                            "%.0fs (max %.0fs) without recovering — "
+                            "exiting to trigger service restart",
+                            platform.value, age, max_age,
+                        )
+                        self._exit_reason = (
+                            "Platform %s stuck in reconnect queue for "
+                            "%.0fs without recovery" % (platform.value, age)
+                        )
+                        self._exit_with_failure = True
+                        await self.stop()
+                        return
 
                 platform_config = info["config"]
                 attempt = info["attempts"] + 1
