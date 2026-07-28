@@ -1787,6 +1787,7 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
                         "setup) — your message will be sent as soon as it's "
                         "ready."
                     ),
+                    "text_key": "notification.agentStartingSlow",
                     "level": "info",
                     "kind": "agent",
                     "ttl_ms": None,
@@ -2852,6 +2853,22 @@ def resolve_skin() -> dict:
         }
     except Exception:
         return {}
+
+
+def resolve_language() -> str:
+    """Resolve the gateway-ready language through the shared Python contract.
+
+    ``agent.i18n.get_language()`` owns environment precedence, normalization,
+    and the process-stable Python presentation boundary. Ink owns subsequent
+    live config refreshes, so changing Dashboard/TUI language does not
+    incidentally alter classic CLI or messaging-platform presentation.
+    """
+    try:
+        from agent.i18n import get_language
+
+        return get_language()
+    except Exception:
+        return "en"
 
 
 # Signature of the last skin broadcast: (name, active user-file mtime). Lets the
@@ -6659,7 +6676,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             _emit(
                 "status.update",
                 sid,
-                {"kind": "process", "text": "Resuming interrupted turn…"},
+                {
+                    "kind": "process",
+                    "text": "Resuming interrupted turn…",
+                    "text_key": "status.resumingInterruptedTurn",
+                },
             )
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue")
@@ -10078,7 +10099,27 @@ def _(rid, params: dict) -> dict:
             f"Agent Running: {'Yes' if session.get('running') else 'No'}",
         ]
     )
-    return _ok(rid, {"output": "\n".join(lines)})
+    return _ok(
+        rid,
+        {
+            # Keep the legacy English projection for older clients. The Ink
+            # presentation consumes ``details`` so locale packs own labels and
+            # grammar without teaching the gateway about frontend catalogs.
+            "output": "\n".join(lines),
+            "details": {
+                "session_id": str(key),
+                "path": display_hermes_home(),
+                "project": project["name"] if project else "",
+                "title": title,
+                "model": str(model),
+                "provider": str(provider),
+                "created": created.strftime("%Y-%m-%d %H:%M"),
+                "last_activity": updated.strftime("%Y-%m-%d %H:%M"),
+                "tokens": int(usage.get("total") or 0),
+                "agent_running": bool(session.get("running")),
+            },
+        },
+    )
 
 
 @method("session.history")
@@ -15210,16 +15251,45 @@ _TUI_HIDDEN: frozenset[str] = frozenset(
     }
 )
 
-_TUI_EXTRA: list[tuple[str, str, str]] = [
-    ("/density", "Toggle compact display mode", "TUI"),
-    ("/logs", "Show recent gateway log lines", "TUI"),
-    (
-        "/mouse",
-        "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]",
-        "TUI",
-    ),
-    ("/sessions", "Switch between live TUI sessions", "TUI"),
+_TUI_EXTRA_META: dict[str, str] = {
+    "/density": "Toggle compact display mode",
+    "/details": "Control agent detail visibility",
+    "/logs": "Show recent gateway log lines",
+    "/mouse": "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]",
+    "/sessions": "Switch between live TUI sessions",
+}
+
+_TUI_EXTRA: list[tuple[str, str]] = [
+    ("/density", "TUI"),
+    ("/logs", "TUI"),
+    ("/mouse", "TUI"),
+    ("/sessions", "TUI"),
 ]
+
+_TUI_COMPLETION_EXTRA: tuple[str, ...] = (
+    "/density",
+    "/details",
+    "/logs",
+    "/mouse",
+)
+
+
+def _tui_extra_meta(command: str) -> str:
+    """Return the canonical English fallback for a TUI-only command."""
+    return _TUI_EXTRA_META[command]
+
+
+def _command_category_key(category: str) -> str:
+    """Stable presentation id; clients localize it in their own framework."""
+    return {
+        "Session": "session",
+        "Configuration": "configuration",
+        "Tools & Skills": "tools",
+        "Info": "info",
+        "Exit": "exit",
+        "TUI": "tui",
+        "User commands": "userCommands",
+    }.get(category, "")
 
 # Commands that queue messages onto _pending_input in the CLI.
 # In the TUI the slash worker subprocess has no reader for that queue,
@@ -15258,6 +15328,7 @@ def _(rid, params: dict) -> dict:
 
         all_pairs: list[list[str]] = []
         canon: dict[str, str] = {}
+        description_keys: dict[str, str] = {}
         categories: list[dict] = []
         cat_map: dict[str, list[list[str]]] = {}
         cat_order: list[str] = []
@@ -15273,6 +15344,7 @@ def _(rid, params: dict) -> dict:
 
             desc = _build_description(cmd)
             all_pairs.append([c, desc])
+            description_keys[c] = cmd.name
 
             cat = cmd.category
             if cat not in cat_map:
@@ -15280,7 +15352,8 @@ def _(rid, params: dict) -> dict:
                 cat_order.append(cat)
             cat_map[cat].append([c, desc])
 
-        for name, desc, cat in _TUI_EXTRA:
+        for name, cat in _TUI_EXTRA:
+            desc = _tui_extra_meta(name)
             # Dedup guard: skip TUI extras that collide with a registry
             # command or one of its aliases (e.g. the historical /compact
             # collision, #57133, or /sessions which the registry also
@@ -15289,6 +15362,7 @@ def _(rid, params: dict) -> dict:
                 continue
             canon[name.lower()] = name
             all_pairs.append([name, desc])
+            description_keys[name] = name.lstrip("/")
             if cat not in cat_map:
                 cat_map[cat] = []
                 cat_order.append(cat)
@@ -15334,7 +15408,13 @@ def _(rid, params: dict) -> dict:
             warning = f"skill discovery unavailable: {e}"
 
         for cat in cat_order:
-            categories.append({"name": cat, "pairs": cat_map[cat]})
+            categories.append(
+                {
+                    "name": cat,
+                    "key": _command_category_key(cat),
+                    "pairs": cat_map[cat],
+                }
+            )
 
         sub = {k: v[:] for k, v in SUBCOMMANDS.items()}
         return _ok(
@@ -15344,6 +15424,7 @@ def _(rid, params: dict) -> dict:
                 "sub": sub,
                 "canon": canon,
                 "categories": categories,
+                "description_keys": description_keys,
                 "skill_count": skill_count,
                 "warning": warning,
             },
@@ -16322,12 +16403,12 @@ def _(rid, params: dict) -> dict:
 
         if is_context and not query:
             items = [
-                {"text": "@diff", "display": "@diff", "meta": "git diff"},
-                {"text": "@staged", "display": "@staged", "meta": "staged diff"},
-                {"text": "@file:", "display": "@file:", "meta": "attach file"},
-                {"text": "@folder:", "display": "@folder:", "meta": "attach folder"},
-                {"text": "@url:", "display": "@url:", "meta": "fetch url"},
-                {"text": "@git:", "display": "@git:", "meta": "git log"},
+                {"text": "@diff", "display": "@diff", "meta": "git diff", "meta_key": "completion.gitDiff"},
+                {"text": "@staged", "display": "@staged", "meta": "staged diff", "meta_key": "completion.stagedDiff"},
+                {"text": "@file:", "display": "@file:", "meta": "attach file", "meta_key": "completion.attachFile"},
+                {"text": "@folder:", "display": "@folder:", "meta": "attach folder", "meta_key": "completion.attachFolder"},
+                {"text": "@url:", "display": "@url:", "meta": "fetch url", "meta_key": "completion.fetchUrl"},
+                {"text": "@git:", "display": "@git:", "meta": "git log", "meta_key": "completion.gitLog"},
             ]
             return _ok(rid, {"items": items})
 
@@ -16475,6 +16556,7 @@ def _(rid, params: dict) -> dict:
                     "text": text,
                     "display": entry + suffix,
                     "meta": "dir" if is_dir else "",
+                    **({"meta_key": "completion.directory"} if is_dir else {}),
                 }
             )
             if len(items) >= 30:
@@ -16485,16 +16567,27 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"items": items})
 
 
-def _details_completion_item(value: str, meta: str = "") -> dict:
-    return {"text": value, "display": value, "meta": meta}
+def _details_completion_item(
+    value: str,
+    meta: str = "",
+    meta_key: str | None = None,
+    meta_vars: dict | None = None,
+) -> dict:
+    item = {"text": value, "display": value, "meta": meta}
+    if meta_key:
+        item["meta_key"] = meta_key
+    if meta_vars:
+        item["meta_vars"] = meta_vars
+    return item
 
 
 def _details_root_completion_item(
-    value: str, meta: str, needs_leading_space: bool
+    value: str, meta: str, needs_leading_space: bool, meta_key: str
 ) -> dict:
     return _details_completion_item(
         f" {value}" if needs_leading_space else value,
         meta,
+        meta_key,
     )
 
 
@@ -16518,16 +16611,16 @@ def _details_completions(text: str) -> list[dict] | None:
         return [
             *[
                 _details_root_completion_item(
-                    mode, "global mode", not has_trailing_space
+                    mode, "global mode", not has_trailing_space, "completion.globalMode"
                 )
                 for mode in modes
             ],
             _details_root_completion_item(
-                "cycle", "cycle global mode", not has_trailing_space
+                "cycle", "cycle global mode", not has_trailing_space, "completion.cycleGlobalMode"
             ),
             *[
                 _details_root_completion_item(
-                    section, "section override", not has_trailing_space
+                    section, "section override", not has_trailing_space, "completion.sectionOverride"
                 )
                 for section in sections
             ],
@@ -16544,6 +16637,11 @@ def _details_completions(text: str) -> list[dict] | None:
                     if candidate in sections
                     else "cycle global mode" if candidate == "cycle" else "global mode"
                 ),
+                (
+                    "completion.sectionOverride"
+                    if candidate in sections
+                    else "completion.cycleGlobalMode" if candidate == "cycle" else "completion.globalMode"
+                ),
             )
             for candidate in candidates
             if candidate.startswith(prefix) and candidate != prefix
@@ -16552,10 +16650,20 @@ def _details_completions(text: str) -> list[dict] | None:
     if len(parts) == 1 and has_trailing_space and parts[0].lower() in sections:
         return [
             *[
-                _details_completion_item(mode, f"set {parts[0].lower()}")
+                _details_completion_item(
+                    mode,
+                    f"set {parts[0].lower()}",
+                    "completion.setSection",
+                    {"section": parts[0].lower()},
+                )
                 for mode in modes
             ],
-            _details_completion_item("reset", f"clear {parts[0].lower()} override"),
+            _details_completion_item(
+                "reset",
+                f"clear {parts[0].lower()} override",
+                "completion.clearSectionOverride",
+                {"section": parts[0].lower()},
+            ),
         ]
 
     if len(parts) == 2 and not has_trailing_space and parts[0].lower() in sections:
@@ -16568,6 +16676,12 @@ def _details_completions(text: str) -> list[dict] | None:
                     if candidate == "reset"
                     else f"set {parts[0].lower()}"
                 ),
+                (
+                    "completion.clearSectionOverride"
+                    if candidate == "reset"
+                    else "completion.setSection"
+                ),
+                {"section": parts[0].lower()},
             )
             for candidate in (*modes, "reset")
             if candidate.startswith(prefix) and candidate != prefix
@@ -16583,7 +16697,7 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"items": []})
 
     try:
-        from hermes_cli.commands import SlashCommandCompleter
+        from hermes_cli.commands import COMMAND_REGISTRY, SlashCommandCompleter
         from prompt_toolkit.document import Document
         from prompt_toolkit.formatted_text import to_plain_text
 
@@ -16595,58 +16709,64 @@ def _(rid, params: dict) -> dict:
             skill_bundles_provider=lambda: get_skill_bundles(),
         )
         doc = Document(text, len(text))
-        # Skill commands and bundles are the only completions offered for an
-        # inline `/skill` reference typed mid-message, so the class has to
-        # reach the TUI as data. Derived from the same providers the completer
-        # uses — no sniffing the ⚡/▣ meta glyphs, which are display text.
+        command_keys: dict[str, str] = {}
+        for command in COMMAND_REGISTRY:
+            command_keys[f"/{command.name}"] = command.name
+            for alias in command.aliases:
+                command_keys[f"/{alias}"] = command.name
+
+        # Inline slash references may offer skills only. Keep that distinction
+        # as protocol data instead of inferring it from localized display text.
         skill_names = {
             key.lstrip("/").lower()
             for key in (*get_skill_commands(), *get_skill_bundles())
         }
-        items = [
-            {
-                "text": c.text,
+        items = []
+        for completion in completer.get_completions(doc, None):
+            item = {
+                "text": completion.text,
                 # prompt_toolkit gives us FormattedText (a list of (style,
                 # text) tuples) for display/display_meta. Serialize both as
                 # plain strings — the TUI's CompletionItem.display contract
                 # is a string, and sending the raw list trips Ink's row
                 # layout into 1-char truncation of the next column.
-                "display": to_plain_text(c.display) if c.display else c.text,
-                "meta": to_plain_text(c.display_meta) if c.display_meta else "",
+                "display": (
+                    to_plain_text(completion.display)
+                    if completion.display
+                    else completion.text
+                ),
+                "meta": (
+                    to_plain_text(completion.display_meta)
+                    if completion.display_meta
+                    else ""
+                ),
                 "kind": (
                     "skill"
-                    if c.text.strip().lstrip("/").lower() in skill_names
+                    if completion.text.strip().lstrip("/").lower() in skill_names
                     else "command"
                 ),
             }
-            for c in completer.get_completions(doc, None)
-        ][:30]
+            completion_token = (
+                completion.text
+                if completion.text.startswith("/")
+                else f"/{completion.text}"
+            )
+            command_key = command_keys.get(completion_token)
+            if command_key:
+                item["meta_key"] = command_key
+            items.append(item)
+            if len(items) >= 30:
+                break
         text_lower = text.lower()
         extras = [
             {
-                "text": "/density",
-                "display": "/density",
-                "meta": "Toggle compact display mode",
+                "text": command,
+                "display": command,
+                "meta": _tui_extra_meta(command),
+                "meta_key": command.lstrip("/"),
                 "kind": "command",
-            },
-            {
-                "text": "/details",
-                "display": "/details",
-                "meta": "Control agent detail visibility",
-                "kind": "command",
-            },
-            {
-                "text": "/logs",
-                "display": "/logs",
-                "meta": "Show recent gateway log lines",
-                "kind": "command",
-            },
-            {
-                "text": "/mouse",
-                "display": "/mouse",
-                "meta": "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]",
-                "kind": "command",
-            },
+            }
+            for command in _TUI_COMPLETION_EXTRA
         ]
         for extra in extras:
             if extra["text"].startswith(text_lower) and not any(
