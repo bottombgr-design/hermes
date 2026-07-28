@@ -23,61 +23,64 @@ Proactive problem detection and multi-agent swarm orchestration system with Rail
 - Multi-agent task orchestration with concurrent agents
 - Deploying a futuristic 3D dashboard to Railway or similar cloud platforms
 
-## Environment Configuration
+## Configuration
 
-Add these lines to your `.env` file (or set them in Railway):
+### Behavioral Settings (`~/.hermes/config.yaml`)
+
+Per Hermes project policy, non-secret behavioral configuration belongs in `~/.hermes/config.yaml` under the `kairos:` key:
+
+```yaml
+kairos:
+  enabled: true
+  scan_interval_minutes: 15
+  max_proactive_fixes: 3
+  require_approval: true
+  scan_paths:
+    - "."
+    - "core"
+    - "kairos"
+    - "agents"
+  max_concurrent_agents: 4
+```
+
+### Credentials (`~/.hermes/.env` or `.env`)
+
+Reserve environment variables strictly for secret credentials (such as API keys):
 
 ```bash
-# ============================================================
-# KAIROS DAEMON (Proactive Problem Detection)
-# ============================================================
-KAIROS_ENABLED=true
-KAIROS_SCAN_INTERVAL_MINUTES=15
-KAIROS_MAX_PROACTIVE_FIXES=3
-KAIROS_REQUIRE_APPROVAL=true
-KAIROS_SCAN_PATHS=.,core,kairos,agents
+# Dashboard / Kairos API Key (Required for task submission endpoints on public deployments)
+KAIROS_API_KEY=your_secret_api_key_here
 
-# ============================================================
-# RAILWAY / CLOUD DEPLOYMENT NOTES
-# ============================================================
-# Do not use Windows absolute paths like C:\Users\... or D:\hermes\... in this file.
-# For Railway, use relative paths or platform-neutral paths such as:
+# OpenRouter / Provider API Keys
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+```
+
+### Cloud / Railway Deployment Settings
+
+For Railway deployment, specify platform-neutral or relative paths in your environment settings:
+
+```bash
 SQLITE_DB_PATH=kairos/memory.db
 CHROMA_DB_PATH=kairos/chroma_db
-CHROMA_COLLECTION=kairos_knowledge
 LOG_FILE=logs/kairos.log
-PIP_CACHE_DIR=/tmp/pip_cache
-TMPDIR=/tmp
-TMP=/tmp
-
-# Backend Server Configuration
 API_HOST=0.0.0.0
 API_PORT=8001
-API_RELOAD=true
-
 LOG_LEVEL=INFO
 ```
 
-## Deployment to Railway
-
-1. Install the skill: `hermes skills install optional/autonomous-ai-agents/kairos-swarm`
-2. Fork the repository to your GitHub account
-3. Create a new Railway project from your fork
-4. Set the environment variables above in Railway's dashboard
-5. Railway auto-detects the Procfile and deploys
-
 ## Quick Reference
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `KAIROS_ENABLED` | `true` | Enable proactive problem detection |
-| `KAIROS_SCAN_INTERVAL_MINUTES` | `15` | Minutes between scans |
-| `KAIROS_MAX_PROACTIVE_FIXES` | `3` | Max fixes without user approval |
-| `MAX_CONCURRENT_AGENTS` | `4` | Maximum parallel agents |
+| Setting | Location | Default | Description |
+|---------|----------|---------|-------------|
+| `kairos.enabled` | `config.yaml` | `true` | Enable proactive problem detection |
+| `kairos.scan_interval_minutes` | `config.yaml` | `15` | Minutes between scans |
+| `kairos.max_proactive_fixes` | `config.yaml` | `3` | Max fixes without user approval |
+| `kairos.max_concurrent_agents` | `config.yaml` | `4` | Maximum parallel agents |
+| `KAIROS_API_KEY` | `.env` | `""` | Auth key for dashboard task trigger endpoints |
 
 ## Procedure
 
 1. Install the skill: `hermes skills install optional/autonomous-ai-agents/kairos-swarm`
-2. Enter the skill directory: `cd skills/optional/autonomous-ai-agents/kairos-swarm`
+2. Enter the skill directory: `cd optional-skills/autonomous-ai-agents/kairos-swarm`
 3. Run the dashboard: `uvicorn backend.dashboard_api:app --reload --port 8001`
-4. Open `http://localhost:3000` in your browser
+4. Open `http://localhost:8001` in your browser
