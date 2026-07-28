@@ -79,6 +79,16 @@ class TestBuiltinSkins:
         assert skin.name == "slate"
         assert skin.get_color("banner_title") == "#7eb8f6"
 
+    def test_hades_skin_loads(self):
+        from hermes_cli.skin_engine import load_skin
+
+        skin = load_skin("hades")
+        assert skin.name == "hades"
+        assert skin.get_color("banner_title") == "#7EB8F6"
+        assert skin.get_color("status_bar_bg") == "#0F172A"
+        assert skin.get_branding("agent_name") == "Hades Agent"
+        assert skin.get_spinner_wings()
+
     def test_daylight_skin_loads(self):
         from hermes_cli.skin_engine import load_skin
 
@@ -149,6 +159,7 @@ class TestSkinManagement:
         assert "ares" in names
         assert "mono" in names
         assert "slate" in names
+        assert "hades" in names
         assert "daylight" in names
         assert "warm-lightmode" in names
         for s in skins:
