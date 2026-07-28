@@ -22,7 +22,7 @@ DEFAULT_CONFIG = {
         "cua_fleet": {
             "base_url": "https://run.cua.ai",
             "token_url": "https://auth.cua.ai/realms/cyclops-cs/protocol/openid-connect/token",
-            "pool_prefix": "hermes",
+            "pool": "hermes-desktop",
             "image_pull_secret": "ecr-credentials",
             "ready_timeout": 600,
         },
