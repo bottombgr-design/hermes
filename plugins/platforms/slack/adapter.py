@@ -1081,6 +1081,16 @@ class SlackAdapter(BasePlatformAdapter):
             fraction_int = 0
         return seconds_int, fraction_int, str(ts)
 
+    @staticmethod
+    def _is_valid_slack_timestamp(ts: Any) -> bool:
+        """Return whether *ts* has Slack's numeric seconds[.fraction] shape."""
+        if not isinstance(ts, str):
+            return False
+        seconds, separator, fraction = ts.partition(".")
+        if not seconds.isdigit():
+            return False
+        return not separator or bool(fraction) and fraction.isdigit()
+
     @classmethod
     def _discard_oldest_slack_timestamps(
         cls, timestamps: set[str], count: int
@@ -5253,6 +5263,45 @@ class SlackAdapter(BasePlatformAdapter):
             if not isinstance(updated_message, dict):
                 return
 
+            previous_message = event.get("previous_message")
+            visible_payload_changed = None
+            if isinstance(previous_message, dict):
+                visible_fields = ("text", "blocks", "attachments", "files")
+                has_previous_typed_field = False
+                has_unknown_field = False
+                comparable_fields = []
+                for field in visible_fields:
+                    expected_type = str if field == "text" else list
+                    previous_value = previous_message.get(field)
+                    current_value = updated_message.get(field)
+                    previous_valid = isinstance(previous_value, expected_type)
+                    current_valid = isinstance(current_value, expected_type)
+                    has_previous_typed_field |= previous_valid
+                    if previous_valid and current_valid:
+                        comparable_fields.append(field)
+                        continue
+
+                    previous_empty = previous_value is None or previous_value in ("", [])
+                    current_empty = current_value is None or current_value in ("", [])
+                    if not (previous_empty and current_empty):
+                        has_unknown_field = True
+
+                if has_previous_typed_field:
+                    if any(
+                        updated_message[field] != previous_message[field]
+                        for field in comparable_fields
+                    ):
+                        visible_payload_changed = True
+                    elif not has_unknown_field:
+                        visible_payload_changed = False
+                if visible_payload_changed is False:
+                    logger.debug(
+                        "[Slack] Ignoring message_changed thread metadata update "
+                        "for message %s",
+                        updated_message.get("ts", ""),
+                    )
+                    return
+
             original_message_ts = str(updated_message.get("ts") or "")
             if (
                 original_message_ts
@@ -5260,11 +5309,76 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 return
             edited = updated_message.get("edited")
-            edited_ts = ""
-            if isinstance(edited, dict):
-                edited_ts = str(edited.get("ts") or "")
+            edited_ts = edited.get("ts") if isinstance(edited, dict) else None
             outer_event_ts = str(event.get("ts") or "")
-            changed_event_ts = str(event.get("event_ts") or edited_ts or "")
+            previous_latest_reply = (
+                previous_message.get("latest_reply")
+                if isinstance(previous_message, dict)
+                else None
+            )
+            updated_latest_reply = updated_message.get("latest_reply")
+            latest_reply_ts = (
+                updated_latest_reply
+                if updated_latest_reply not in (None, "")
+                else previous_latest_reply
+            )
+            reply_metadata_fields = (
+                "latest_reply",
+                "reply_count",
+                "reply_users_count",
+                "reply_users",
+                "replies",
+            )
+            has_reply_metadata = any(
+                field in updated_message for field in reply_metadata_fields
+            ) or (
+                isinstance(previous_message, dict)
+                and any(field in previous_message for field in reply_metadata_fields)
+            )
+            missing_reply_field = object()
+            reply_metadata_changed = bool(
+                isinstance(previous_message, dict)
+                and any(
+                    updated_message.get(field, missing_reply_field)
+                    != previous_message.get(field, missing_reply_field)
+                    for field in reply_metadata_fields
+                )
+            )
+            if reply_metadata_changed and visible_payload_changed is not True:
+                logger.debug(
+                    "[Slack] Ignoring thread parent reply metadata transition "
+                    "for message %s",
+                    original_message_ts,
+                )
+                return
+
+            latest_reply_valid = self._is_valid_slack_timestamp(latest_reply_ts)
+            edited_ts_valid = self._is_valid_slack_timestamp(edited_ts)
+            latest_reply_after_edit = bool(
+                latest_reply_valid
+                and edited_ts_valid
+                and self._slack_timestamp_sort_key(latest_reply_ts)
+                > self._slack_timestamp_sort_key(edited_ts)
+            )
+            ambiguous_reply_order = bool(
+                has_reply_metadata
+                and not (latest_reply_valid and edited_ts_valid)
+                and visible_payload_changed is not True
+            )
+            if visible_payload_changed is not True and has_reply_metadata and (
+                latest_reply_after_edit or ambiguous_reply_order
+            ):
+                logger.debug(
+                    "[Slack] Ignoring thread parent reply metadata update "
+                    "for message %s: edited_ts=%s latest_reply=%s",
+                    original_message_ts,
+                    edited_ts,
+                    latest_reply_ts,
+                )
+                return
+            changed_event_ts = str(
+                event.get("event_ts") or (edited_ts if edited_ts_valid else "") or ""
+            )
             if (
                 not changed_event_ts
                 and outer_event_ts
