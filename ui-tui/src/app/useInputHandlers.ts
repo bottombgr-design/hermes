@@ -14,6 +14,7 @@ import type {
 } from '../gatewayTypes.js'
 import { isAction, isCopyShortcut, isMac, isVoiceToggleKey } from '../lib/platform.js'
 import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionWheel.js'
+import { RpcMethodUnavailableError } from '../lib/rpc.js'
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
 import { closeWidget, dispatchWidgetInput } from '../sdk/host.js'
 
@@ -121,15 +122,21 @@ export function dismissSensitivePrompt(
     patchOverlayState({ sudo: null })
     sys('sudo cancelled')
 
-    return rpc<SudoRespondResponse>('sudo.cancel', { request_id: requestId }).then(result => {
-      if (result || !sessionId) {
-        return result
+    return rpc<SudoRespondResponse>(
+      'sudo.cancel',
+      { request_id: requestId },
+      { rethrowMethodUnavailable: true }
+    ).catch(error => {
+      if (!(error instanceof RpcMethodUnavailableError)) {
+        throw error
       }
 
-      // A null result means the probe failed (notably, an older backend has no
-      // sudo.cancel method). Interrupt the owning turn instead of sending a
-      // null/empty password that legacy code can treat as submission.
-      return rpc<SudoRespondResponse>('session.interrupt', { session_id: sessionId })
+      // Older backends have no sudo.cancel method. Interrupt the owning turn
+      // instead of sending a null/empty password that legacy code can treat as
+      // submission. Other RPC failures must not escalate cancellation intent.
+      return sessionId
+        ? rpc<SudoRespondResponse>('session.interrupt', { session_id: sessionId })
+        : null
     })
   }
 

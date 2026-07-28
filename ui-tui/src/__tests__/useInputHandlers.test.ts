@@ -9,6 +9,7 @@ import {
   shouldFallThroughForScroll,
   sudoSubmissionParams
 } from '../app/useInputHandlers.js'
+import { RpcMethodUnavailableError } from '../lib/rpc.js'
 
 const baseKey = {
   downArrow: false,
@@ -135,7 +136,11 @@ describe('dismissSensitivePrompt', () => {
 
     expect(getOverlayState().sudo).toBeNull()
     expect(sys).toHaveBeenCalledWith('sudo cancelled')
-    expect(rpc).toHaveBeenCalledWith('sudo.cancel', { request_id: 'sudo-1' })
+    expect(rpc).toHaveBeenCalledWith(
+      'sudo.cancel',
+      { request_id: 'sudo-1' },
+      { rethrowMethodUnavailable: true }
+    )
     await pending
     expect(rpc).toHaveBeenCalledTimes(1)
   })
@@ -143,13 +148,39 @@ describe('dismissSensitivePrompt', () => {
   it('interrupts the owning session when the sudo.cancel probe fails', async () => {
     resetOverlayState()
     patchOverlayState({ sudo: { requestId: 'sudo-1' } })
-    const rpc = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ status: 'interrupted' })
+
+    const rpc = vi
+      .fn()
+      .mockRejectedValueOnce(new RpcMethodUnavailableError('unknown method: sudo.cancel'))
+      .mockResolvedValueOnce({ status: 'interrupted' })
+
     const sys = vi.fn()
 
     await dismissSensitivePrompt(getOverlayState(), rpc, sys, 's1')
 
-    expect(rpc).toHaveBeenNthCalledWith(1, 'sudo.cancel', { request_id: 'sudo-1' })
+    expect(rpc).toHaveBeenNthCalledWith(
+      1,
+      'sudo.cancel',
+      { request_id: 'sudo-1' },
+      { rethrowMethodUnavailable: true }
+    )
     expect(rpc).toHaveBeenNthCalledWith(2, 'session.interrupt', { session_id: 's1' })
+  })
+
+  it('does not interrupt the owning session when sudo.cancel fails transiently', async () => {
+    resetOverlayState()
+    patchOverlayState({ sudo: { requestId: 'sudo-1' } })
+    const rpc = vi.fn().mockResolvedValue(null)
+    const sys = vi.fn()
+
+    await dismissSensitivePrompt(getOverlayState(), rpc, sys, 's1')
+
+    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledWith(
+      'sudo.cancel',
+      { request_id: 'sudo-1' },
+      { rethrowMethodUnavailable: true }
+    )
   })
 
   it('clears a secret overlay before a stale cancel RPC resolves', async () => {
