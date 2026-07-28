@@ -33,6 +33,7 @@ import {
 } from '@/store/session'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
+import { setSessionDraftingTool } from '@/store/tool-drafting'
 
 import type {
   ClientSessionState,
@@ -519,7 +520,9 @@ export function usePromptActions({
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
-        await executeSlashCommand(visibleText)
+        // Forward the explicit target (background queue drain, tile) — dropping
+        // it ran the command against whatever chat happened to be in front.
+        await executeSlashCommand(visibleText, options?.sessionId ? { sessionId: options.sessionId } : undefined)
 
         return true
       }
@@ -590,6 +593,7 @@ export function usePromptActions({
     clearSessionTodos(sessionId)
     clearSessionSubagents(sessionId)
     resetSessionBackground(sessionId)
+    setSessionDraftingTool(sessionId, '')
     // Stop ends the turn, so the gateway is no longer blocked on any prompt it
     // raised. Drop this session's pending clarify / approval / sudo / secret so
     // a dead panel (and the sidebar "needs input" dot) can't linger and accept
