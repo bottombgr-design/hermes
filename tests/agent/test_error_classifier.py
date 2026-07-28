@@ -248,6 +248,22 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.auth
         assert result.should_fallback is True
 
+    def test_opencode_go_html_403_is_transient_edge_failure(self):
+        e = MockAPIError(
+            "<html><head><title>Forbidden</title></head></html>",
+            status_code=403,
+        )
+        result = classify_api_error(e, provider="opencode-go")
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+        assert result.should_rotate_credential is False
+
+    def test_opencode_go_plain_403_remains_auth(self):
+        e = MockAPIError("Forbidden", status_code=403)
+        result = classify_api_error(e, provider="opencode-go")
+        assert result.reason == FailoverReason.auth
+        assert result.retryable is False
+
     def test_403_key_limit_classified_as_billing(self):
         """OpenRouter 403 'key limit exceeded' is billing, not auth."""
         e = MockAPIError("Key limit exceeded for this key", status_code=403)
@@ -2254,8 +2270,6 @@ class Test408RequestTimeout:
         assert result.retryable is False
         assert result.should_fallback is True
         assert result.should_compress is False
-
-
 # ── Test: throttle vs overflow disambiguation + new overflow shapes ─────
 # Port of anomalyco/opencode#37848 (expand context overflow patterns +
 # rate-limit exclusion guard).
@@ -2325,5 +2339,4 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="ollama", model="m")
         assert result.reason == FailoverReason.context_overflow
-
 
