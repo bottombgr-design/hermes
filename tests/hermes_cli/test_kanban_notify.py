@@ -26,6 +26,15 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+_INHERITED_DELIVERY_METADATA = {
+    "chat_type": "dm",
+    "direct_messages_topic_id": "20197",
+    "telegram_dm_topic_reply_fallback": True,
+    "telegram_reply_to_message_id": "462",
+    "thread_id": "20197",
+}
+
+
 def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert len(subs) == 1
     assert subs[0]["platform"] == "telegram"
@@ -33,6 +42,10 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["thread_id"] == "topic1"
     assert subs[0]["user_id"] == "user1"
     assert subs[0]["notifier_profile"] == "default"
+    # Inherited subscriptions must preserve routing metadata, not just the
+    # raw recipient identifiers (issue #73030).
+    assert subs[0]["chat_type"] == "dm"
+    assert subs[0]["delivery_metadata"] == _INHERITED_DELIVERY_METADATA
 
 
 def test_create_task_inherits_parent_notify_subscriptions(kanban_home):
@@ -44,9 +57,11 @@ def test_create_task_inherits_parent_notify_subscriptions(kanban_home):
             task_id=parent,
             platform="telegram",
             chat_id="chat1",
+            chat_type="dm",
             thread_id="topic1",
             user_id="user1",
             notifier_profile="default",
+            delivery_metadata=_INHERITED_DELIVERY_METADATA,
         )
 
         child = kb.create_task(conn, title="child", parents=[parent], assignee="worker1")
@@ -70,9 +85,11 @@ def test_link_tasks_inherits_parent_notify_subscriptions_without_replaying_old_c
             task_id=parent,
             platform="telegram",
             chat_id="chat1",
+            chat_type="dm",
             thread_id="topic1",
             user_id="user1",
             notifier_profile="default",
+            delivery_metadata=_INHERITED_DELIVERY_METADATA,
         )
 
         kb.link_tasks(conn, parent, child)
@@ -102,9 +119,11 @@ def test_decompose_triage_task_inherits_root_notify_subscriptions(kanban_home):
             task_id=root,
             platform="telegram",
             chat_id="chat1",
+            chat_type="dm",
             thread_id="topic1",
             user_id="user1",
             notifier_profile="default",
+            delivery_metadata=_INHERITED_DELIVERY_METADATA,
         )
 
         child_ids = kb.decompose_triage_task(
@@ -127,6 +146,37 @@ def test_decompose_triage_task_inherits_root_notify_subscriptions(kanban_home):
     assert len(child_subs) == 2
     for subs in child_subs:
         _assert_inherited_notify_sub(subs)
+
+
+def test_inherited_notify_sub_preserves_null_routing_fields(kanban_home):
+    """A parent subscription with no routing metadata must inherit cleanly.
+
+    Parent rows created before ``chat_type``/``delivery_metadata`` existed
+    (or via paths that never set them) carry NULL. The inheritance copy must
+    preserve that NULL rather than erroring or coercing a default. This is
+    the regression guard for the issue #73030 fix.
+    """
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="worker1")
+        kb.add_notify_sub(
+            conn,
+            task_id=parent,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="topic1",
+            user_id="user1",
+            notifier_profile="default",
+        )
+
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="worker1")
+        subs = kb.list_notify_subs(conn, child)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["chat_type"] is None
+    assert subs[0]["delivery_metadata"] in (None, {})
 
 
 @pytest.mark.asyncio
