@@ -97,6 +97,25 @@ export function getNested(obj: HermesConfigRecord, path: string): unknown {
   return cur
 }
 
+/**
+ * True when an edit clears the entire "Enabled Toolsets" list — i.e. the
+ * previous config had a non-empty toolsets array and the next one has an empty
+ * array (or no toolsets at all).
+ *
+ * Clearing every toolset silently disables memory, terminal, web search,
+ * delegation, and most tools, and config auto-saves with no undo, so callers
+ * use this to confirm the destructive transition before applying it. Any edit
+ * that keeps at least one toolset — or that never had one — returns false.
+ */
+export function clearsEnabledToolsets(prev: HermesConfigRecord, next: HermesConfigRecord): boolean {
+  const prevToolsets = getNested(prev, 'toolsets')
+  const nextToolsets = getNested(next, 'toolsets')
+  const hadToolsets = Array.isArray(prevToolsets) && prevToolsets.length > 0
+  const clearsToolsets = !Array.isArray(nextToolsets) || nextToolsets.length === 0
+
+  return hadToolsets && clearsToolsets
+}
+
 export function inferFieldSchema(value: unknown): ConfigFieldSchema {
   if (typeof value === 'boolean') {
     return { type: 'boolean' }
