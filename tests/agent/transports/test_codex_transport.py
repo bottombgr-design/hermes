@@ -645,12 +645,12 @@ class TestCodexBuildKwargs:
             for t in tools
         )
 
-    def test_non_xai_path_does_not_inject_native_web_search(self, transport):
-        """Native web_search injection is scoped to xAI — Codex/GitHub paths
-        keep the client-side web_search function untouched."""
+    def test_non_xai_non_gpt5_path_does_not_inject_native_web_search(self, transport):
+        """Native web_search injection is scoped to xAI and GPT-5+ — other
+        models keep the client-side web_search function untouched."""
         messages = [{"role": "user", "content": "Search."}]
         kw = transport.build_kwargs(
-            model="gpt-5.4", messages=messages,
+            model="gpt-4.1-mini", messages=messages,
             tools=[{"type": "function", "function": {
                 "name": "web_search", "description": "Search the web.",
                 "parameters": {"type": "object",
@@ -663,6 +663,105 @@ class TestCodexBuildKwargs:
             t.get("type") == "function" and t.get("name") == "web_search"
             for t in tools
         )
+
+    # -- GPT-5+ / Grok native web search injection --
+
+    @pytest.mark.parametrize("model", [
+        "gpt-5.4",
+        "gpt-5.6-luna",
+        "gpt-5-mini",
+        "gpt-6",
+        "gpt-7.1",
+        "openai/gpt-5.5",
+        "grok-4.5",
+        "grok-4",
+        "grok-5",
+        "xai/grok-4.5",
+    ])
+    def test_native_search_injection(self, transport, model):
+        """GPT-5+ / Grok on non-xAI Responses swaps client web_search for native."""
+        messages = [{"role": "user", "content": "Search."}]
+        kw = transport.build_kwargs(
+            model=model, messages=messages,
+            tools=[
+                {"type": "function", "function": {
+                    "name": "read_file", "description": "Read a file.",
+                    "parameters": {"type": "object",
+                                   "properties": {"path": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "web_search", "description": "Search the web.",
+                    "parameters": {"type": "object",
+                                   "properties": {"query": {"type": "string"}}}}},
+            ],
+            is_xai_responses=False,
+        )
+        tools = kw.get("tools", [])
+        # Native built-in present
+        assert any(t.get("type") == "web_search" for t in tools)
+        # Client-side function form removed
+        assert not any(
+            t.get("type") == "function" and t.get("name") == "web_search"
+            for t in tools
+        )
+        # Other tools preserved
+        names = [t.get("name") for t in tools if t.get("type") == "function"]
+        assert "read_file" in names
+
+    def test_native_search_no_inject_without_client_web_search(self, transport):
+        """No additive grant - only swaps when web_search was already present."""
+        messages = [{"role": "user", "content": "Read."}]
+        kw = transport.build_kwargs(
+            model="grok-4.5", messages=messages,
+            tools=[{"type": "function", "function": {
+                "name": "read_file", "description": "Read a file.",
+                "parameters": {"type": "object",
+                               "properties": {"path": {"type": "string"}}}}}],
+            is_xai_responses=False,
+        )
+        tools = kw.get("tools", [])
+        assert not any(t.get("type") == "web_search" for t in tools)
+        assert any(t.get("name") == "read_file" for t in tools)
+
+    @pytest.mark.parametrize("model", [
+        "gpt-4o",
+        "gpt-4.1-mini",
+        "claude-sonnet-4.6",
+        "gemini-3.6-flash",
+        "gpt-",
+    ])
+    def test_non_native_search_model_keeps_client_web_search(self, transport, model):
+        """Models below GPT-5 or non-GPT/Grok keep client web_search untouched."""
+        messages = [{"role": "user", "content": "Search."}]
+        kw = transport.build_kwargs(
+            model=model, messages=messages,
+            tools=[{"type": "function", "function": {
+                "name": "web_search", "description": "Search the web.",
+                "parameters": {"type": "object",
+                               "properties": {"query": {"type": "string"}}}}}],
+            is_xai_responses=False,
+        )
+        tools = kw.get("tools", [])
+        assert not any(t.get("type") == "web_search" for t in tools)
+        assert any(
+            t.get("type") == "function" and t.get("name") == "web_search"
+            for t in tools
+        )
+
+    def test_xai_path_uses_xai_block_not_native_block(self, transport):
+        """When is_xai_responses=True, the xAI block handles it - the non-xAI
+        block is skipped (guarded by ``not is_xai_responses``)."""
+        messages = [{"role": "user", "content": "Search."}]
+        kw = transport.build_kwargs(
+            model="grok-4.5", messages=messages,
+            tools=[{"type": "function", "function": {
+                "name": "web_search", "description": "Search the web.",
+                "parameters": {"type": "object",
+                               "properties": {"query": {"type": "string"}}}}}],
+            is_xai_responses=True,
+        )
+        tools = kw.get("tools", [])
+        # xAI block still injects native web_search
+        assert any(t.get("type") == "web_search" for t in tools)
 
     def test_xai_reasoning_disabled_no_reasoning_key(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
