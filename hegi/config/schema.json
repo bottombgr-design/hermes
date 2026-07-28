@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HEGI v2 Configuration",
+  "type": "object",
+  "required": ["version", "enabled", "telegram", "agents", "episode", "archive", "memory"],
+  "properties": {
+    "version": {"const": 1},
+    "enabled": {"const": true},
+    "telegram": {
+      "type": "object",
+      "required": ["chat_id", "enabled"],
+      "properties": {
+        "chat_id": {"type": "string", "minLength": 1},
+        "curator_env": {"type": "string"},
+        "enabled": {"const": true}
+      }
+    },
+    "agents": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["name", "db_path"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "db_path": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "required": [
+        "auto_commit",
+        "auto_draft",
+        "require_professor_approval",
+        "professor_user_ids",
+        "default_project"
+      ],
+      "properties": {
+        "auto_commit": {"const": false},
+        "auto_draft": {"const": false},
+        "require_professor_approval": {"const": true},
+        "professor_user_ids": {
+          "type": "array",
+          "items": {"type": ["string", "integer"]},
+          "minItems": 1
+        },
+        "default_project": {"type": "string", "minLength": 1},
+        "approval": {
+          "type": "object",
+          "required": [
+            "enabled",
+            "allow_commit_after_explicit_remember_command",
+            "allow_autonomous_commit",
+            "require_reply_or_meeting_id",
+            "require_fresh_search",
+            "require_draft_validation",
+            "require_post_commit_validation",
+            "require_audit",
+            "require_index",
+            "require_backup"
+          ],
+          "properties": {
+            "enabled": {"const": true},
+            "cli": {"type": "string"},
+            "queue_root": {"type": "string"},
+            "forest_cli": {"type": "string"},
+            "forest_root": {"type": "string"},
+            "backup_script": {"type": "string"},
+            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "allow_commit_after_explicit_remember_command": {"const": true},
+            "allow_autonomous_commit": {"const": false},
+            "require_reply_or_meeting_id": {"const": true},
+            "require_fresh_search": {"const": true},
+            "require_draft_validation": {"const": true},
+            "require_post_commit_validation": {"const": true},
+            "require_audit": {"const": true},
+            "require_index": {"const": true},
+            "require_backup": {"const": true}
+          }
+        },
+        "commands": {
+          "type": "object",
+          "required": [
+            "draft_only",
+            "approve_and_commit",
+            "merge_existing",
+            "reject"
+          ],
+          "additionalProperties": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1
+          }
+        }
+      }
+    }
+  }
+}
