@@ -1918,6 +1918,11 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
+        topic_aware_enabled: bool = False,
+        topic_aware_time_gap: int = 120,
+        topic_aware_min_messages: int = 6,
+        topic_aware_max_tokens: int | None = None,
+        topic_aware_max_chars: int | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -1973,6 +1978,16 @@ class ContextCompressor(ContextEngine):
             0, int(proactive_prune_min_reclaim_tokens or 0)
         )
         self.min_tail_user_messages = min_tail_user_messages
+        self.topic_aware_enabled = topic_aware_enabled
+        self.topic_aware_time_gap = topic_aware_time_gap
+        self.topic_aware_min_messages = topic_aware_min_messages
+        # Per-topic output cap (character count, not token count).
+        # Floor at 200 chars to prevent accidental zero/negative truncation.
+        self.topic_aware_max_chars: int | None = (
+            max(200, topic_aware_max_chars)
+            if topic_aware_max_chars is not None and topic_aware_max_chars > 0
+            else None
+        )
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
         # Output-token reservation: the provider carves max_tokens out of the
@@ -4865,6 +4880,134 @@ This compaction should PRIORITISE preserving all information related to the focu
     # Main compression entry point
     # ------------------------------------------------------------------
 
+    def _detect_topics(
+        self, messages: List[Dict[str, Any]], start: int, end: int
+    ) -> List[int]:
+        """Detect topic boundaries using time gaps between user messages.
+
+        Returns a list of message indices where each adjacent pair [i, j)
+        defines one topic segment.  Minimum: [start, end] (single topic).
+
+        Heuristics (deterministic, no LLM cost):
+          - Time gap > topic_aware_time_gap minutes between consecutive user
+            messages marks a topic boundary.
+          - Segments shorter than topic_aware_min_messages are merged into
+            the preceding segment.
+        """
+        boundaries = [start]
+        last_user_ts: Any = None
+        topic_time_gap = self.topic_aware_time_gap
+
+        for i in range(start, end):
+            msg = messages[i]
+            if msg.get("role") != "user":
+                continue
+            ts = msg.get("timestamp")
+            if ts is not None and last_user_ts is not None:
+                try:
+                    # Support both datetime and ISO-format strings (common after
+                    # SQLite session restore).
+                    if isinstance(ts, str):
+                        from datetime import datetime as _dt
+                        try:
+                            ts = _dt.fromisoformat(ts.replace("Z", "+00:00"))
+                        except (ValueError, TypeError):
+                            ts = None
+                    if ts is None:
+                        last_user_ts = ts  # Reset; unparseable string
+                        continue
+                    gap_minutes = (ts - last_user_ts).total_seconds() / 60.0
+                    if gap_minutes > topic_time_gap:
+                        boundaries.append(i)
+                except (TypeError, AttributeError):
+                    pass
+            last_user_ts = ts
+
+        boundaries.append(end)
+
+        # Single topic → no splitting needed.
+        if len(boundaries) <= 2:
+            return [start, end]
+
+        # Merge tiny segments so every topic has at least min_messages.
+        min_msg = max(self.topic_aware_min_messages, 4)
+        merged = [boundaries[0]]
+        for i in range(1, len(boundaries)):
+            seg_len = boundaries[i] - merged[-1]
+            if seg_len < min_msg and len(merged) > 1:
+                merged[-1] = boundaries[i]
+            else:
+                merged.append(boundaries[i])
+
+        return merged if len(merged) > 2 else [start, end]
+
+    def _multi_topic_compress(
+        self,
+        messages: List[Dict[str, Any]],
+        compress_start: int,
+        compress_end: int,
+        topic_boundaries: List[int],
+        telemetry: Dict[str, Any],
+    ) -> Optional[str]:
+        """Generate a ``## Topics`` summary text by calling the LLM once per topic.
+
+        Returns the assembled summary string suitable for injection into the
+        normal Phase 4 assembly pipeline.  Returns None if no topic produced a
+        summary (caller should fall back to the standard single-summary path).
+
+        Unlike the old implementation, this method does NOT build the final
+        message list itself — it leaves assembly, persistence-marker stripping,
+        tool-pair sanitization, metadata tagging, and counter updates to the
+        unified Phase 4 in ``compress()``.
+        """
+        n_topics = len(topic_boundaries) - 1
+        head_msgs = messages[:compress_start]
+        tail_msgs = messages[compress_end:]
+        topic_summaries: List[str] = []
+
+        for ti in range(n_topics):
+            seg_start = topic_boundaries[ti]
+            seg_end = topic_boundaries[ti + 1]
+            seg_msgs = list(head_msgs) + list(messages[seg_start:seg_end]) + list(tail_msgs)
+
+            # Derive a human-readable topic label from the first user message.
+            label = ""
+            for m in messages[seg_start:seg_end]:
+                if m.get("role") == "user":
+                    content = m.get("content", "")
+                    if isinstance(content, str) and content.strip():
+                        label = content.strip()[:80]
+                        break
+
+            try:
+                summary = self._generate_summary(
+                    seg_msgs,
+                    focus_topic=label,
+                )
+                if summary:
+                    # Apply per-topic output bound when configured.
+                    if (
+                        self.topic_aware_max_chars
+                        and len(summary) > self.topic_aware_max_chars
+                    ):
+                        summary = summary[: self.topic_aware_max_chars]
+                    topic_summaries.append(
+                        f"### Topic {ti + 1}: {label}\n{summary}"
+                    )
+            except Exception:
+                logger.warning(
+                    "Topic-aware summary failed for topic %d/%d (label=%r)",
+                    ti + 1, n_topics, label[:40] if label else "(none)",
+                    exc_info=True,
+                )
+
+        if not topic_summaries:
+            return None  # All topics failed → fallback
+
+        assembled = ["## Topics"] + topic_summaries
+        telemetry["chunk_count"] = n_topics
+        return "\n\n".join(assembled)
+
     def compress(
         self,
         messages: List[Dict[str, Any]],
@@ -5024,6 +5167,27 @@ This compaction should PRIORITISE preserving all information related to the focu
                     self._ineffective_compression_count,
                 )
             return messages
+
+        # Topic-aware compression: if enabled and multiple topics detected,
+        # generate a per-topic summary text now, then let the unified Phase 4
+        # assembly pipeline handle stripping, sanitization, and counters.
+        _multi_topic_summary: Optional[str] = None
+        if (
+            self.topic_aware_enabled
+            and self.topic_aware_time_gap > 0
+            and (compress_end - compress_start) >= self.topic_aware_min_messages * 2
+        ):
+            topic_boundaries = self._detect_topics(
+                messages, compress_start, compress_end
+            )
+            if len(topic_boundaries) > 2:
+                _multi_topic_summary = self._multi_topic_compress(
+                    messages,
+                    compress_start,
+                    compress_end,
+                    topic_boundaries,
+                    telemetry,
+                )
 
         turns_to_summarize = messages[compress_start:compress_end]
         # Snapshot the rehydration state so an aborted attempt below can roll
@@ -5188,13 +5352,18 @@ This compaction should PRIORITISE preserving all information related to the focu
                 tail_msgs,
             )
 
-        # Phase 3: Generate structured summary
-        summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(
-            turns_to_summarize,
-            focus_topic=summary_focus_topic,
-            memory_context=memory_context,
-        )
+        # Phase 3: Generate structured summary.  When topic-aware detection
+        # produced a multi-topic summary, use it directly; otherwise fall
+        # through to the standard single-call _generate_summary() path.
+        if _multi_topic_summary:
+            summary = _multi_topic_summary
+        else:
+            summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
+            summary = self._generate_summary(
+                turns_to_summarize,
+                focus_topic=summary_focus_topic,
+                memory_context=memory_context,
+            )
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):

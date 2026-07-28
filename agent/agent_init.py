@@ -1833,6 +1833,18 @@ def init_agent(
         pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
+    compression_topic_aware_enabled = bool(
+        _compression_cfg.get("topic_aware", {}).get("enabled", False)
+    )
+    compression_topic_aware_time_gap = int(
+        _compression_cfg.get("topic_aware", {}).get("time_gap_minutes", 120)
+    )
+    compression_topic_aware_min_messages = int(
+        _compression_cfg.get("topic_aware", {}).get("min_topic_messages", 6)
+    )
+    compression_topic_aware_max_tokens = int(
+        _compression_cfg.get("topic_aware", {}).get("per_topic_max_chars", 0)
+    ) or None  # 0 or missing → no limit
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # Minimum REAL (actionable) user messages guaranteed to survive in the
     # uncompressed tail (compression.min_tail_user_messages).  Default 1
@@ -2399,6 +2411,10 @@ def init_agent(
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
+            topic_aware_enabled=compression_topic_aware_enabled,
+            topic_aware_time_gap=compression_topic_aware_time_gap,
+            topic_aware_min_messages=compression_topic_aware_min_messages,
+            topic_aware_max_chars=compression_topic_aware_max_tokens,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
