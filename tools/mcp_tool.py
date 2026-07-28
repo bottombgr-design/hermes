@@ -4088,12 +4088,19 @@ _parallel_safe_servers: set = set()
 # guessing.
 _mcp_tool_server_names: Dict[str, str] = {}
 
+# MCP-only mutation epoch. Unlike ``tools.registry.registry._generation``, this
+# is unaffected by plugins and other dynamic tool families, so turn-boundary
+# refreshes can detect removal of the final MCP tool without rebuilding an
+# established conversation for unrelated registry changes.
+_mcp_tool_generation: int = 0
+
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
 # Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
-# _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
+# _parallel_safe_servers, _mcp_tool_server_names, _mcp_tool_generation, and
+# _stdio_pids.
 _lock = threading.Lock()
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
@@ -5407,15 +5414,21 @@ _UTILITY_CAPABILITY_ATTRS = {
 
 def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
     """Remember the exact MCP server that registered *tool_name*."""
+    global _mcp_tool_generation
     safe_server_name = sanitize_mcp_name_component(server_name)
     with _lock:
         _mcp_tool_server_names[tool_name] = safe_server_name
+        # Bump even when provenance is unchanged: list_changed may replace a
+        # same-name tool's schema, which still changes the model-facing catalog.
+        _mcp_tool_generation += 1
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
     """Forget MCP server provenance for a deregistered tool."""
+    global _mcp_tool_generation
     with _lock:
-        _mcp_tool_server_names.pop(tool_name, None)
+        if _mcp_tool_server_names.pop(tool_name, None) is not None:
+            _mcp_tool_generation += 1
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -5999,6 +6012,12 @@ def has_registered_mcp_tools() -> bool:
         return bool(_mcp_tool_server_names)
 
 
+def get_mcp_tool_generation() -> int:
+    """Return the MCP-only registry mutation epoch."""
+    with _lock:
+        return _mcp_tool_generation
+
+
 def get_registered_mcp_server_names() -> set:
     """Return the set of MCP server names that have actually registered at
     least one tool into the registry (post-connection, post check_fn/include-
@@ -6033,9 +6052,10 @@ def refresh_agent_mcp_tools(
     apart again.
 
     The rebuild respects the agent's own ``enabled_toolsets`` /
-    ``disabled_toolsets`` (the same filtering it was built with) and diffs by
-    tool **name** (not count — a count compare misses an equal-size add/remove
-    swap).
+    ``disabled_toolsets`` (the same filtering it was built with) and compares
+    the complete assembled definitions. Name-only comparison is insufficient:
+    Tool Search collapses a changing deferred catalog to the same three bridge
+    names while their model-facing descriptions and schemas still change.
 
     Crucially it is **additive-preserving**: ``get_tool_definitions`` returns
     only the registry-derived tools, but ``agent_init`` appends two further
@@ -6078,6 +6098,7 @@ def refresh_agent_mcp_tools(
     # computed an OLDER set must not clobber a newer set another caller already
     # published. ``registry._generation`` bumps on every (de)register.
     snapshot_generation = registry._generation
+    mcp_snapshot_generation = get_mcp_tool_generation()
 
     # Registry-derived tools (built-ins + MCP), filtered to the agent's toolsets.
     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
@@ -6116,14 +6137,18 @@ def refresh_agent_mcp_tools(
         if snapshot_generation < published_gen:
             # A newer snapshot already won; our set is stale — drop it.
             return set()
+        current_defs = list(getattr(agent, "tools", None) or [])
         current = {
             t["function"]["name"]
-            for t in (getattr(agent, "tools", None) or [])
+            for t in current_defs
         }
-        if new_names == current:
-            # No change → leave the live snapshot untouched (no churn), but
-            # record the generation so an in-flight older caller can't clobber.
+        if new_defs == current_defs:
+            # No schema or ordering change → leave the live snapshot untouched
+            # (no cache churn), but record the generation so an in-flight older
+            # caller can't clobber it. Keep ``added`` name-based below: callers
+            # use that return value only to report newly available names.
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
+            agent._mcp_tool_snapshot_generation = mcp_snapshot_generation
             return set()
         agent.tools = new_defs
         agent.valid_tool_names = new_names
@@ -6133,6 +6158,7 @@ def refresh_agent_mcp_tools(
             engine_names.clear()
             engine_names.update(staged_engine_names)
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
+        agent._mcp_tool_snapshot_generation = mcp_snapshot_generation
         return new_names - current
 
 
