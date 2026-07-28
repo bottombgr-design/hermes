@@ -15,8 +15,6 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from dotenv import dotenv_values
-
 from hermes_constants import get_config_path
 from utils import fast_safe_load
 
@@ -64,6 +62,8 @@ def _read_dotenv(path: Path) -> dict[str, str]:
     if not path.is_file():
         return {}
     try:
+        from dotenv import dotenv_values
+
         return {
             key: value
             for key, value in dotenv_values(path).items()
