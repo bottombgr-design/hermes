@@ -186,6 +186,213 @@ def test_check_for_skill_updates_does_not_fall_back_across_registries():
     assert "bundle" not in results[0], "must not carry a foreign registry's bundle"
 
 
+def test_handle_skills_slash_search_accepts_chatconsole_without_status_errors():
+    results = [type("R", (), {
+        "name": "kubernetes",
+        "description": "Cluster orchestration",
+        "source": "skills.sh",
+        "trust_level": "community",
+        "identifier": "skills-sh/example/kubernetes",
+    })()]
+
+    with patch("tools.skills_hub.unified_search", return_value=results), \
+         patch("tools.skills_hub.create_source_router", return_value={}), \
+         patch("tools.skills_hub.GitHubAuth"):
+        handle_skills_slash("/skills search kubernetes", console=ChatConsole())
+
+
+def test_do_install_scans_with_resolved_identifier(monkeypatch, tmp_path, hub_env):
+    import tools.skills_guard as guard
+    import tools.skills_hub as hub
+
+    canonical_identifier = "skills-sh/anthropics/skills/frontend-design"
+
+    class _ResolvedSource:
+        def inspect(self, identifier):
+            return type("Meta", (), {
+                "extra": {},
+                "identifier": canonical_identifier,
+            })()
+
+        def fetch(self, identifier):
+            return type("Bundle", (), {
+                "name": "frontend-design",
+                "files": {"SKILL.md": "# Frontend Design"},
+                "source": "skills.sh",
+                "identifier": canonical_identifier,
+                "trust_level": "trusted",
+                "metadata": {},
+            })()
+    q_path = tmp_path / "skills" / ".hub" / "quarantine" / "frontend-design"
+    q_path.mkdir(parents=True)
+    (q_path / "SKILL.md").write_text("# Frontend Design", encoding="utf-8")
+
+    scanned = {}
+
+    def _scan_skill(skill_path, source="community"):
+        scanned["source"] = source
+        return guard.ScanResult(
+            skill_name="frontend-design",
+            source=source,
+            trust_level="trusted",
+            verdict="safe",
+        )
+
+    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_ResolvedSource()])
+    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
+    monkeypatch.setattr(hub, "HubLockFile", lambda: type("Lock", (), {"get_installed": lambda self, name: None})())
+    monkeypatch.setattr(guard, "scan_skill", _scan_skill)
+    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
+    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (False, "stop after scan"))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_install("skils-sh/anthropics/skills/frontend-design", console=console, skip_confirm=True)
+
+    assert scanned["source"] == canonical_identifier
+
+
+def test_do_install_scans_official_bundles_with_source_provenance(
+    monkeypatch, tmp_path, hub_env
+):
+    import tools.skills_guard as guard
+    import tools.skills_hub as hub
+
+    class _OfficialSource:
+        def inspect(self, identifier):
+            return type("Meta", (), {
+                "extra": {},
+                "identifier": "official/agent/prunus-gaia",
+            })()
+
+        def fetch(self, identifier):
+            return type("Bundle", (), {
+                "name": "prunus-gaia",
+                "files": {"SKILL.md": "# Prunus Gaia"},
+                "source": "official",
+                "identifier": "official/agent/prunus-gaia",
+                "trust_level": "builtin",
+                "metadata": {},
+            })()
+
+    q_path = tmp_path / "skills" / ".hub" / "quarantine" / "prunus-gaia"
+    q_path.mkdir(parents=True)
+    (q_path / "SKILL.md").write_text("# Prunus Gaia", encoding="utf-8")
+
+    scanned = {}
+
+    def _scan_skill(skill_path, source="community"):
+        scanned["source"] = source
+        return guard.ScanResult(
+            skill_name="prunus-gaia",
+            source=source,
+            trust_level="builtin",
+            verdict="safe",
+        )
+
+    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_OfficialSource()])
+    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
+    monkeypatch.setattr(hub, "HubLockFile", lambda: type("Lock", (), {"get_installed": lambda self, name: None})())
+    monkeypatch.setattr(guard, "scan_skill", _scan_skill)
+    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
+    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (False, "stop after scan"))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_install("official/agent/prunus-gaia", console=console, skip_confirm=True)
+
+    assert scanned["source"] == "official"
+
+
+def test_do_install_preserves_nested_official_optional_path(
+    monkeypatch, tmp_path, hub_env
+):
+    class _OfficialNestedSource:
+        def inspect(self, identifier):
+            return type("Meta", (), {
+                "extra": {},
+                "identifier": "official/mlops/training/trl-fine-tuning",
+            })()
+
+        def fetch(self, identifier):
+            return type("Bundle", (), {
+                "name": "trl-fine-tuning",
+                "files": {"SKILL.md": "# TRL"},
+                "source": "official",
+                "identifier": "official/mlops/training/trl-fine-tuning",
+                "trust_level": "builtin",
+                "metadata": {},
+            })()
+
+    installs = _install_mocks(monkeypatch, tmp_path, _OfficialNestedSource)
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "official/mlops/training/trl-fine-tuning",
+        console=console,
+        skip_confirm=True,
+    )
+
+    assert installs == [{"name": "trl-fine-tuning", "category": "mlops/training"}]
+
+
+def test_do_audit_scans_official_skills_with_source_provenance(
+    monkeypatch, tmp_path, hub_env
+):
+    """Audit must resolve trust from provenance, not the multi-segment id.
+
+    Regression: an installed official optional skill records a multi-segment
+    lockfile identifier (``official/software-development/…``). Passing that
+    raw identifier into the trust resolver classifies it as ``community``
+    (the resolver only recognizes the provenance value ``official``), which
+    can flip a permitted CAUTION into a spurious BLOCKED. Audit must mirror
+    install and key off the ``source`` field.
+    """
+    import tools.skills_guard as guard
+    import tools.skills_hub as hub
+    from hermes_cli.skills_hub import do_audit
+
+    install_path = "software-development/subagent-driven-development"
+    skill_path = hub.SKILLS_DIR / install_path
+    skill_path.mkdir(parents=True)
+    (skill_path / "SKILL.md").write_text("# Subagent Driven Development", encoding="utf-8")
+
+    entry = {
+        "name": "subagent-driven-development",
+        "source": "official",
+        "identifier": "official/software-development/subagent-driven-development",
+        "install_path": install_path,
+    }
+
+    class _Lock:
+        def list_installed(self):
+            return [entry]
+
+    scanned = {}
+
+    def _scan_skill(path, source="community"):
+        scanned["source"] = source
+        return guard.ScanResult(
+            skill_name="subagent-driven-development",
+            source=source,
+            trust_level=guard._resolve_trust_level(source),
+            verdict="caution",
+        )
+
+    monkeypatch.setattr(hub, "HubLockFile", _Lock)
+    monkeypatch.setattr(guard, "scan_skill", _scan_skill)
+    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_audit(name="subagent-driven-development", console=console)
+
+    assert scanned["source"] == "official"
 
 
 # ---------------------------------------------------------------------------
@@ -257,11 +464,122 @@ def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
 
 
 
+def test_url_install_rejects_invalid_name_override(monkeypatch, tmp_path, hub_env):
+    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/SKILL.md",
+        console=console, skip_confirm=True,
+        name_override="SKILL",  # rejected by _is_valid_installed_skill_name
+    )
+
+    assert installs == []  # did NOT install
+    assert "Invalid --name" in sink.getvalue()
+
+
+def test_url_install_actionable_error_on_non_interactive_with_no_name(monkeypatch, tmp_path, hub_env):
+    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/SKILL.md",
+        console=console, skip_confirm=True,
+        # No name_override — should error out with a retry hint.
+    )
+
+    assert installs == []
+    out = sink.getvalue()
+    assert "Cannot install from URL" in out
+    assert "--name <your-name>" in out
+
+
+def test_url_install_prompts_interactively_when_tty(monkeypatch, tmp_path, hub_env):
+    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
+
+    # Simulate user typing "my-interactive" to name prompt, then "" to category.
+    answers = iter(["my-interactive", ""])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/SKILL.md",
+        console=console, skip_confirm=False,  # interactive
+        force=True,  # skip the final confirm prompt (tested elsewhere)
+    )
+
+    assert installs == [{"name": "my-interactive", "category": ""}]
+
+
+def test_url_install_prompts_category_and_uses_typed_value(monkeypatch, tmp_path, hub_env):
+    import tools.skills_hub as hub
+    installs = _install_mocks(
+        monkeypatch, tmp_path,
+        _make_url_bundle_fetcher(name="sharethis-chat", awaiting_name=False),
+    )
+
+    # Stage an existing category bucket so _existing_categories finds it.
+    (hub.SKILLS_DIR / "productivity" / "notion").mkdir(parents=True)
+    (hub.SKILLS_DIR / "productivity" / "notion" / "SKILL.md").write_text("# notion", encoding="utf-8")
+
+    # Name is already resolved (from frontmatter) → only category prompt fires.
+    answers = iter(["productivity"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/sharethis-chat/SKILL.md",
+        console=console, skip_confirm=False, force=True,
+    )
+
+    assert installs == [{"name": "sharethis-chat", "category": "productivity"}]
+    assert "Existing: productivity" in sink.getvalue()
+
+
+def test_url_install_cancel_name_prompt_aborts(monkeypatch, tmp_path, hub_env):
+    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
+
+    # Empty input with no default → name prompt returns None → abort.
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/SKILL.md",
+        console=console, skip_confirm=False, force=True,
+    )
+
+    assert installs == []
+    assert "Installation cancelled" in sink.getvalue()
 
 
 # ── _existing_categories ────────────────────────────────────────────────────
 
 
+def test_existing_categories_skips_top_level_skills(monkeypatch, tmp_path, hub_env):
+    import tools.skills_hub as hub
+    from hermes_cli.skills_hub import _existing_categories
+
+    # Category bucket with nested skill.
+    (hub.SKILLS_DIR / "productivity" / "notion").mkdir(parents=True)
+    (hub.SKILLS_DIR / "productivity" / "notion" / "SKILL.md").write_text("# notion", encoding="utf-8")
+
+    # Flat skill at top level (NOT a category).
+    (hub.SKILLS_DIR / "my-flat-skill").mkdir()
+    (hub.SKILLS_DIR / "my-flat-skill" / "SKILL.md").write_text("# flat", encoding="utf-8")
+
+    # Empty dir (NOT a category — no SKILL.md below).
+    (hub.SKILLS_DIR / "empty-dir").mkdir()
+
+    # Hidden dir (ignored).
+    (hub.SKILLS_DIR / ".hub").mkdir(exist_ok=True)
+
+    cats = _existing_categories()
+    assert cats == ["productivity"]
 
 
 
