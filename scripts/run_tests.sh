@@ -111,9 +111,22 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
+# USERPROFILE/LOCALAPPDATA/APPDATA: Windows has no $HOME concept — CPython's
+# Path.home() reads USERPROFILE and raises "Could not determine home
+# directory" without it. Since `env -i` drops them, every test that imports a
+# module touching Path.home() at import time (hermes_cli.main ->
+# _apply_profile_override -> get_default_hermes_root) died at COLLECTION on
+# Windows, so the whole file reported "no tests ran" rather than failing
+# visibly. Passed through only when already set, so POSIX runs are unchanged
+# and stay just as hermetic.
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${USERPROFILE:+USERPROFILE="$USERPROFILE"} \
+  ${LOCALAPPDATA:+LOCALAPPDATA="$LOCALAPPDATA"} \
+  ${APPDATA:+APPDATA="$APPDATA"} \
+  ${SYSTEMROOT:+SYSTEMROOT="$SYSTEMROOT"} \
+  ${COMSPEC:+COMSPEC="$COMSPEC"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
