@@ -1879,6 +1879,7 @@ AUTHOR_MAP = {
     "yosapol@jitrak.dev": "Eji4h",  # direct email match
     "kiljadn@gmail.com": "designnotdrum",  # PR #56480 salvage (toolset static-inference fix)
     "lavya@loom.local": "LavyaTandel",  # PR #57893 salvage local git identity (envelope-layout cache markers on tool/empty-assistant messages; #57845)
+    "tikkanadityajyothi@gmail.com": "Vissirexa",  # PRs #60087 (guardrails: repeated tool results), #62934/#62977 (long-running memory leaks; bounded TTS/turn-buffer caches), #64803 (guardrails: mutation-aware no-progress reset), #64848 (browser_wait tool)
 }
 
 
