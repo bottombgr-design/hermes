@@ -15,6 +15,7 @@ import {
   pickPrimaryPreviewTarget
 } from '@/components/assistant-ui/thread/content'
 import { MESSAGE_PARTS_COMPONENTS } from '@/components/assistant-ui/thread/message-parts'
+import { QuoteSelectionContextMenu } from '@/components/assistant-ui/thread/quote-selection'
 import { ResponseLoadingIndicator, StreamStallIndicator } from '@/components/assistant-ui/thread/status'
 import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
@@ -84,50 +85,56 @@ export const AssistantMessage: FC<{
   const enterRef = useEnterAnimation(isRunning, `assistant-message:${messageId}`)
 
   return (
-    <MessagePrimitive.Root
-      className="group flex w-full min-w-0 max-w-full flex-col gap-0 self-start overflow-hidden"
-      data-role="assistant"
-      data-slot="aui_assistant-message-root"
-      data-streaming={isRunning ? 'true' : undefined}
-      ref={enterRef}
-    >
-      <div
-        className="wrap-anywhere min-w-0 max-w-full overflow-hidden text-pretty text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground"
-        data-slot="aui_assistant-message-content"
+    <QuoteSelectionContextMenu>
+      <MessagePrimitive.Root
+        className="group flex w-full min-w-0 max-w-full flex-col gap-0 self-start overflow-hidden"
+        data-role="assistant"
+        data-slot="aui_assistant-message-root"
+        data-streaming={isRunning ? 'true' : undefined}
+        ref={enterRef}
       >
-        {/* Todos render in the composer status stack now, not inline. */}
-        <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
-        {isPlaceholder ? <ResponseLoadingIndicator /> : isRunning && <StreamStallIndicator />}
-        {previewTargets.length > 0 && (
-          <div className="mt-3 flex flex-wrap gap-2">
-            {previewTargets.map(target => (
-              <PreviewAttachment key={target} source="explicit-link" target={target} />
-            ))}
-          </div>
+        <div
+          className="wrap-anywhere min-w-0 max-w-full overflow-hidden text-pretty text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground"
+          data-slot="aui_assistant-message-content"
+        >
+          {/* Todos render in the composer status stack now, not inline. */}
+          <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
+          {isPlaceholder ? <ResponseLoadingIndicator /> : isRunning && <StreamStallIndicator />}
+          {previewTargets.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {previewTargets.map(target => (
+                <PreviewAttachment key={target} source="explicit-link" target={target} />
+              ))}
+            </div>
+          )}
+          <MessagePrimitive.Error>
+            <ErrorPrimitive.Root
+              className="mt-1.5 flex items-start gap-1.5 text-[0.78rem] leading-5 text-[color-mix(in_srgb,var(--dt-destructive)_78%,var(--ui-text-secondary))]"
+              role="alert"
+            >
+              <ErrorPrimitive.Message className="min-w-0 flex-1" />
+              {onDismissError && (
+                <TooltipIconButton
+                  className="-my-0.5 shrink-0 text-current opacity-70 hover:opacity-100"
+                  onClick={() => onDismissError(messageId)}
+                  side="top"
+                  tooltip={t.assistant.thread.dismissError}
+                >
+                  <XIcon className="size-3.5" />
+                </TooltipIconButton>
+              )}
+            </ErrorPrimitive.Root>
+          </MessagePrimitive.Error>
+        </div>
+        {hasVisibleText && !isInterim && (
+          <AssistantFooter
+            getMessageText={getMessageText}
+            messageId={messageId}
+            onBranchInNewChat={onBranchInNewChat}
+          />
         )}
-        <MessagePrimitive.Error>
-          <ErrorPrimitive.Root
-            className="mt-1.5 flex items-start gap-1.5 text-[0.78rem] leading-5 text-[color-mix(in_srgb,var(--dt-destructive)_78%,var(--ui-text-secondary))]"
-            role="alert"
-          >
-            <ErrorPrimitive.Message className="min-w-0 flex-1" />
-            {onDismissError && (
-              <TooltipIconButton
-                className="-my-0.5 shrink-0 text-current opacity-70 hover:opacity-100"
-                onClick={() => onDismissError(messageId)}
-                side="top"
-                tooltip={t.assistant.thread.dismissError}
-              >
-                <XIcon className="size-3.5" />
-              </TooltipIconButton>
-            )}
-          </ErrorPrimitive.Root>
-        </MessagePrimitive.Error>
-      </div>
-      {hasVisibleText && !isInterim && (
-        <AssistantFooter getMessageText={getMessageText} messageId={messageId} onBranchInNewChat={onBranchInNewChat} />
-      )}
-    </MessagePrimitive.Root>
+      </MessagePrimitive.Root>
+    </QuoteSelectionContextMenu>
   )
 }
 

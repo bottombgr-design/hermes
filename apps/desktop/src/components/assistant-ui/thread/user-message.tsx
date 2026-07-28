@@ -3,6 +3,7 @@ import { type FC, type ReactNode, useCallback, useRef, useState } from 'react'
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
+import { QuoteSelectionContextMenu } from '@/components/assistant-ui/thread/quote-selection'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
 import { Codicon } from '@/components/ui/codicon'
@@ -255,112 +256,114 @@ export const UserMessage: FC<{
         }
         messageId={messageId}
       >
-        <ActionBarPrimitive.Root className="relative w-full max-w-full" data-slot="aui_user-bubble-actions">
-          <div className="human-message-with-todos-wrapper flex w-full flex-col gap-0">
-            <div className="relative w-full">
-              {readOnly ? (
-                // Spectator transcript: clicking only toggles the clamp so the
-                // full prompt is readable — never opens an edit composer.
-                <button
-                  aria-expanded={bodyClamped ? expanded : undefined}
-                  className={cn(bubbleClassName, !bodyClamped && 'cursor-default')}
-                  onClick={() => {
-                    if (!bodyClamped) {
-                      return
-                    }
-
-                    triggerHaptic('selection')
-                    setExpanded(value => !value)
-                  }}
-                  title={bodyClamped ? (expanded ? t.common.collapse : copy.expandMessage) : undefined}
-                  type="button"
-                >
-                  {bubbleContent}
-                </button>
-              ) : (
-                // Always editable — clicking opens the edit composer even while a
-                // turn streams; sending the edit reverts (interrupt + rewind).
-                <ActionBarPrimitive.Edit asChild>
+        <QuoteSelectionContextMenu>
+          <ActionBarPrimitive.Root className="relative w-full max-w-full" data-slot="aui_user-bubble-actions">
+            <div className="human-message-with-todos-wrapper flex w-full flex-col gap-0">
+              <div className="relative w-full">
+                {readOnly ? (
+                  // Spectator transcript: clicking only toggles the clamp so the
+                  // full prompt is readable — never opens an edit composer.
                   <button
-                    aria-label={copy.editMessage}
-                    className={bubbleClassName}
-                    onClick={() => triggerHaptic('selection')}
-                    onPointerDown={() => notifyThreadEditOpen()}
-                    title={copy.editMessage}
+                    aria-expanded={bodyClamped ? expanded : undefined}
+                    className={cn(bubbleClassName, !bodyClamped && 'cursor-default')}
+                    onClick={() => {
+                      if (!bodyClamped) {
+                        return
+                      }
+
+                      triggerHaptic('selection')
+                      setExpanded(value => !value)
+                    }}
+                    title={bodyClamped ? (expanded ? t.common.collapse : copy.expandMessage) : undefined}
                     type="button"
                   >
                     {bubbleContent}
                   </button>
-                </ActionBarPrimitive.Edit>
-              )}
-              {(showStop || showRestore) && (
-                <div className="pointer-events-none absolute right-2 bottom-2 z-10 flex items-center justify-center opacity-0 transition-opacity group-hover/user-message:opacity-100 group-focus-within/user-message:opacity-100">
-                  {showStop ? (
+                ) : (
+                  // Always editable — clicking opens the edit composer even while a
+                  // turn streams; sending the edit reverts (interrupt + rewind).
+                  <ActionBarPrimitive.Edit asChild>
                     <button
-                      aria-label={copy.stop}
-                      className={cn('pointer-events-auto size-5', USER_ACTION_ICON_BUTTON_CLASS)}
-                      onClick={event => {
-                        event.preventDefault()
-                        event.stopPropagation()
-                        void onCancel?.()
-                      }}
-                      title={copy.stop}
+                      aria-label={copy.editMessage}
+                      className={bubbleClassName}
+                      onClick={() => triggerHaptic('selection')}
+                      onPointerDown={() => notifyThreadEditOpen()}
+                      title={copy.editMessage}
                       type="button"
                     >
-                      {StopGlyph}
+                      {bubbleContent}
                     </button>
-                  ) : (
-                    <button
-                      aria-label={copy.restoreCheckpoint}
-                      className={cn('pointer-events-auto size-6', USER_ACTION_ICON_BUTTON_CLASS)}
-                      onClick={event => {
-                        event.preventDefault()
-                        event.stopPropagation()
-                        triggerHaptic('selection')
-                        onRequestRestoreConfirm?.(messageId, {
-                          text: messageText,
-                          userOrdinal: runtimeUserOrdinal
-                        })
-                      }}
-                      onPointerDown={event => {
-                        event.preventDefault()
-                        event.stopPropagation()
-                      }}
-                      title={copy.restoreFromHere}
-                      type="button"
-                    >
-                      <Codicon name="discard" size="0.875rem" />
-                    </button>
-                  )}
-                </div>
-              )}
+                  </ActionBarPrimitive.Edit>
+                )}
+                {(showStop || showRestore) && (
+                  <div className="pointer-events-none absolute right-2 bottom-2 z-10 flex items-center justify-center opacity-0 transition-opacity group-hover/user-message:opacity-100 group-focus-within/user-message:opacity-100">
+                    {showStop ? (
+                      <button
+                        aria-label={copy.stop}
+                        className={cn('pointer-events-auto size-5', USER_ACTION_ICON_BUTTON_CLASS)}
+                        onClick={event => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          void onCancel?.()
+                        }}
+                        title={copy.stop}
+                        type="button"
+                      >
+                        {StopGlyph}
+                      </button>
+                    ) : (
+                      <button
+                        aria-label={copy.restoreCheckpoint}
+                        className={cn('pointer-events-auto size-6', USER_ACTION_ICON_BUTTON_CLASS)}
+                        onClick={event => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          triggerHaptic('selection')
+                          onRequestRestoreConfirm?.(messageId, {
+                            text: messageText,
+                            userOrdinal: runtimeUserOrdinal
+                          })
+                        }}
+                        onPointerDown={event => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                        }}
+                        title={copy.restoreFromHere}
+                        type="button"
+                      >
+                        <Codicon name="discard" size="0.875rem" />
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+              <BranchPickerPrimitive.Root
+                className={cn(
+                  'checkpoint-container flex items-center gap-1 pb-0 pt-1 pl-1.5 text-[0.75rem] leading-none text-(--ui-text-tertiary)',
+                  readOnly && 'hidden'
+                )}
+                hideWhenSingleBranch
+              >
+                <span aria-hidden className="checkpoint-icon size-1.5 rounded-full border border-current" />
+                <BranchPickerPrimitive.Previous
+                  className="checkpoint-restore-text rounded-sm bg-transparent px-1 opacity-65 hover:opacity-100 disabled:hidden disabled:cursor-default"
+                  title={copy.restorePrevious}
+                >
+                  {copy.restoreCheckpoint}
+                </BranchPickerPrimitive.Previous>
+                <span className="checkpoint-divider opacity-55">
+                  <BranchPickerPrimitive.Number />/<BranchPickerPrimitive.Count />
+                </span>
+                <BranchPickerPrimitive.Next
+                  className="checkpoint-restore-text rounded-sm bg-transparent px-1 opacity-65 hover:opacity-100 disabled:hidden disabled:cursor-default"
+                  title={copy.restoreNext}
+                >
+                  {copy.goForward}
+                </BranchPickerPrimitive.Next>
+              </BranchPickerPrimitive.Root>
             </div>
-            <BranchPickerPrimitive.Root
-              className={cn(
-                'checkpoint-container flex items-center gap-1 pb-0 pt-1 pl-1.5 text-[0.75rem] leading-none text-(--ui-text-tertiary)',
-                readOnly && 'hidden'
-              )}
-              hideWhenSingleBranch
-            >
-              <span aria-hidden className="checkpoint-icon size-1.5 rounded-full border border-current" />
-              <BranchPickerPrimitive.Previous
-                className="checkpoint-restore-text rounded-sm bg-transparent px-1 opacity-65 hover:opacity-100 disabled:hidden disabled:cursor-default"
-                title={copy.restorePrevious}
-              >
-                {copy.restoreCheckpoint}
-              </BranchPickerPrimitive.Previous>
-              <span className="checkpoint-divider opacity-55">
-                <BranchPickerPrimitive.Number />/<BranchPickerPrimitive.Count />
-              </span>
-              <BranchPickerPrimitive.Next
-                className="checkpoint-restore-text rounded-sm bg-transparent px-1 opacity-65 hover:opacity-100 disabled:hidden disabled:cursor-default"
-                title={copy.restoreNext}
-              >
-                {copy.goForward}
-              </BranchPickerPrimitive.Next>
-            </BranchPickerPrimitive.Root>
-          </div>
-        </ActionBarPrimitive.Root>
+          </ActionBarPrimitive.Root>
+        </QuoteSelectionContextMenu>
       </StickyHumanMessageContainer>
     </MessagePrimitive.Root>
   )
