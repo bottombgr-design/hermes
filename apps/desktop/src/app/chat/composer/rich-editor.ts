@@ -18,6 +18,63 @@ import {
 } from '@/components/assistant-ui/directive-text'
 
 export const RICH_INPUT_SLOT = 'composer-rich-input'
+export type NumberedListKey = 'Enter' | 'Backspace' | 'Tab'
+const NUMBERED_LIST_LINE_RE = /^([ \t]*)(\d+)\. (.*)$/
+// numbered list helpers
+export function handleNumberedListKey(editor: HTMLElement, key: NumberedListKey): boolean {
+  const hit = composerSelectionRange(editor)
+
+  if (!hit?.range.collapsed) {
+    return false
+  }
+
+  const text = composerPlainText(editor)
+  const caret = caretOffsetInEditor(editor)
+  const lineStart = text.lastIndexOf('\n', caret - 1) + 1
+  const lineEndIndex = text.indexOf('\n', caret)
+  const lineEnd = lineEndIndex === -1 ? text.length : lineEndIndex
+
+  if (caret !== lineEnd) {
+    return false
+  }
+
+  const match = NUMBERED_LIST_LINE_RE.exec(text.slice(lineStart, lineEnd))
+
+  if (!match) {
+    return false
+  }
+
+  const indent = match[1] || ''
+  const content = match[3] || ''
+  const blankMarker = content.trim() === ''
+  let nextText: string
+  let nextCaret: number
+
+  if (key === 'Enter') {
+    if (blankMarker) {
+      nextText = `${text.slice(0, lineStart)}\n${text.slice(lineEnd)}`
+      nextCaret = lineStart + 1
+    } else {
+      const nextMarker = `${indent}${Number(match[2]) + 1}. `
+      nextText = `${text.slice(0, caret)}\n${nextMarker}${text.slice(caret)}`
+      nextCaret = caret + nextMarker.length + 1
+    }
+  } else if (blankMarker && key === 'Backspace') {
+    nextText = text.slice(0, lineStart) + text.slice(lineEnd)
+    nextCaret = lineStart
+  } else if (blankMarker && key === 'Tab') {
+    const subBullet = `${indent}${' '.repeat(match[2]!.length + 2)}- `
+    nextText = `${text.slice(0, lineStart)}${subBullet}${text.slice(lineEnd)}`
+    nextCaret = lineStart + subBullet.length
+  } else {
+    return false
+  }
+
+  renderComposerContents(editor, nextText)
+  placeCaretAtOffset(editor, nextCaret)
+
+  return true
+}
 
 export const REF_RE = /@(file|folder|url|image|tool|line|terminal|session):(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)/g
 
