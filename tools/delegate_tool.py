@@ -1544,6 +1544,14 @@ def _build_child_agent(
             **child_optional_kwargs,
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Delegated children are autonomous: there is no user in their isolated
+    # session to re-prompt after a narration-only "I will..." response. Keep
+    # explicit user choices (false/model lists) intact, but harden the default
+    # auto mode so the existing bounded intent-ack continuation applies across
+    # child API modes rather than only codex_responses.
+    intent_ack_mode = getattr(child, "_intent_ack_continuation", "auto")
+    if isinstance(intent_ack_mode, str) and intent_ack_mode.lower() == "auto":
+        setattr(child, "_intent_ack_continuation", True)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -2320,12 +2328,37 @@ def _run_single_child(
         # it instead of silently accepting zero-content "success".
         _empty_sentinel = summary.strip() == "(empty)"
 
+        messages = result.get("messages") or []
+        _unfinished_intent = False
+        if summary and not interrupted and isinstance(messages, list):
+            try:
+                from agent.agent_runtime_helpers import (
+                    looks_like_codex_intermediate_ack,
+                )
+
+                _unfinished_intent = looks_like_codex_intermediate_ack(
+                    child,
+                    goal,
+                    summary,
+                    messages,
+                    require_workspace=False,
+                    require_no_tools=False,
+                )
+            except Exception:
+                logger.debug(
+                    "Subagent final intent classification failed",
+                    exc_info=True,
+                )
+
         if interrupted:
             status = "interrupted"
+        elif _unfinished_intent:
+            status = "failed"
         elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
+            # ``completed`` is a mechanical lifecycle state: the child ended
+            # with a non-empty handoff.  It is deliberately NOT a semantic
+            # endorsement of the summary's claims or deliverables; the parent
+            # must verify those independently (surfaced via semantic_status).
             status = "completed"
         else:
             status = "failed"
@@ -2334,7 +2367,6 @@ def _run_single_child(
         # Uses tool_call_id to correctly pair parallel tool calls with results.
         tool_trace: list[Dict[str, Any]] = []
         trace_by_id: Dict[str, Dict[str, Any]] = {}
-        messages = result.get("messages") or []
         if isinstance(messages, list):
             for msg in messages:
                 if not isinstance(msg, dict):
@@ -2371,6 +2403,8 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif _unfinished_intent:
+            exit_reason = "incomplete_intent"
         elif completed:
             exit_reason = "completed"
         else:
@@ -2384,6 +2418,9 @@ def _run_single_child(
         entry: Dict[str, Any] = {
             "task_index": task_index,
             "status": status,
+            "semantic_status": (
+                "unverified" if status == "completed" else "not_applicable"
+            ),
             "summary": summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
@@ -2417,7 +2454,15 @@ def _run_single_child(
             ),
         }
         if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+            if _unfinished_intent:
+                entry["error"] = (
+                    "Subagent announced another action instead of delivering "
+                    "the requested result."
+                )
+            else:
+                entry["error"] = result.get(
+                    "error", "Subagent did not produce a response."
+                )
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
@@ -3745,6 +3790,10 @@ def _build_top_level_description() -> str:
         "subagent to return a verifiable handle (URL, ID, absolute path, HTTP "
         "status) and verify it yourself — fetch the URL, stat the file, read "
         "back the content — before telling the user the operation succeeded.\n"
+        "- Result status='completed' is only a mechanical lifecycle signal: "
+        "the child returned a non-empty handoff. It does NOT mean the claims, "
+        "artifacts, or task outcome were semantically verified; completed "
+        "entries therefore carry semantic_status='unverified'.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
         "delegate_task, clarify, memory, send_message.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
