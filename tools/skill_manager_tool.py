@@ -1022,7 +1022,8 @@ def _patch_skill(
         target, err = _resolve_skill_target(skill_dir, file_path)
         if err:
             return {"success": False, "error": err}
-        assert target is not None
+        if target is None:
+            return {"success": False, "error": "Failed to resolve skill target path"}
     else:
         # Patching SKILL.md
         target = skill_dir / "SKILL.md"
@@ -1240,7 +1241,8 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     target, err = _resolve_skill_target(existing["path"], file_path)
     if err:
         return {"success": False, "error": err}
-    assert target is not None
+    if target is None:
+        return {"success": False, "error": "Failed to resolve skill target path"}
     if target.exists():
         read_guard = _background_review_read_before_write_guard(
             name, target, "write_file", file_path
@@ -1286,7 +1288,8 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     target, err = _resolve_skill_target(skill_dir, file_path)
     if err:
         return {"success": False, "error": err}
-    assert target is not None
+    if target is None:
+        return {"success": False, "error": "Failed to resolve skill target path"}
     if not target.exists():
         # List what's actually there for the model to see
         available = []
