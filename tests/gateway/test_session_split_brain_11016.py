@@ -155,8 +155,10 @@ class TestAdapterSessionCancellation:
         await adapter.handle_message(
             _make_event("/model xiaomi/mimo-v2-pro --provider nous")
         )
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        for _ in range(20):
+            if any("handled:model" in r for r in adapter.sent_responses):
+                break
+            await asyncio.sleep(0)
 
         assert any("handled:model" in r for r in adapter.sent_responses), (
             f"follow-up /model stayed blocked after {command_text}"
@@ -260,8 +262,12 @@ class TestStaleSessionLockSelfHeal:
         # An ordinary message should heal the stale lock, then fall through
         # to normal dispatch.  User gets a reply instead of a busy ack.
         await adapter.handle_message(_make_event("hello"))
-        # Drain any spawned background tasks.
-        for _ in range(5):
+        # Drain the spawned background task. Pre-delivery typing cleanup adds
+        # a few scheduler hops, so wait for the observable reply rather than
+        # assuming a fixed event-loop turn count.
+        for _ in range(20):
+            if any("handled:text" in r for r in adapter.sent_responses):
+                break
             await asyncio.sleep(0)
 
         assert any("handled:text" in r for r in adapter.sent_responses), (
