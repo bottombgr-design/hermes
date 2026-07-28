@@ -21032,6 +21032,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # fenced code block — consecutive terminal calls then drop the
         # repeated "💻 terminal" header and render back-to-back blocks.
         last_was_terminal_block = [False]
+        from agent.redact import (
+            StreamingSecretSanitizer,
+            sanitize_terminal_secret_text,
+        )
+        _progress_secret_state = StreamingSecretSanitizer(
+            token_candidates_only=True,
+        )
+        _progress_pending_renderer = [None]
+        _progress_secret_lock = threading.Lock()
+
+        def _sanitize_progress_event_fragment(value, renderer):
+            with _progress_secret_lock:
+                return _sanitize_progress_event_fragment_locked(value, renderer)
+
+        def _sanitize_progress_event_fragment_locked(value, renderer):
+            """Sanitize across fragments without moving text to a later tool."""
+            raw = str(value or "")
+            pending_before = _progress_secret_state.pending
+            previous_renderer = _progress_pending_renderer[0]
+            combined = pending_before + raw
+            safe = _progress_secret_state.feed(raw)
+            pending_after = _progress_secret_state.pending
+            emitted_raw = combined[:len(combined) - len(pending_after)]
+            current_emitted = emitted_raw[len(pending_before):]
+            current_safe = sanitize_terminal_secret_text(current_emitted)
+            preserves_event_boundary = (
+                safe == emitted_raw
+                or safe == pending_before + current_safe
+            )
+
+            messages = []
+            if (
+                pending_before
+                and previous_renderer is not None
+                and preserves_event_boundary
+            ):
+                previous_length = min(len(pending_before), len(emitted_raw))
+                if previous_length:
+                    messages.append(
+                        previous_renderer(safe[:previous_length])
+                    )
+                current_output = safe[previous_length:]
+                if current_safe != current_emitted:
+                    # The combined cross-event stream can defeat a credential's
+                    # left boundary even though the current event alone is a
+                    # complete secret. Preserve event ownership, but never
+                    # prefer its raw slice over its independently safe form.
+                    current_output = current_safe
+                if current_output:
+                    messages.append(renderer(current_output))
+            elif safe:
+                # A redacted value spanning events belongs to the event that
+                # began it, not to the later tool that completed its grammar.
+                messages.append((previous_renderer or renderer)(safe))
+
+            _progress_pending_renderer[0] = (
+                renderer if pending_after else None
+            )
+            return messages
 
         # ── Discord voice "verbal ack before tool calls" ────────────────
         # When the bot is in a voice channel with the continuous mixer
@@ -21141,6 +21200,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
             if not progress_queue or not _run_still_current():
                 return
+            from agent.redact import sanitize_terminal_secret_text
 
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
@@ -21165,7 +21225,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
                             long_tool_hint_fired[0] = True
-                            progress_queue.put(tool_progress_hint_gateway())
+                            progress_queue.put(
+                                sanitize_terminal_secret_text(
+                                    tool_progress_hint_gateway()
+                                )
+                            )
                             mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
                 except Exception as _hint_err:
                     logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
@@ -21180,8 +21244,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not _thinking_enabled:
                     return
                 thinking_text = preview if tool_name == "_thinking" else tool_name
-                msg = f"💬 {thinking_text}" if thinking_text else None
-                if msg:
+                messages = _sanitize_progress_event_fragment(
+                    thinking_text,
+                    lambda safe: f"💬 {safe}",
+                )
+                for msg in messages:
                     progress_queue.put(msg)
                 return
 
@@ -21243,8 +21310,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # at ``tool_preview_length`` (default 40) so a long or multi-line
             # command doesn't render as a huge block — matching the budget the
             # non-terminal preview path already applies (#42634).
-            _code_block_full = None
-            _code_block_short = None
             try:
                 _progress_adapter = self._adapter_for_source(source)
             except Exception:
@@ -21257,59 +21322,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and args["command"].strip()
             ):
                 from agent.display import get_tool_preview_max_len
-                _cmd_full = args["command"].rstrip()
                 # Consecutive terminal calls: drop the repeated
                 # "💻 terminal" header so back-to-back commands render as
                 # adjacent code blocks under a single header.
                 _block_header = (
                     "" if last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
                 )
-                _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
-                # Single-line, capped preview for non-verbose modes.
-                _pl = get_tool_preview_max_len()
-                _cap = _pl if _pl > 0 else 40
-                _lines = _cmd_full.splitlines()
-                _cmd_short = _lines[0] if _lines else _cmd_full
-                _multiline = len(_lines) > 1
-                if len(_cmd_short) > _cap:
-                    _cmd_short = _cmd_short[:_cap - 3] + "..."
-                elif _multiline:
-                    _cmd_short = _cmd_short + " ..."
-                _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
+
+                def _render_terminal_command(safe):
+                    command = safe
+                    if progress_mode != "verbose":
+                        _pl = get_tool_preview_max_len()
+                        _cap = _pl if _pl > 0 else 40
+                        _lines = command.splitlines()
+                        command = _lines[0] if _lines else command
+                        if len(command) > _cap:
+                            command = command[:_cap - 3] + "..."
+                        elif len(_lines) > 1:
+                            command = command + " ..."
+                    return f"{_block_header}```\n{command}\n```"
+
+                messages = _sanitize_progress_event_fragment(
+                    args["command"].rstrip(),
+                    _render_terminal_command,
+                )
+                if not messages:
+                    last_was_terminal_block[0] = False
+                    return
+                last_was_terminal_block[0] = True
+                for msg in messages:
+                    progress_queue.put(msg)
+                return
 
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
-                if _code_block_full is not None:
-                    last_was_terminal_block[0] = True
-                    progress_queue.put(_code_block_full)
-                    return
                 last_was_terminal_block[0] = False
                 if args:
                     from agent.display import get_tool_preview_max_len
                     _pl = get_tool_preview_max_len()
-                    args_str = json.dumps(args, ensure_ascii=False, default=str)
-                    # When tool_preview_length is 0 (default), don't truncate
-                    # in verbose mode — the user explicitly asked for full
-                    # detail.  Platform message-length limits handle the rest.
-                    if _pl > 0 and len(args_str) > _pl:
-                        args_str = args_str[:_pl - 3] + "..."
-                    msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+
+                    def _render_verbose_args(safe):
+                        # When tool_preview_length is 0 (default), don't
+                        # truncate in verbose mode.
+                        if _pl > 0 and len(safe) > _pl:
+                            safe = safe[:_pl - 3] + "..."
+                        return (
+                            f"{emoji} {tool_name}({list(args.keys())})\n"
+                            f"{safe}"
+                        )
+
+                    messages = _sanitize_progress_event_fragment(
+                        json.dumps(args, ensure_ascii=False, default=str),
+                        _render_verbose_args,
+                    )
                 elif preview:
-                    msg = f"{emoji} {tool_name}: \"{preview}\""
+                    messages = _sanitize_progress_event_fragment(
+                        preview,
+                        lambda safe: f'{emoji} {tool_name}: "{safe}"',
+                    )
                 else:
-                    msg = f"{emoji} {tool_name}..."
-                progress_queue.put(msg)
+                    messages = [f"{emoji} {tool_name}..."]
+                for msg in messages:
+                    progress_queue.put(msg)
                 return
             
             # "all" / "new" modes: short preview, respects tool_preview_length
             # config (defaults to 40 chars when unset to keep gateway messages
             # compact — unlike CLI spinners, these persist as permanent messages).
-            # Terminal commands on markdown platforms get a single-line capped
-            # fenced block (built above) instead of the truncated preview.
-            if _code_block_short is not None:
-                msg = _code_block_short
-                last_was_terminal_block[0] = True
-            elif preview:
+            # Terminal commands on markdown platforms returned above after
+            # building their capped fenced block.
+            if preview:
                 from agent.display import (
                     get_tool_preview_max_len,
                     get_tool_verb,
@@ -21318,39 +21400,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
-                if len(preview) > _cap:
-                    preview = preview[:_cap - 3] + "..."
-                # Friendly labels: render a human-phrased line for built-in
-                # tools ("🔍 Searching the web for ...") by prefixing the verb
-                # onto the preview the callback already computed (so the
-                # command/url/query is preserved).  Custom/plugin/MCP tools
-                # have no verb and fall back to the raw "tool_name: ..." form.
-                _verb = get_tool_verb(tool_name)
-                if _verb:
-                    if verb_drops_preview(tool_name):
-                        msg = f"{emoji} {_verb}"
-                    else:
-                        msg = f"{emoji} {_verb}{tool_verb_connector(tool_name)}{preview}"
-                else:
-                    msg = f"{emoji} {tool_name}: \"{preview}\""
+
+                def _render_compact_preview(safe):
+                    if len(safe) > _cap:
+                        safe = safe[:_cap - 3] + "..."
+                    # Friendly labels: render a human-phrased line for built-in
+                    # tools while preserving custom/plugin/MCP fallback labels.
+                    _verb = get_tool_verb(tool_name)
+                    if _verb:
+                        if verb_drops_preview(tool_name):
+                            return f"{emoji} {_verb}"
+                        return (
+                            f"{emoji} {_verb}"
+                            f"{tool_verb_connector(tool_name)}{safe}"
+                        )
+                    return f'{emoji} {tool_name}: "{safe}"'
+
+                messages = _sanitize_progress_event_fragment(
+                    preview,
+                    _render_compact_preview,
+                )
                 last_was_terminal_block[0] = False
             else:
-                msg = f"{emoji} {tool_name}..."
+                messages = [f"{emoji} {tool_name}..."]
                 last_was_terminal_block[0] = False
             
             # Dedup: collapse consecutive identical progress messages.
             # Common with execute_code where models iterate with the same
             # code (same boilerplate imports → identical previews).
-            if msg == last_progress_msg[0]:
-                repeat_count[0] += 1
-                # Update the last line in progress_lines with a counter
-                # via a special "dedup" queue message.
-                progress_queue.put(("__dedup__", msg, repeat_count[0]))
-                return
-            last_progress_msg[0] = msg
-            repeat_count[0] = 0
-            
-            progress_queue.put(msg)
+            for msg in messages:
+                if msg == last_progress_msg[0]:
+                    repeat_count[0] += 1
+                    # Update the last line in progress_lines with a counter
+                    # via a special "dedup" queue message.
+                    progress_queue.put(("__dedup__", msg, repeat_count[0]))
+                    continue
+                last_progress_msg[0] = msg
+                repeat_count[0] = 0
+                progress_queue.put(msg)
         
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited.
@@ -21458,6 +21545,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
         async def send_progress_messages():
+            from agent.redact import sanitize_terminal_secret_text
+
             if not progress_queue:
                 return
 
@@ -21698,7 +21787,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _progress_text(progress_lines)
                         result = await _edit_progress_message(progress_msg_id, full_text)
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
@@ -21725,7 +21814,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 can_edit = False
                             _flood_result = await adapter.send(
                                 chat_id=source.chat_id,
-                                content=msg,
+                                content=sanitize_terminal_secret_text(str(msg)),
                                 reply_to=_progress_reply_to,
                                 metadata=_progress_metadata,
                             )
@@ -21738,7 +21827,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            full_text = _progress_text(progress_lines)
                             result = await adapter.send(
                                 chat_id=source.chat_id,
                                 content=full_text,
@@ -21749,7 +21838,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # Editing unsupported: send just this line
                             result = await adapter.send(
                                 chat_id=source.chat_id,
-                                content=msg,
+                                content=sanitize_terminal_secret_text(str(msg)),
                                 reply_to=_progress_reply_to,
                                 metadata=_progress_metadata,
                             )
@@ -21800,6 +21889,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Final edit with all remaining tools (only if editing works)
                     if can_edit and progress_lines and progress_msg_id:
                         await _roll_progress_overflow_if_needed()
+                    if can_edit and progress_lines and progress_msg_id is None:
+                        try:
+                            result = await _send_progress_text(
+                                _progress_text(progress_lines)
+                            )
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
+                        except Exception:
+                            pass
                     if can_edit and progress_lines and progress_msg_id:
                         full_text = _progress_text(progress_lines)
                         try:
@@ -22106,6 +22204,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 def _stream_delta_cb(text: str) -> None:
                     if _run_still_current():
                         _stts_consumer_ref.on_delta(text)
+            _pending_interim_sensitive_suffix = [""]
+            _pending_interim_lock = threading.Lock()
+
+            def _send_direct_interim(text: str, *, final: bool = False) -> None:
+                from agent.redact import (
+                    sanitize_terminal_secret_text,
+                    split_incomplete_sensitive_suffix,
+                )
+
+                if _stream_consumer is not None or not _status_adapter:
+                    return
+                with _pending_interim_lock:
+                    combined = _pending_interim_sensitive_suffix[0] + str(text or "")
+                    visible, _pending_interim_sensitive_suffix[0] = (
+                        split_incomplete_sensitive_suffix(
+                            combined,
+                            final=final,
+                            embedded_prefixes=False,
+                        )
+                    )
+                visible = sanitize_terminal_secret_text(visible)
+                if not visible.strip():
+                    return
+                safe_schedule_threadsafe(
+                    _status_adapter.send(
+                        _status_chat_id,
+                        visible,
+                        metadata=_status_thread_metadata,
+                    ),
+                    _loop_for_step,
+                    logger=logger,
+                    log_message="interim_assistant_callback scheduling error",
+                )
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
@@ -22119,16 +22250,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
                 if already_streamed or not _status_adapter or not str(display_text or "").strip():
                     return
-                safe_schedule_threadsafe(
-                    _status_adapter.send(
-                        _status_chat_id,
-                        display_text,
-                        metadata=_status_thread_metadata,
-                    ),
-                    _loop_for_step,
-                    logger=logger,
-                    log_message="interim_assistant_callback scheduling error",
+                _send_direct_interim(str(text))
+
+            def _merge_direct_interim_into_final(result: dict) -> None:
+                """Resolve one shared direct-commentary/final byte stream."""
+                from agent.redact import sanitize_terminal_secret_text
+
+                if _stream_consumer is not None:
+                    return
+                with _pending_interim_lock:
+                    pending = _pending_interim_sensitive_suffix[0]
+                    _pending_interim_sensitive_suffix[0] = ""
+                if not pending:
+                    return
+                combined = sanitize_terminal_secret_text(
+                    pending + str(result.get("final_response") or "")
                 )
+                if result.get("response_previewed"):
+                    # The agent says its final response is already represented
+                    # by the preview path, so resolve and deliver the retained
+                    # bytes there.  Leaving them only in final_response would
+                    # suppress the sole safe terminal egress.
+                    _send_direct_interim(combined, final=True)
+                else:
+                    result["final_response"] = combined
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
@@ -22977,7 +23122,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                try:
+                    result = agent.run_conversation(
+                        _api_run_message,
+                        **_conversation_kwargs,
+                    )
+                except BaseException:
+                    _send_direct_interim("", final=True)
+                    raise
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -22989,6 +23141,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+            _merge_direct_interim_into_final(result)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
@@ -24128,6 +24281,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
+                with _progress_secret_lock:
+                    _pending_progress_text = _progress_secret_state.flush()
+                    if (
+                        _pending_progress_text
+                        and _progress_pending_renderer[0] is not None
+                    ):
+                        _pending_progress_text = _progress_pending_renderer[0](
+                            _pending_progress_text
+                        )
+                if _pending_progress_text and _run_still_current():
+                    try:
+                        _progress_flush_adapter = self._adapter_for_source(
+                            source
+                        )
+                        if _progress_flush_adapter is not None:
+                            _flush_result = await _progress_flush_adapter.send(
+                                chat_id=source.chat_id,
+                                content=_pending_progress_text,
+                                reply_to=_progress_reply_to,
+                                metadata=_progress_metadata,
+                            )
+                            if (
+                                _cleanup_progress
+                                and getattr(_flush_result, "success", False)
+                                and getattr(_flush_result, "message_id", None)
+                            ):
+                                _cleanup_msg_ids.append(
+                                    str(_flush_result.message_id)
+                                )
+                    except Exception:
+                        logger.debug(
+                            "terminal progress-secret flush failed",
+                            exc_info=True,
+                        )
                 progress_task.cancel()
             if log_task:
                 log_task.cancel()
