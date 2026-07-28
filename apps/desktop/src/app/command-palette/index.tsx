@@ -313,6 +313,7 @@ export function CommandPalette() {
   const { availableThemes, mode, resolvedMode, setMode, setTheme, themeName } = useTheme()
   const [search, setSearch] = useState('')
   const [page, setPage] = useState<string | null>(null)
+  const previousFocusRef = useRef<HTMLElement | null>(null)
 
   // cmdk's onSelect doesn't forward the triggering event — keep the last
   // click/keydown modifiers so session rows can honour ⌘-Enter / ⌘-click.
@@ -930,6 +931,19 @@ export function CommandPalette() {
             HUD_SURFACE,
             'z-(--z-over-modal-content) w-[min(34rem,calc(100vw-2rem))] overflow-hidden duration-150 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:slide-in-from-top-2 data-[state=open]:zoom-in-95'
           )}
+          onCloseAutoFocus={event => {
+            const previousFocus = previousFocusRef.current
+
+            previousFocusRef.current = null
+
+            if (previousFocus?.isConnected) {
+              event.preventDefault()
+              previousFocus.focus({ preventScroll: true })
+            }
+          }}
+          onOpenAutoFocus={() => {
+            previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+          }}
         >
           <DialogPrimitive.Title className="sr-only">{t.commandCenter.paletteTitle}</DialogPrimitive.Title>
           <Command className="bg-transparent" loop shouldFilter={false}>
