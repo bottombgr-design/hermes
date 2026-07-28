@@ -21,6 +21,7 @@ import pytest
 import gateway.run as gateway_run
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.restart import EXTERNAL_GATEWAY_SUPERVISOR_ENV
+from gateway.slash_commands import _RestartTransaction
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -41,8 +42,18 @@ def _make_runner_with_mock_restart(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
     monkeypatch.delenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV, raising=False)
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
     return runner
+
+
+def _assert_restart_args(runner, detached: bool, via_service: bool):
+    runner.request_restart.assert_called_once()
+    kw = runner.request_restart.call_args.kwargs
+    assert kw.get("detached") is detached
+    assert kw.get("via_service") is via_service
+    assert kw.get("transaction") is not None
+    assert isinstance(kw.get("transaction"), _RestartTransaction)
+    assert kw.get("transaction").request_id.startswith("req-")
 
 
 @pytest.mark.asyncio
@@ -53,7 +64,7 @@ async def test_restart_under_launchd_uses_service_path(tmp_path, monkeypatch):
 
     await runner._handle_restart_command(_make_restart_event())
 
-    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
+    _assert_restart_args(runner, detached=False, via_service=True)
 
 
 @pytest.mark.asyncio
@@ -64,7 +75,7 @@ async def test_restart_in_interactive_macos_shell_uses_detached_path(tmp_path, m
 
     await runner._handle_restart_command(_make_restart_event())
 
-    runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+    _assert_restart_args(runner, detached=True, via_service=False)
 
 
 @pytest.mark.asyncio
@@ -74,7 +85,7 @@ async def test_restart_without_service_env_uses_detached_path(tmp_path, monkeypa
 
     await runner._handle_restart_command(_make_restart_event())
 
-    runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+    _assert_restart_args(runner, detached=True, via_service=False)
 
 
 @pytest.mark.asyncio
@@ -85,7 +96,7 @@ async def test_restart_under_systemd_uses_service_path(tmp_path, monkeypatch):
 
     await runner._handle_restart_command(_make_restart_event())
 
-    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
+    _assert_restart_args(runner, detached=False, via_service=True)
 
 
 @pytest.mark.asyncio
@@ -98,7 +109,7 @@ async def test_restart_with_external_supervisor_marker_uses_service_path(
 
     await runner._handle_restart_command(_make_restart_event())
 
-    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
+    _assert_restart_args(runner, detached=False, via_service=True)
 
 
 @pytest.mark.asyncio
@@ -111,4 +122,4 @@ async def test_false_external_supervisor_marker_keeps_detached_path(
 
     await runner._handle_restart_command(_make_restart_event())
 
-    runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+    _assert_restart_args(runner, detached=True, via_service=False)

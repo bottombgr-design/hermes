@@ -5,6 +5,7 @@ with a network error, Telegram re-delivers the `/restart` message to the new
 gateway process.  Without a dedup guard, the new gateway would process
 `/restart` again and immediately restart — a self-perpetuating loop.
 """
+import asyncio
 import json
 import time
 from unittest.mock import MagicMock
@@ -33,7 +34,7 @@ async def test_restart_handler_writes_dedup_marker_with_update_id(tmp_path, monk
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    runner._gateway_loop = asyncio.get_running_loop()
 
     event = _make_restart_event(update_id=12345)
     result = await runner._handle_restart_command(event)
@@ -111,7 +112,7 @@ async def test_fresh_restart_with_higher_update_id_is_processed(tmp_path, monkey
     }))
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     event = _make_restart_event(update_id=12346)  # strictly higher → fresh
     result = await runner._handle_restart_command(event)
@@ -138,7 +139,7 @@ async def test_stale_marker_older_than_5min_does_not_block(tmp_path, monkeypatch
     }))
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     # Same update_id as the stale marker, but the marker is too old to trust
     event = _make_restart_event(update_id=12345)
@@ -192,7 +193,7 @@ async def test_no_marker_file_allows_restart(tmp_path, monkeypatch):
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     event = _make_restart_event(update_id=100)
     result = await runner._handle_restart_command(event)
@@ -211,7 +212,7 @@ async def test_corrupt_marker_file_is_treated_as_absent(tmp_path, monkeypatch):
     marker.write_text("not-json{")
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     event = _make_restart_event(update_id=100)
     result = await runner._handle_restart_command(event)
@@ -234,7 +235,7 @@ async def test_event_without_update_id_bypasses_dedup(tmp_path, monkeypatch):
     }))
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     # No update_id — the dedup check should NOT kick in
     event = _make_restart_event(update_id=None)
@@ -261,7 +262,7 @@ async def test_different_platform_bypasses_dedup(tmp_path, monkeypatch):
     }))
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     # /restart from Discord — not a redelivery candidate
     discord_source = SessionSource(
@@ -296,7 +297,7 @@ async def test_marker_missing_but_booted_from_restart_ignores_redelivery(tmp_pat
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
     runner._booted_from_restart = True
     runner._startup_time = time.time()
 
@@ -321,7 +322,7 @@ async def test_marker_missing_fresh_boot_allows_restart(tmp_path, monkeypatch):
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
     runner._booted_from_restart = False
     runner._startup_time = time.time()
 
@@ -343,7 +344,7 @@ async def test_marker_missing_booted_from_restart_but_old_process_allows(tmp_pat
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
     runner._booted_from_restart = True
     runner._startup_time = time.time() - 120  # well past the 60s window
 

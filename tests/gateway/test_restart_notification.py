@@ -10,6 +10,7 @@ import gateway.run as gateway_run
 from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import build_session_key
+from gateway.slash_commands import _RestartTransaction
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
@@ -54,7 +55,7 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     source = make_restart_source(chat_id="42")
     event = MessageEvent(
@@ -84,7 +85,7 @@ async def test_relay_restart_command_persists_authenticated_routing_provenance(
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
     source = make_restart_source(chat_id="D123")
     source.platform = Platform.SLACK
     source.user_id = "U123"
@@ -113,7 +114,7 @@ async def test_restart_command_uses_service_restart_under_systemd(tmp_path, monk
     monkeypatch.setenv("INVOCATION_ID", "abc123")
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     source = make_restart_source(chat_id="42")
     event = MessageEvent(
@@ -124,7 +125,13 @@ async def test_restart_command_uses_service_restart_under_systemd(tmp_path, monk
     )
 
     await runner._handle_restart_command(event)
-    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
+    runner.request_restart.assert_called_once()
+    _kw = runner.request_restart.call_args.kwargs
+    assert _kw.get("detached") is False
+    assert _kw.get("via_service") is True
+    assert _kw.get("transaction") is not None
+    assert isinstance(_kw.get("transaction"), _RestartTransaction)
+    assert _kw.get("transaction").request_id.startswith("req-")
 
 
 @pytest.mark.asyncio
@@ -134,7 +141,7 @@ async def test_restart_command_uses_detached_without_systemd(tmp_path, monkeypat
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     source = make_restart_source(chat_id="42")
     event = MessageEvent(
@@ -145,7 +152,13 @@ async def test_restart_command_uses_detached_without_systemd(tmp_path, monkeypat
     )
 
     await runner._handle_restart_command(event)
-    runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+    runner.request_restart.assert_called_once()
+    _kw = runner.request_restart.call_args.kwargs
+    assert _kw.get("detached") is True
+    assert _kw.get("via_service") is False
+    assert _kw.get("transaction") is not None
+    assert isinstance(_kw.get("transaction"), _RestartTransaction)
+    assert _kw.get("transaction").request_id.startswith("req-")
 
 
 @pytest.mark.asyncio
@@ -154,7 +167,7 @@ async def test_restart_command_preserves_thread_id(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     source = make_restart_source(chat_id="99", thread_id="777")
 
@@ -189,7 +202,7 @@ async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path
     monkeypatch.setattr(gateway_run, "atomic_json_write", _fake_atomic_json_write)
 
     runner, _adapter = make_restart_runner()
-    runner.request_restart = MagicMock(return_value=True)
+    # runner.request_restart uses real method from make_restart_runner
 
     source = make_restart_source(chat_id="42")
     event = MessageEvent(
