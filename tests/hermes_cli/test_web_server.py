@@ -2824,26 +2824,28 @@ class TestWebServerEndpoints:
         web_server._ACTION_COMMANDS.pop("gateway-restart", None)
         web_server._ACTION_IDEMPOTENCY_KEYS.pop("gateway-restart", None)
 
-        first = self.client.post(
-            "/api/gateway/restart",
-            json=_service_mutation_body("RESTART", "same"),
-        )
-        repeated = self.client.post(
-            "/api/gateway/restart",
-            json=_service_mutation_body("RESTART", "same"),
-        )
-        conflicting = self.client.post(
-            "/api/gateway/restart",
-            json=_service_mutation_body("RESTART", "different"),
-        )
+        try:
+            first = self.client.post(
+                "/api/gateway/restart",
+                json=_service_mutation_body("RESTART", "same"),
+            )
+            repeated = self.client.post(
+                "/api/gateway/restart",
+                json=_service_mutation_body("RESTART", "same"),
+            )
+            conflicting = self.client.post(
+                "/api/gateway/restart",
+                json=_service_mutation_body("RESTART", "different"),
+            )
 
-        assert first.status_code == 200
-        assert repeated.status_code == 200
-        assert conflicting.status_code == 409
-        assert calls == [(["gateway", "restart"], "gateway-restart")]
-        web_server._ACTION_PROCS.pop("gateway-restart", None)
-        web_server._ACTION_COMMANDS.pop("gateway-restart", None)
-        web_server._ACTION_IDEMPOTENCY_KEYS.pop("gateway-restart", None)
+            assert first.status_code == 200
+            assert repeated.status_code == 200
+            assert conflicting.status_code == 409
+            assert calls == [(["gateway", "restart"], "gateway-restart")]
+        finally:
+            web_server._ACTION_PROCS.pop("gateway-restart", None)
+            web_server._ACTION_COMMANDS.pop("gateway-restart", None)
+            web_server._ACTION_IDEMPOTENCY_KEYS.pop("gateway-restart", None)
 
     def test_action_status_reaps_completed_process(self, monkeypatch):
         import hermes_cli.web_server as web_server
