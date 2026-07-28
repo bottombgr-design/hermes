@@ -2000,7 +2000,7 @@ class TestLastPromptTokens:
         assert entry.last_prompt_tokens == 0
 
     def test_session_entry_roundtrip(self):
-        """last_prompt_tokens should survive serialization/deserialization."""
+        """Context measurements should survive serialization/deserialization."""
         from gateway.session import SessionEntry
         from datetime import datetime
         entry = SessionEntry(
@@ -2009,11 +2009,14 @@ class TestLastPromptTokens:
             created_at=datetime.now(),
             updated_at=datetime.now(),
             last_prompt_tokens=42000,
+            last_input_budget_tokens=500000,
         )
         d = entry.to_dict()
         assert d["last_prompt_tokens"] == 42000
+        assert d["last_input_budget_tokens"] == 500000
         restored = SessionEntry.from_dict(d)
         assert restored.last_prompt_tokens == 42000
+        assert restored.last_input_budget_tokens == 500000
 
     def test_session_entry_from_old_data(self):
         """Old session data without last_prompt_tokens should default to 0."""
@@ -2030,6 +2033,7 @@ class TestLastPromptTokens:
         }
         entry = SessionEntry.from_dict(data)
         assert entry.last_prompt_tokens == 0
+        assert entry.last_input_budget_tokens == 0
 
     def test_update_session_sets_last_prompt_tokens(self, tmp_path):
         """update_session should store the actual prompt token count."""
@@ -2050,8 +2054,13 @@ class TestLastPromptTokens:
         )
         store._entries = {"k1": entry}
 
-        store.update_session("k1", last_prompt_tokens=85000)
+        store.update_session(
+            "k1",
+            last_prompt_tokens=85000,
+            last_input_budget_tokens=480000,
+        )
         assert entry.last_prompt_tokens == 85000
+        assert entry.last_input_budget_tokens == 480000
 
     def test_update_session_none_does_not_change(self, tmp_path):
         """update_session with default (None) should not change last_prompt_tokens."""
@@ -2070,11 +2079,13 @@ class TestLastPromptTokens:
             created_at=datetime.now(),
             updated_at=datetime.now(),
             last_prompt_tokens=50000,
+            last_input_budget_tokens=480000,
         )
         store._entries = {"k1": entry}
 
         store.update_session("k1")  # No last_prompt_tokens arg
         assert entry.last_prompt_tokens == 50000  # unchanged
+        assert entry.last_input_budget_tokens == 480000
 
     def test_update_session_zero_resets(self, tmp_path):
         """update_session with last_prompt_tokens=0 should reset the field."""

@@ -76,3 +76,21 @@ def test_funnel_also_clears_boundary_security_state():
     assert OTHER in runner._pending_approvals
     assert KEY not in runner._update_prompt_pending
     assert KEY not in runner._pending_skills_reload_notes
+
+
+def test_context_segment_boundary_preserves_conversation_state():
+    runner = _bare_runner()
+    runner._pending_approvals = {KEY: {"cmd": "danger"}, OTHER: {}}
+    runner._update_prompt_pending = {KEY: True}
+
+    runner._clear_context_segment_scope(KEY)
+
+    for attr in _CONVERSATION_SCOPED_STATE:
+        store = getattr(runner, attr)
+        if attr == "_pending_turn_sidecar_notes":
+            assert KEY not in store
+        else:
+            assert KEY in store, f"{attr} lost across context rollover"
+        assert OTHER in store
+    assert KEY not in runner._pending_approvals
+    assert KEY not in runner._update_prompt_pending
