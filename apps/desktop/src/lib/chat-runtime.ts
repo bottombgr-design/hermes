@@ -5,6 +5,7 @@ import type { ClientSessionState, CommandDispatchResponse } from '@/app/types'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { type ChatMessage, type ChatMessagePart, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalize } from '@/lib/text'
+import { coerceTimestampDate } from '@/lib/time'
 import type { ComposerAttachment } from '@/store/composer'
 import type { ModelOptionsResponse, SessionInfo } from '@/types/hermes'
 
@@ -372,9 +373,11 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
   const role =
     message.role === 'user' || message.role === 'assistant' || message.role === 'system' ? message.role : 'assistant'
 
-  const createdAt = message.timestamp
-    ? new Date(message.timestamp * 1000)
-    : new Date(Number(message.id.match(/\d+/)?.[0]) || Date.now())
+  // Synthetic live ids may carry a Unix timestamp as a complete dash-delimited
+  // token. Ignore arbitrary digits in session ids (`rt9`, counters, etc.) so
+  // they cannot turn into plausible-looking dates near the Unix epoch.
+  const idTimestamp = message.id.match(/(?:^|-)(\d{13}|\d{10})(?=-|$)/)?.[1]
+  const createdAt = coerceTimestampDate(message.timestamp ?? idTimestamp) ?? new Date()
 
   if (role === 'user') {
     return {

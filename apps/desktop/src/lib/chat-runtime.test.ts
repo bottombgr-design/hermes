@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import type { ComposerAttachment } from '@/store/composer'
 
@@ -8,7 +8,8 @@ import {
   coerceThinkingText,
   optimisticAttachmentRef,
   parseCommandDispatch,
-  parseSlashCommand
+  parseSlashCommand,
+  toRuntimeMessage
 } from './chat-runtime'
 
 const DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANS'
@@ -83,6 +84,49 @@ describe('coerceThinkingText', () => {
         "◉_◉ processing... I don't see any current rewritten thinking or next thinking to process. Could you provide the thinking content you'd like me to rewrite?"
       )
     ).toBe('')
+  })
+})
+
+describe('toRuntimeMessage timestamps', () => {
+  it('uses the millisecond timestamp embedded in a live stream id', () => {
+    const createdAt = 1_785_064_294_529
+
+    const message = toRuntimeMessage({
+      id: `assistant-stream-${createdAt}-1`,
+      parts: [],
+      role: 'assistant'
+    })
+
+    expect(message.createdAt.getTime()).toBe(createdAt)
+  })
+
+  it('uses a Unix-seconds token embedded in a synthetic id', () => {
+    const message = toRuntimeMessage({
+      id: 'assistant-stream-1785064294-1',
+      parts: [],
+      role: 'assistant'
+    })
+
+    expect(message.createdAt.getTime()).toBe(1_785_064_294_000)
+  })
+
+  it('ignores non-timestamp digits in a synthetic id', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-26T13:30:00.000Z'))
+
+    try {
+      const message = toRuntimeMessage({ id: 'assistant-stream-rt9', parts: [], role: 'assistant' })
+
+      expect(message.createdAt.toISOString()).toBe('2026-07-26T13:30:00.000Z')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('converts persisted Unix seconds to milliseconds', () => {
+    const message = toRuntimeMessage({ id: 'stored-1', parts: [], role: 'assistant', timestamp: 1_785_064_294 })
+
+    expect(message.createdAt.getTime()).toBe(1_785_064_294_000)
   })
 })
 
