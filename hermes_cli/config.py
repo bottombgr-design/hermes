@@ -3064,6 +3064,18 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Verified-blocker rule (Article XII P5 + XIV P2): when true,
+        # ``block_task()`` requires an ``evidence`` field on non-dependency
+        # blocks. An agent cannot transition a task to ``blocked`` on a
+        # hypothetical or unverified condition — the falsification record
+        # (the command/observation that established the blocker is real)
+        # is structurally required. Prevents the 2026-07-19 incident class
+        # ("Blocked on SSH key" while the key was loadable). Off by default
+        # so existing code and tests are not broken; production deployments
+        # enable it explicitly. Dependency blocks and system-generated
+        # circuit-breaker blocks are exempt (the latter carries
+        # ``last_failure_error`` as its own evidence).
+        "require_block_evidence": False,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
