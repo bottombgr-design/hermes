@@ -147,6 +147,30 @@ def test_file_mutation_lint_error_result_is_not_a_tool_failure():
     assert classify_tool_failure("patch", patch_result) == (False, "")
 
 
+def test_mcp_wrapped_application_error_counts_as_guardrail_failure():
+    wrapped = json.dumps(
+        {
+            "result": json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "duplicate_artifact",
+                        "message": "generated artifact was already processed",
+                        "retryable": True,
+                    },
+                }
+            )
+        }
+    )
+
+    failed, suffix = classify_tool_failure(
+        "mcp_example_materialize_artifact", wrapped
+    )
+
+    assert failed is True
+    assert "already processed" in suffix
+
+
 def test_same_tool_varying_args_warns_by_default_without_halting():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(same_tool_failure_warn_after=2, same_tool_failure_halt_after=3)
