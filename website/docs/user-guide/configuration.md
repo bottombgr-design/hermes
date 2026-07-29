@@ -114,11 +114,11 @@ Before that stash step, Hermes also restores tracked `package-lock.json` diffs l
 
 ## Terminal Backend Configuration
 
-Hermes supports six terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, or a Singularity/Apptainer container.
+Hermes supports seven terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a POSIX or Windows host via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, or a Singularity/Apptainer container.
 
 ```yaml
 terminal:
-  backend: local    # local | docker | ssh | modal | daytona | singularity
+  backend: local    # local | docker | ssh | ssh_pwsh | modal | daytona | singularity
   cwd: "."          # Gateway/cron working directory (CLI always uses launch dir)
   timeout: 180      # Per-command timeout in seconds
   home_mode: auto   # auto | real | profile — subprocess HOME policy
@@ -136,7 +136,8 @@ For cloud sandboxes such as Modal and Daytona, `container_persistent: true` mean
 |---------|-------------------|-----------|----------|
 | **local** | Your machine directly | None | Development, personal use |
 | **docker** | Single persistent Docker container (shared across session, `/new`, subagents) | Full (namespaces, cap-drop) | Safe sandboxing, CI/CD |
-| **ssh** | Remote server via SSH | Network boundary | Remote dev, powerful hardware |
+| **ssh** | POSIX remote via SSH and Bash | Network boundary | Linux/macOS remote development |
+| **ssh_pwsh** | Windows remote via SSH and PowerShell | Network boundary | Windows remote development |
 | **modal** | Modal cloud sandbox | Full (cloud VM) | Ephemeral cloud compute, evals |
 | **daytona** | Daytona workspace | Full (cloud container) | Managed cloud dev environments |
 | **singularity** | Singularity/Apptainer container | Namespaces (--containall) | HPC clusters, shared machines |
@@ -311,9 +312,16 @@ Every key under `terminal:` has an env-var override of the form `TERMINAL_<KEY_U
 | `TERMINAL_TIMEOUT` | `timeout` | Per-command timeout |
 | `HERMES_DOCKER_BINARY` | _none_ | Force a specific docker/podman binary path |
 
-### SSH Backend
+### SSH Backends
 
-Runs commands on a remote server over SSH. Uses ControlMaster for connection reuse (5-minute idle keepalive). Persistent shell is enabled by default — state (cwd, env vars) survives across commands.
+Hermes provides two SSH backends that share the same connection settings:
+
+- `ssh` runs commands through Bash on a POSIX remote.
+- `ssh_pwsh` runs commands through PowerShell on a Windows remote.
+
+Both use ControlMaster for connection reuse (5-minute idle keepalive) and preserve command state such as cwd and environment variables.
+
+#### POSIX SSH (`ssh`)
 
 ```yaml
 terminal:
@@ -337,6 +345,18 @@ TERMINAL_SSH_USER=ubuntu
 | `TERMINAL_SSH_PERSISTENT` | `true` | Enable persistent shell |
 
 **How it works:** Connects at init time with `BatchMode=yes` and `StrictHostKeyChecking=accept-new`. Persistent shell keeps a single `bash -l` process alive on the remote host, communicating via temporary files. Commands that need `stdin_data` or `sudo` automatically fall back to one-shot mode.
+
+#### Windows PowerShell SSH (`ssh_pwsh`)
+
+```yaml
+terminal:
+  backend: ssh_pwsh
+  cwd: "~"                         # Remote Windows user profile
+```
+
+This backend uses the same `TERMINAL_SSH_HOST`, `TERMINAL_SSH_USER`, `TERMINAL_SSH_PORT`, and `TERMINAL_SSH_KEY` settings shown above. The remote must run OpenSSH Server and provide either PowerShell 7 (`pwsh`) or Windows PowerShell 5 or later (`powershell`).
+
+Commands are sent with PowerShell `-EncodedCommand`, so they are not interpreted by the remote `cmd.exe` shell. `~` and `~/...` refer to the remote Windows user's profile. Files required by remote execution (credentials, skills, and caches) are uploaded in a zip archive under `%USERPROFILE%\.hermes`; the full local Hermes home is not copied, and remote changes are not synchronized back automatically.
 
 ### Modal Backend
 
