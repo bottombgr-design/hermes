@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildGroups, firstVisibleGroupIndex, isVirtualizedGroup, LIVE_TAIL_GROUPS, type MessageGroup } from './list'
+import {
+  buildGroups,
+  firstVisibleGroupIndex,
+  isVirtualizedGroup,
+  LIVE_TAIL_GROUPS,
+  type MessageGroup,
+  scrollLatestTurnStartIntoView
+} from './list'
 
 // Signature rows are `${index}:${id}:${role}:${weight}` (see the useAuiState
 // selector in list.tsx).
@@ -108,5 +115,32 @@ describe('isVirtualizedGroup', () => {
   it('honors a custom tail size', () => {
     expect(isVirtualizedGroup(5, 10, 3)).toBe(true)
     expect(isVirtualizedGroup(7, 10, 3)).toBe(false)
+  })
+})
+
+describe('scrollLatestTurnStartIntoView', () => {
+  it('scrolls the viewport to the start of the newest user/assistant turn instead of the bottom', () => {
+    const viewport = document.createElement('div')
+    const oldTurn = document.createElement('div')
+    const latestTurn = document.createElement('div')
+
+    oldTurn.setAttribute('data-slot', 'aui_turn-pair')
+    latestTurn.setAttribute('data-slot', 'aui_turn-pair')
+    viewport.append(oldTurn, latestTurn)
+    viewport.scrollTop = 500
+
+    viewport.getBoundingClientRect = () => ({ top: 100 }) as DOMRect
+    latestTurn.getBoundingClientRect = () => ({ top: 420 }) as DOMRect
+
+    expect(scrollLatestTurnStartIntoView(viewport)).toBe(true)
+    expect(viewport.scrollTop).toBe(812)
+  })
+
+  it('does nothing when no turn container has rendered yet', () => {
+    const viewport = document.createElement('div')
+    viewport.scrollTop = 250
+
+    expect(scrollLatestTurnStartIntoView(viewport)).toBe(false)
+    expect(viewport.scrollTop).toBe(250)
   })
 })
