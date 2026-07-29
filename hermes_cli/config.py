@@ -1492,6 +1492,18 @@ DEFAULT_CONFIG = {
                                       # episodic break instead of a tiny break every
                                       # tool iteration. 0 = commit any non-zero prune.
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
+        # Absolute token count at which the gateway nudges the user to rotate
+        # the session (0 = off). Chat surfaces show no context meter, so a
+        # 400k thread looks like a 40k one; a ratio of the context window is
+        # useless here because 95% of a 1M model is 950k. Opt-in, cooldowned.
+        #
+        # Pick a value ABOVE where `threshold` compaction fires, not below it.
+        # The hint means "compaction has already engaged and this session is
+        # still large, so rotating is now your call" — firing earlier than the
+        # automation just nags about something already being handled. On a
+        # 500K-window model with threshold 0.5 (compacts at ~250K), ~300K is a
+        # sensible hint; ~150K produces regular noise.
+        "rotate_hint_tokens": 0,
         "hygiene_timeout_seconds": 30,  # max seconds gateway waits for pre-agent hygiene compression
                                       # WITHOUT forward progress. The summary call streams, so
                                       # this is an inactivity budget: a slow model still
