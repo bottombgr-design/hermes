@@ -167,6 +167,9 @@ _RATE_LIMIT_PATTERNS = [
     # BEFORE _CONTEXT_OVERFLOW_PATTERNS in the message-only path, so the
     # throttle wins.  (port of anomalyco/opencode#37848's exclusion guard)
     "throttling",
+    # NVIDIA / OpenRouter per-worker quota errors (#73391)
+    "worker local total request limit",
+    "resource exhausted",
 ]
 
 # Patterns that indicate provider-side overload, NOT a per-credential rate
@@ -1448,6 +1451,7 @@ def _classify_by_error_code(
             FailoverReason.rate_limit,
             retryable=True,
             should_rotate_credential=True,
+            should_fallback=True,
         )
 
     if code_lower in _BILLING_ERROR_CODES:
