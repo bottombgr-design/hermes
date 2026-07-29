@@ -113,6 +113,28 @@ class TestAnthropicTransport:
         assert result[0]["name"] == "test_tool"
         assert "input_schema" in result[0]
 
+    def test_request_extra_body_merges_with_anthropic_generated_fields(
+        self, transport, monkeypatch
+    ):
+        """Model config can add a nested body field without dropping fast mode."""
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.build_anthropic_kwargs",
+            lambda **_kwargs: {"extra_body": {"options": {"server": True}, "speed": "fast"}},
+        )
+
+        kwargs = transport.build_kwargs(
+            model="claude-opus-4-6",
+            messages=[],
+            request_overrides={
+                "extra_body": {"options": {"seed": 42}}
+            },
+        )
+
+        assert kwargs["extra_body"] == {
+            "options": {"server": True, "seed": 42},
+            "speed": "fast",
+        }
+
     def test_validate_response_none(self, transport):
         assert transport.validate_response(None) is False
 

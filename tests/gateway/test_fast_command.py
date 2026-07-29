@@ -142,6 +142,33 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
     assert route["request_overrides"] == {}
 
 
+def test_turn_route_carries_runtime_request_overrides():
+    """Model-level request fields survive gateway route construction."""
+    runner = _make_runner()
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "http://localhost:11434/v1",
+        "provider": "custom",
+        "requested_provider": "custom:ollama",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+        "max_tokens": None,
+        "request_overrides": {
+            "extra_body": {"options": {"seed": 42}}
+        },
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner, "hi", "llama3.1", runtime_kwargs
+    )
+
+    assert route["request_overrides"] == {
+        "extra_body": {"options": {"seed": 42}}
+    }
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_session_scoped_by_default(monkeypatch, tmp_path):
     """Bare /fast fast applies a session override — config.yaml untouched."""
@@ -234,6 +261,7 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
             "api_mode": "chat_completions",
             "base_url": "https://openrouter.ai/api/v1",
             "api_key": "***",
+            "request_overrides": {"extra_body": {"options": {"seed": 42}}},
         },
     )
 
@@ -252,7 +280,10 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
 
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
-    assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+    assert _CapturingAgent.last_init["request_overrides"] == {
+        "extra_body": {"options": {"seed": 42}},
+        "service_tier": "priority",
+    }
 
 
 @pytest.mark.asyncio
