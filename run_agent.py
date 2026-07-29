@@ -441,6 +441,7 @@ class AIAgent:
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
+        allowed_tool_names: List[str] = None,
         save_trajectories: bool = False,
         verbose_logging: bool = False,
         quiet_mode: bool = False,
@@ -519,6 +520,7 @@ class AIAgent:
             tool_delay=tool_delay,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
+            allowed_tool_names=allowed_tool_names,
             save_trajectories=save_trajectories,
             verbose_logging=verbose_logging,
             quiet_mode=quiet_mode,
@@ -6924,6 +6926,7 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
+            read_only=function_args.get("read_only"),
             background=(not _is_subagent),
             parent_agent=self,
         )

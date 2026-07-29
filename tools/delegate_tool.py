@@ -55,6 +55,30 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
     ]
 )
 
+# Exact-name allowlist for runtime-enforced read-only delegations. Dual-use
+# surfaces (terminal, execute_code, browser_console, process, deferred MCP
+# bridges) are intentionally absent: prompt-only restrictions cannot make
+# those tools read-only.
+READ_ONLY_ALLOWED_TOOLS = frozenset(
+    {
+        "read_file",
+        "search_files",
+        "web_search",
+        "web_extract",
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_back",
+        "browser_scroll",
+        "browser_get_images",
+        "browser_vision",
+        "vision_analyze",
+        "video_analyze",
+        "session_search",
+        "skill_view",
+        "skills_list",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Subagent approval callbacks
@@ -793,6 +817,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    read_only: bool = False,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -814,6 +839,14 @@ def _build_child_system_prompt(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
+        )
+    if read_only:
+        parts.append(
+            "\n## READ-ONLY MODE (runtime-enforced)\n"
+            "You must not modify local files, repositories, processes, remote "
+            "systems, accounts, or external state. The runtime exposes only an "
+            "exact allowlist of read-only tools; do not claim writes or other "
+            "side effects. Report evidence and proposed changes instead."
         )
     parts.append(
         "\nComplete this task using the tools available to you. "
@@ -1213,6 +1246,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Runtime-enforced exact tool allowlist; also forces leaf role.
+    read_only: bool = False,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1235,7 +1270,13 @@ def _build_child_agent(
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
     max_spawn = _get_max_spawn_depth()
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
-    effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
+    # Read-only children are always leaves. Otherwise an orchestrator could
+    # escape the exact allowlist by spawning an unrestricted descendant.
+    effective_role = (
+        role
+        if (not read_only and role == "orchestrator" and orchestrator_ok)
+        else "leaf"
+    )
 
     # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
     # subagent_id is generated here so the progress callback, the
@@ -1322,6 +1363,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        read_only=read_only,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1517,6 +1559,9 @@ def _build_child_agent(
             fallback_model=parent_fallback,
             enabled_toolsets=child_toolsets,
             disabled_toolsets=child_disabled_toolsets,
+            allowed_tool_names=(
+                sorted(READ_ONLY_ALLOWED_TOOLS) if read_only else None
+            ),
             quiet_mode=True,
             ephemeral_system_prompt=child_prompt,
             log_prefix=f"[subagent-{task_index}]",
@@ -1558,8 +1603,9 @@ def _build_child_agent(
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the
-    # kill switch or depth bounded the caller's requested role).
+    # kill switch, depth bound, or read-only mode bounded the caller's role).
     child._delegate_role = effective_role
+    child._delegate_read_only = bool(read_only)
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -2421,6 +2467,7 @@ def _run_single_child(
             "semantic_status": (
                 "unverified" if status == "completed" else "not_applicable"
             ),
+            "read_only": bool(getattr(child, "_delegate_read_only", False)),
             "summary": summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
@@ -2827,6 +2874,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    read_only: Optional[bool] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2856,8 +2904,10 @@ def delegate_task(
             "(`p` in /agents) or the `delegation.pause` RPC before retrying."
         )
 
-    # Normalise the top-level role once; per-task overrides re-normalise.
+    # Normalise the top-level role and read-only default once; per-task
+    # overrides are resolved below.
     top_role = _normalize_role(role)
+    top_read_only = is_truthy_value(read_only, default=False)
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -2926,7 +2976,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [{
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "read_only": top_read_only,
+        }]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2983,9 +3038,13 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
-        # Per-task role beats top-level; normalise again so unknown
-        # per-task values warn and degrade to leaf uniformly.
+        # Per-task role and read-only values beat top-level defaults.
         effective_role = _normalize_role(t.get("role") or top_role)
+        effective_read_only = (
+            is_truthy_value(t.get("read_only"), default=False)
+            if "read_only" in t
+            else top_read_only
+        )
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -3006,6 +3065,7 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            read_only=effective_read_only,
         )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
@@ -3794,6 +3854,9 @@ def _build_top_level_description() -> str:
         "the child returned a non-empty handoff. It does NOT mean the claims, "
         "artifacts, or task outcome were semantically verified; completed "
         "entries therefore carry semantic_status='unverified'.\n"
+        "- Pass read_only=true for audits/research that must not mutate state. "
+        "This is runtime-enforced with an exact tool-name allowlist, blocks "
+        "dual-use execution/deferred tools, and forces the child to leaf role.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
         "delegate_task, clarify, memory, send_message.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
@@ -3931,6 +3994,13 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "read_only": {
+                            "type": "boolean",
+                            "description": (
+                                "Per-task runtime-enforced read-only mode. "
+                                "Overrides the top-level value."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3943,6 +4013,14 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "read_only": {
+                "type": "boolean",
+                "description": (
+                    "Runtime-enforced read-only mode. The child receives an "
+                    "exact allowlist of read-only tools and is forced to leaf "
+                    "role. Per-task values override this batch default."
+                ),
             },
             "background": {
                 "type": "boolean",
@@ -4015,6 +4093,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        read_only=args.get("read_only"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
