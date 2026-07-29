@@ -17,7 +17,15 @@ from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
+from hermes_cli.secret_validation import has_usable_secret
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
+from gateway.platform_configuration import (
+    BUILTIN_PLATFORM_SPECS,
+    StaticConfigurationState,
+    deep_merge,
+    evaluate_static_configuration,
+    load_static_platform_states,
+)
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -371,6 +379,63 @@ class Platform(Enum):
 # Snapshot of built-in platform values before any dynamic _missing_ lookups.
 # Used to distinguish real platforms from arbitrary strings.
 _BUILTIN_PLATFORM_VALUES = frozenset(m.value for m in Platform.__members__.values())
+
+
+def load_status_platform_states(
+    candidate_names: Any,
+) -> dict[str, StaticConfigurationState]:
+    """Classify persisted runtime names without resolving platform plugins.
+
+    Bundled platforms use the same pure specs as ``GatewayConfig``.  A
+    third-party platform can opt in by registering a complete declarative spec
+    on its ``PlatformEntry``; this lookup only inspects entries that are
+    already concrete and never runs deferred loaders or entry points.
+    """
+    candidates = tuple(
+        dict.fromkeys(
+            str(name).strip()
+            for name in candidate_names
+            if str(name).strip()
+        )
+    )
+    specs = dict(BUILTIN_PLATFORM_SPECS)
+    try:
+        from gateway.platform_registry import platform_registry
+
+        for name in candidates:
+            entry = platform_registry.get_concrete_entry(name)
+            if entry is None:
+                continue
+            if name in BUILTIN_PLATFORM_SPECS and not entry.readiness_trusted:
+                # An unbundled override may own the runtime adapter, but it
+                # cannot replace Hermes' trusted static contract on the
+                # import-free path. Dynamic verification belongs to Gateway.
+                specs.pop(name, None)
+            elif entry.static_configuration is None:
+                # A concrete third-party override owns this name but has not
+                # supplied enough pure metadata. Do not apply the unrelated
+                # shipped adapter's built-in contract.
+                specs.pop(name, None)
+            else:
+                specs[name] = entry.static_configuration
+    except Exception:
+        pass
+    return load_static_platform_states(
+        get_hermes_home(),
+        candidates,
+        specs=specs,
+        getenv=_getenv,
+    )
+
+
+def load_status_configured_platforms(candidate_names: Any) -> frozenset[str]:
+    """Return only candidates whose static configuration is proven."""
+    states = load_status_platform_states(candidate_names)
+    return frozenset(
+        name
+        for name, state in states.items()
+        if state is StaticConfigurationState.CONFIGURED
+    )
 
 
 # Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
@@ -812,13 +877,6 @@ class StreamingConfig:
         )
 
 
-# -----------------------------------------------------------------------------
-# Built-in platform connection checkers
-# -----------------------------------------------------------------------------
-# Each callable receives a ``PlatformConfig`` and returns ``True`` when the
-# platform is sufficiently configured to be considered "connected".  Platforms
-# that rely on the generic ``token or api_key`` check (Telegram, Discord,
-# Slack, Matrix, Mattermost, HomeAssistant) do not need an entry here.
 def _has_usable_api_server_key(key: object) -> bool:
     """True when API_SERVER_KEY is present and strong enough to be usable.
 
@@ -826,15 +884,11 @@ def _has_usable_api_server_key(key: object) -> bool:
     (``has_usable_secret`` with ``min_length=16``) so the platform is only
     enrolled at load time when the adapter would actually agree to start.
     """
-    if not key:
-        return False
-    try:
-        from hermes_cli.auth import has_usable_secret
-    except ImportError:
-        return len(str(key).strip()) >= 16
     return has_usable_secret(key, min_length=16)
 
 
+# Full Gateway enrollment predicates retained from the parent contract. The
+# readiness table deliberately does not participate in this decision.
 _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] = {
     Platform.WEIXIN: lambda cfg: bool(
         cfg.extra.get("account_id") and (cfg.token or cfg.extra.get("token"))
@@ -859,10 +913,6 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.YUANBAO: lambda cfg: bool(
         cfg.extra.get("app_id") and cfg.extra.get("app_secret")
     ),
-    # Relay dials OUT to a connector; it is "connected" once an endpoint URL is
-    # configured (extra["relay_url"] or extra["url"]). The capability descriptor
-    # is negotiated at handshake time, so the URL is the only config-level
-    # signal in the experimental phase. EXPERIMENTAL — may change.
     Platform.RELAY: lambda cfg: bool(
         cfg.extra.get("relay_url") or cfg.extra.get("url")
     ),
@@ -979,19 +1029,18 @@ class GatewayConfig:
 
     def _is_platform_connected(self, platform: Platform, config: PlatformConfig) -> bool:
         """Check whether a single platform is sufficiently configured."""
-        # Weixin requires both a token and an account_id (checked first so
-        # the generic token branch doesn't let it through without account_id).
+        # Keep the full Gateway lane compatible with the parent implementation.
+        # Static metadata is for import-free readiness only; it must never
+        # preempt these established enrollment predicates or plugin callbacks.
         if platform == Platform.WEIXIN:
             return bool(
                 config.extra.get("account_id")
                 and (config.token or config.extra.get("token"))
             )
 
-        # Generic token/api_key auth covers Telegram, Discord, Slack, etc.
         if config.token or config.api_key:
             return True
 
-        # Platform-specific check
         checker = _PLATFORM_CONNECTED_CHECKERS.get(platform)
         if checker is not None:
             return checker(config)
@@ -1266,6 +1315,16 @@ def load_gateway_config() -> GatewayConfig:
         try:
             with open(gateway_json_path, "r", encoding="utf-8") as f:
                 gw_data = json.load(f) or {}
+            legacy_platforms = gw_data.get("platforms")
+            if isinstance(legacy_platforms, dict):
+                for legacy_block in legacy_platforms.values():
+                    if not isinstance(legacy_block, dict) or "enabled" not in legacy_block:
+                        continue
+                    legacy_extra = legacy_block.setdefault("extra", {})
+                    if not isinstance(legacy_extra, dict):
+                        legacy_extra = {}
+                        legacy_block["extra"] = legacy_extra
+                    legacy_extra["_enabled_explicit"] = True
             logger.info(
                 "Loaded legacy %s — consider moving settings to config.yaml",
                 gateway_json_path,
@@ -1437,13 +1496,17 @@ def load_gateway_config() -> GatewayConfig:
                     existing = platforms_data.get(plat_name, {})
                     if not isinstance(existing, dict):
                         existing = {}
-                    # Deep-merge extra dicts so gateway.json defaults survive
-                    merged_extra = {**existing.get("extra", {}), **plat_block.get("extra", {})}
+                    # The full loader and import-free readiness share the same
+                    # recursive precedence semantics. Nested adapter settings
+                    # from gateway.json remain unless a higher source replaces
+                    # the exact leaf.
+                    merged = deep_merge(existing, plat_block)
                     if "enabled" in plat_block:
+                        merged_extra = merged.get("extra")
+                        if not isinstance(merged_extra, dict):
+                            merged_extra = {}
+                            merged["extra"] = merged_extra
                         merged_extra["_enabled_explicit"] = True
-                    merged = {**existing, **plat_block}
-                    if merged_extra:
-                        merged["extra"] = merged_extra
                     platforms_data[plat_name] = merged
 
             _merge_platform_map(gateway_platforms)
@@ -1738,6 +1801,21 @@ def load_gateway_config() -> GatewayConfig:
             _home / "config.yaml",
             e,
         )
+
+    # Platform-owned YAML bridges may have revisited a lower-precedence source
+    # while translating adapter settings. Re-anchor enable/disable provenance
+    # once, at the final raw-data boundary, so the effective merged declaration
+    # is what environment overrides must respect.
+    _final_platforms = gw_data.get("platforms")
+    if isinstance(_final_platforms, dict):
+        for _final_block in _final_platforms.values():
+            if not isinstance(_final_block, dict) or "enabled" not in _final_block:
+                continue
+            _final_extra = _final_block.setdefault("extra", {})
+            if not isinstance(_final_extra, dict):
+                _final_extra = {}
+                _final_block["extra"] = _final_extra
+            _final_extra["_enabled_explicit"] = True
 
     config = GatewayConfig.from_dict(gw_data)
 
@@ -2578,37 +2656,39 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             # enabled=True means the user wrote it themselves or another
             # env-var bridge enabled it — keep that decision).
             if existing_cfg is None or not existing_cfg.enabled:
-                if entry.is_connected is not None:
+                # Probe with ``enabled=True`` since the question is whether
+                # this candidate has enough evidence to be enabled.  Layer
+                # env-seeded extras onto a copy so the existing config is not
+                # mutated during classification.
+                if existing_cfg is not None:
+                    probe_cfg = PlatformConfig(
+                        enabled=True,
+                        token=existing_cfg.token,
+                        api_key=existing_cfg.api_key,
+                        extra=dict(existing_cfg.extra or {}),
+                    )
+                else:
+                    probe_cfg = PlatformConfig(enabled=True)
+                if isinstance(seed_for_probe, dict) and seed_for_probe:
+                    probe_extra = dict(probe_cfg.extra or {})
+                    for k, v in seed_for_probe.items():
+                        if k == "home_channel":
+                            continue
+                        probe_extra.setdefault(k, v)
+                    probe_cfg.extra = probe_extra
+
+                static_state = evaluate_static_configuration(
+                    probe_cfg,
+                    entry.static_configuration,
+                    getenv=_getenv,
+                    home=get_hermes_home(),
+                )
+                if static_state is not StaticConfigurationState.UNKNOWN:
+                    configured = (
+                        static_state is StaticConfigurationState.CONFIGURED
+                    )
+                elif entry.is_connected is not None:
                     try:
-                        # Probe with ``enabled=True`` since we're asking
-                        # "would this plugin BE configured if we enabled
-                        # it?" not "is it currently enabled?". Google
-                        # Chat's ``_is_connected`` short-circuits on
-                        # ``config.enabled`` being False, which on the
-                        # default ``PlatformConfig()`` would fail the
-                        # gate even with proper env vars set.
-                        if existing_cfg is not None:
-                            probe_cfg = existing_cfg
-                            if not probe_cfg.enabled:
-                                probe_cfg = PlatformConfig(
-                                    enabled=True,
-                                    extra=dict(probe_cfg.extra or {}),
-                                )
-                        else:
-                            probe_cfg = PlatformConfig(enabled=True)
-                        if isinstance(seed_for_probe, dict) and seed_for_probe:
-                            # Don't mutate ``existing_cfg``; the probe gets
-                            # a transient view with env-seeded extras layered
-                            # on top of whatever's already there.
-                            probe_extra = dict(getattr(probe_cfg, "extra", {}) or {})
-                            for k, v in seed_for_probe.items():
-                                if k == "home_channel":
-                                    continue
-                                probe_extra.setdefault(k, v)
-                            probe_cfg = PlatformConfig(
-                                enabled=True,
-                                extra=probe_extra,
-                            )
                         configured = bool(entry.is_connected(probe_cfg))
                     except Exception as exc:
                         logger.debug(
@@ -2616,13 +2696,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                             entry.name, exc,
                         )
                         configured = False
-                    if not configured:
-                        logger.debug(
-                            "Plugin platform '%s' available but not configured "
-                            "(is_connected returned False) — skipping enable",
-                            entry.name,
-                        )
-                        continue
+                else:
+                    # Parent contract: when neither static_configuration nor
+                    # is_connected is available, check_fn alone decides
+                    # enablement.  Do not tighten Gateway enrollment here.
+                    configured = None
+                if configured is False:
+                    logger.debug(
+                        "Plugin platform '%s' available but not statically "
+                        "configured — skipping enable",
+                        entry.name,
+                    )
+                    continue
             # Verify dependencies LAST — only for platforms that are already
             # enabled or passed the credential gate above.  For adapter plugins
             # ``check_fn`` lazy-INSTALLS the platform SDK (pip) as a side
