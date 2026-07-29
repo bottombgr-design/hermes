@@ -12,6 +12,7 @@ freshness check is a no-op and the OOM rebuild always runs.
 """
 
 import os
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -206,6 +207,10 @@ class TestWebUIBuildNeeded:
         assert _web_ui_build_needed(web_dir) is True
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only: tests use fcntl.flock and the .web_ui_build.lock helper, which Windows handles via msvcrt instead",
+)
 class TestBuildWebUISkipsWhenFresh:
 
     def test_skips_npm_when_dist_is_fresh(self, tmp_path):
@@ -491,6 +496,10 @@ class TestBuildWebUIRetryAndStaleFallback:
         assert "Run manually" in out
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only: tests use fcntl.flock for cross-process build serialization; Windows uses msvcrt locking",
+)
 class TestBuildWebUIFlock:
     """Cross-process build serialization (salvaged from PR #63455).
 
