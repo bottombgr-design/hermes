@@ -256,6 +256,39 @@ def test_builtin_compressor_carries_newest_count_across_rotation(tmp_path, monke
     assert db.get_compression_count("child") == 2
 
 
+def test_builtin_compressor_does_not_downgrade_newer_child_count_on_rotation(
+    tmp_path, monkeypatch,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("parent", source="acp")
+    db.set_compression_count("parent", 1)
+    db.create_session("child", source="acp", parent_session_id="parent")
+    db.set_compression_count("child", 4)
+    monkeypatch.setattr(
+        "agent.context_compressor.get_model_context_length",
+        lambda *_a, **_k: 100_000,
+    )
+    compressor = ContextCompressor(
+        model="fake-model",
+        threshold_percent=0.85,
+        protect_first_n=2,
+        protect_last_n=2,
+        quiet_mode=True,
+    )
+    compressor.bind_session_state(db, "parent")
+    compressor.compression_count = 2
+
+    compressor.on_session_start(
+        "child",
+        session_db=db,
+        boundary_reason="compression",
+        old_session_id="parent",
+    )
+
+    assert compressor.compression_count == 4
+    assert db.get_compression_count("child") == 4
+
+
 def test_update_from_response_forwards_canonical_cache_buckets():
     """conversation_loop passes cache_read/write/reasoning tokens to engine."""
     # Test the contract directly: a usage_dict built from CanonicalUsage must

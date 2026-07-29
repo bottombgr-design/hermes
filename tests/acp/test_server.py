@@ -42,6 +42,7 @@ from acp_adapter.server import (
     HERMES_VERSION,
 )
 from acp_adapter.session import SessionManager
+from agent.context_compressor import ContextCompressor
 from hermes_state import SessionDB
 
 
@@ -1977,22 +1978,33 @@ class TestSlashCommands:
         assert "cleared" in result.lower()
         assert len(state.history) == 0
 
-    def test_reset_persists_cleared_compression_count(self, agent, mock_manager):
+    def test_reset_persists_cleared_compression_count(
+        self, agent, mock_manager, tmp_path, monkeypatch,
+    ):
         state = self._make_state(mock_manager)
-        compressor = MagicMock()
-        compressor.compression_count = 2
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(state.session_id, source="acp")
+        db.set_compression_count(state.session_id, 2)
+        monkeypatch.setattr(
+            "agent.context_compressor.get_model_context_length",
+            lambda *_a, **_k: 100_000,
+        )
+        compressor = ContextCompressor(
+            model="fake-model",
+            threshold_percent=0.85,
+            protect_first_n=2,
+            protect_last_n=2,
+            quiet_mode=True,
+        )
+        compressor.bind_session_state(db, state.session_id)
         state.agent.context_compressor = compressor
-
-        def reset_state():
-            compressor.compression_count = 0
-
-        state.agent.reset_session_state = MagicMock(side_effect=reset_state)
+        state.agent.reset_session_state = MagicMock(side_effect=compressor.on_session_reset)
 
         result = agent._handle_slash_command("/reset", state)
 
         assert "cleared" in result.lower()
         assert compressor.compression_count == 0
-        compressor._persist_compression_count.assert_called_once_with()
+        assert db.get_compression_count(state.session_id) == 0
 
     def test_reset_resets_agent_session_state(self, agent, mock_manager):
         state = self._make_state(mock_manager)

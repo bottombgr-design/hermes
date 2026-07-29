@@ -1591,6 +1591,14 @@ class ContextCompressor(ContextEngine):
                     logger.debug("compression parent count lookup failed (non-sqlite): %s", exc)
         self.bind_session_state(session_db, session_id)
         if boundary_reason == "compression":
+            # A recovery path may re-adopt a child row that already has a
+            # newer durable count. Compression depth is monotonic within the
+            # logical conversation, so preserve the newest valid value from
+            # live state, the parent row, or the destination row.
+            previous_compression_count = max(
+                previous_compression_count,
+                self.compression_count,
+            )
             # Rotation creates a fresh child row before this callback. Preserve
             # the logical conversation's streak until boundary bookkeeping
             # persists the updated value onto the child row.
