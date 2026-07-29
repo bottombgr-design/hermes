@@ -18,7 +18,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
     """Patch the job pipeline primitives and record the call order."""
     calls = []
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, adapters=None, loop=None):
         calls.append(("run_job", job["id"]))
         fr = final if silent_marker_in is None else silent_marker_in
         return (success, output, fr, error)
@@ -103,7 +103,7 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
 def test_run_one_job_exception_marks_failure(monkeypatch):
     """If run_job raises, the helper marks the run failed and returns False
     rather than propagating."""
-    def boom(job, *, defer_agent_teardown=None):
+    def boom(job, *, defer_agent_teardown=None, adapters=None, loop=None):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(s, "run_job", boom)
@@ -136,7 +136,7 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
 
     scope_during_run = {}
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, adapters=None, loop=None):
         # This is where resolve_runtime_provider() would read a secret. Prove a
         # scope is installed and the profile's secret resolves without raising.
         scope_during_run["scope"] = ss.current_secret_scope()
@@ -192,7 +192,7 @@ def test_run_one_job_env_injected_credential_resolves_without_multiplex(
 
     observed = {}
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, adapters=None, loop=None):
         # This is where resolve_runtime_provider() reads the credential.
         observed["key"] = ss.get_secret("DEEPINFRA_API_KEY")
         # And a key that IS in .env must still resolve (scope stays useful).
@@ -239,7 +239,7 @@ def test_run_one_job_env_file_wins_over_environ_without_multiplex(
 
     observed = {}
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, adapters=None, loop=None):
         observed["key"] = ss.get_secret("DEEPINFRA_API_KEY")
         return (True, "out", "final", None)
 
@@ -274,7 +274,7 @@ def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
         def close(self):
             order.append("agent.close")
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, adapters=None, loop=None):
         order.append("run_job")
         # Mimic run_job's deferral contract: hand the live agent back so the
         # caller tears it down after delivery instead of in run_job's finally.
@@ -313,7 +313,7 @@ def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch)
         def close(self):
             order.append("agent.close")
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, adapters=None, loop=None):
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
@@ -348,7 +348,7 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
         def close(self):
             order.append("agent.close")
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, adapters=None, loop=None):
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
@@ -372,3 +372,25 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
     assert ok is False
     assert "deliver" not in order
     assert order == ["save-raise", "agent.close", "cleanup_stale"], order
+
+
+def test_run_one_job_forwards_adapters_and_loop_to_run_job(monkeypatch):
+    """run_one_job plumbs the gateway's live adapters/loop into run_job so a
+    cron.allow_clarify run can wire a clarify callback over the live delivery
+    adapter. Standalone `hermes cron run` passes neither (None)."""
+    seen = {}
+
+    def fake_run_job(job, *, defer_agent_teardown=None, adapters=None, loop=None):
+        seen["adapters"] = adapters
+        seen["loop"] = loop
+        return (True, "out", "final response", None)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "_deliver_result", lambda *a, **k: None)
+    monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
+
+    ok = s.run_one_job({"id": "j11", "name": "t"}, adapters="ADAPTERS", loop="LOOP")
+
+    assert ok is True
+    assert seen == {"adapters": "ADAPTERS", "loop": "LOOP"}
