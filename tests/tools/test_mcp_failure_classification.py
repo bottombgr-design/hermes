@@ -61,6 +61,14 @@ class TestUnwrapExceptionGroup:
         g = _group(_group(asyncio.CancelledError()), _group(real))
         assert _unwrap_exception_group(g) is real
 
+    def test_prefers_oauth_error_over_socket_teardown(self):
+        from mcp.client.auth import OAuthTokenError
+
+        auth_error = OAuthTokenError("invalid_client: bad secret")
+        group = _group(OSError("address already in use"), _group(auth_error))
+
+        assert _unwrap_exception_group(group) is auth_error
+
     def test_all_cancellation_returns_cancellation(self):
         g = _group(asyncio.CancelledError())
         assert isinstance(_unwrap_exception_group(g), asyncio.CancelledError)
