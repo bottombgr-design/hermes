@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -448,6 +449,7 @@ class TestGeneratedSystemdUnits:
         # KillMode=mixed is preserved so the gateway still reaps its own
         # tool-call children before systemd SIGKILLs the cgroup — #8202.
         assert "KillMode=mixed" in unit
+        assert f"LimitNOFILE={gateway_cli.GATEWAY_SERVICE_NOFILE_LIMIT}" in unit
 
     def test_user_unit_adds_cleanup_headroom_to_positive_drain_timeout(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 45)
@@ -558,6 +560,7 @@ class TestGeneratedSystemdUnits:
         # The default drain is immediate, so keep a bounded 60-second stop
         # budget without forcing every restart to wait 90 seconds.
         assert self._expected_timeout_stop_sec() in unit
+        assert f"LimitNOFILE={gateway_cli.GATEWAY_SERVICE_NOFILE_LIMIT}" in unit
         assert "WantedBy=multi-user.target" in unit
         # ExecStopPost reaps any process the gateway didn't clean up itself,
         # so long-lived helpers (e.g. adb) can't be left orphaned in the
@@ -567,6 +570,20 @@ class TestGeneratedSystemdUnits:
         # KillMode=mixed is preserved so the gateway still reaps its own
         # tool-call children before systemd SIGKILLs the cgroup — #8202.
         assert "KillMode=mixed" in unit
+
+
+class TestGeneratedLaunchdPlists:
+    def test_launchd_plist_sets_file_descriptor_limits(self):
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        assert (
+            plist["SoftResourceLimits"]["NumberOfFiles"]
+            == gateway_cli.GATEWAY_SERVICE_NOFILE_LIMIT
+        )
+        assert (
+            plist["HardResourceLimits"]["NumberOfFiles"]
+            == gateway_cli.GATEWAY_SERVICE_NOFILE_LIMIT
+        )
 
 
 class TestGatewayStopCleanup:
