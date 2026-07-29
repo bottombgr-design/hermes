@@ -568,6 +568,35 @@ class TestSessionOps:
         assert resp is None
 
     @pytest.mark.asyncio
+    async def test_load_session_sends_restored_usage_before_returning(
+        self, agent, mock_manager
+    ):
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+        state = mock_manager.create_session(cwd="/tmp")
+        state.history = [{"role": "user", "content": "restored turn"}]
+        state.agent.context_compressor = MagicMock(
+            context_length=272_000,
+            last_prompt_tokens=182_079,
+            compression_count=2,
+        )
+
+        await agent.load_session(cwd="/tmp", session_id=state.session_id)
+
+        usage_updates = [
+            call.kwargs["update"]
+            for call in mock_conn.session_update.await_args_list
+            if isinstance(call.kwargs.get("update"), UsageUpdate)
+        ]
+        assert len(usage_updates) == 1
+        assert usage_updates[0].used == 182_079
+        assert usage_updates[0].size == 272_000
+        assert usage_updates[0].field_meta == {
+            "hermes": {"compressionCount": 2}
+        }
+
+    @pytest.mark.asyncio
     async def test_load_session_replays_persisted_history_to_client(self, agent):
         mock_conn = MagicMock(spec=acp.Client)
         mock_conn.session_update = AsyncMock()

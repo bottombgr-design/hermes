@@ -1422,7 +1422,13 @@ class HermesACPAgent(acp.Agent):
                 exc_info=True,
             )
         self._schedule_available_commands_update(session_id)
-        self._schedule_usage_update(state)
+        # Unlike session/new, session/load already has a client-side routing
+        # binding before the request starts so replay notifications can be
+        # consumed. Publish restored context/compression telemetry in the same
+        # request lifetime; deferring it until after return can lose the update
+        # during transport/task handoff and leaves a resumed client stale until
+        # its first prompt.
+        await self._send_usage_update(state)
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
