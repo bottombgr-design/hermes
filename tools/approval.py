@@ -1103,6 +1103,39 @@ _SUDO_OPTIONS_WITH_ARG = {
     "-p", "--prompt",
     "-u", "--user",
 }
+# GNU env options whose value arrives as the NEXT word. Their operand is
+# data (`env --chdir /tmp/reboot /bin/echo` never executes reboot), so the
+# projection walker must not treat it as the command word. `=`-attached
+# forms are already handled by the generic option check. `-S/--split-string`
+# is listed here only for the walker's word skipping — its payload is
+# executable-bearing, but parsing it is a separate fail-closed change
+# (same verdict as the design review); skipping keeps parity with main.
+_ENV_OPTIONS_WITH_ARG = {
+    "-a", "--argv0",
+    "-c", "--chdir",
+    "-s", "--split-string",
+    "-u", "--unset",
+}
+
+# `command` takes options of its own before the executable, and none of them
+# take a separate operand: `command -p /sbin/reboot` and `command -- ...`
+# both run the executable. `-v`/`-V` are the exception — they only look the
+# command up and print it, so nothing is executed and the walker must stop
+# rather than project a word that never runs. `command`'s only short options
+# are `p`, `v` and `V`, so any cluster carrying v/V (`-pv`) is lookup-only too.
+_COMMAND_LOOKUP_ONLY_SHORT = frozenset("vV")
+_COMMAND_OPTIONS = frozenset({"-p", "-v", "-V"})
+
+# `exec -a NAME` consumes the following word as the argv[0] to use; `-c` and
+# `-l` take no operand. Anything else after `exec` is the program.
+_EXEC_OPTIONS = frozenset({"-a", "-c", "-l"})
+_EXEC_OPTIONS_WITH_ARG = frozenset({"-a"})
+
+
+def _is_lookup_only_option(option_name: str) -> bool:
+    if option_name.startswith("--"):
+        return False
+    return bool(set(option_name[1:]) & _COMMAND_LOOKUP_ONLY_SHORT)
 
 _INTERPRETER_EXEC_FLAGS = {
     "python": {"-c"},
@@ -1960,6 +1993,169 @@ def _iter_shell_command_word_spans(command: str):
             break
 
 
+_EXECUTABLE_LAUNCHER_SUFFIXES = (".exe", ".bat", ".cmd")
+_PROJECTED_BASENAME_RE = re.compile(r"[A-Za-z0-9_][\w.+-]*\Z")
+_WINDOWS_ABSOLUTE_RE = re.compile(r"[A-Za-z]:[\\/]|\\\\")
+# `_read_shell_word` stops at whitespace and `;&|`, so a command that ends
+# at a substitution/subshell closer keeps that byte in the word:
+# `(/sbin/reboot)` reads as `/sbin/reboot)`. Trim the closers before the
+# basename check or the stray byte makes the word look like something other
+# than a program name and the projection silently declines. Only `)` and
+# the backtick qualify: both are shell metacharacters that can never sit
+# inside an unquoted word. `}` is NOT one (`echo foo}` prints `foo}`, and
+# a brace group's `}` is its own word behind `;`), so trimming it would
+# rewrite legitimate names like `/tmp/reboot}`.
+_WORD_TAIL_CLOSERS = ")`"
+
+
+def _projected_executable_basename(word: str) -> str | None:
+    """Reduce one command-position word to the bare program name a shell
+    would resolve, or None when the word already is one (or can't be one).
+
+    A Windows-absolute word (drive or UNC prefix) is split on both
+    separators BEFORE any escape collapsing — the deobfuscation pass treats
+    backslashes as shell escapes and would dissolve the path. Everything
+    else goes through the same quote/escape collapsing the r\\m detection
+    uses, so composed spellings (``'/sbin/'shutdown``, ``/sbin/shut\\down``)
+    reduce like their plain forms."""
+    stripped = _strip_optional_shell_quotes(word)
+    if _WINDOWS_ABSOLUTE_RE.match(stripped):
+        basename = stripped.replace("\\", "/").rsplit("/", 1)[-1]
+    else:
+        collapsed = _deobfuscate_shell_word_for_detection(word) or word
+        basename = _strip_optional_shell_quotes(collapsed).rsplit("/", 1)[-1]
+    lowered = basename.lower()
+    for suffix in _EXECUTABLE_LAUNCHER_SUFFIXES:
+        if lowered.endswith(suffix):
+            basename = basename[: -len(suffix)]
+            break
+    if basename == word:
+        return None  # already a bare name — nothing to project
+    # Refuse anything that doesn't reduce to a plain program name (empty
+    # basename from a trailing slash, expansion debris): projecting those
+    # could only manufacture command words a shell would not actually run.
+    if not _PROJECTED_BASENAME_RE.fullmatch(basename):
+        return None
+    return basename
+
+
+def _project_path_spelled_executables(command: str) -> str | None:
+    """Detection-only variant: rewrite command-position executables that are
+    spelled by path (POSIX or Windows, quoted or bare, with or without a
+    launcher suffix) to ``\\n<basename>`` so the flat ``_CMDPOS``-anchored
+    patterns see the same command word a bare spelling would produce —
+    ``/sbin/shutdown``, ``C:\\Windows\\System32\\shutdown.exe`` and
+    ``"C:\\Program Files\\Git\\usr\\bin\\rm.exe"`` must behave exactly like
+    ``shutdown`` / ``rm``. Must run on the RAW command: the global
+    normalization strips backslashes and fuses a Windows path into one word
+    before the basename could be recovered.
+
+    The walk mirrors ``_iter_shell_command_word_spans`` but recognizes
+    wrappers by their PROJECTED basename, so a path-spelled wrapper chain
+    (``/usr/bin/env /usr/bin/sudo /sbin/shutdown``) resolves in this single
+    pass — no fixpoint, no overlapping re-splice. Assignment-shaped words
+    (``X=/sbin/shutdown``) are prefix data, never executables. Returns None
+    when nothing needed rewriting."""
+    replacements: dict[int, tuple[int, str]] = {}
+    for command_start in _iter_shell_command_starts(command):
+        pos = command_start
+        wrapper_arg_options: frozenset | set = frozenset()
+        wrapper_options: frozenset | set | None = frozenset()
+        command_option_grammar = False
+        skip_wrapper_options = False
+        skip_next_wrapper_arg = False
+        # Bound the WRAPPER chain, not the whole prefix: shell grammar puts no
+        # limit on assignment prefixes or on a wrapper option list, so counting
+        # those let a caller push the executable past a fixed budget and out of
+        # the projection (`A0=1 ... A11=1 /sbin/reboot` — egilewski on #71996;
+        # eleven repeated options — Sol). Only a wrapper word spends budget; the
+        # walk still terminates because every iteration consumes input.
+        wrapper_budget = 12
+        while wrapper_budget > 0:
+            word_start, raw_end, _raw_word = _read_shell_word(command, pos)
+            if word_start == raw_end:
+                break
+            pos = raw_end
+            # Trim group/substitution closers the word reader keeps
+            # (`(/sbin/reboot)` reads as `/sbin/reboot)`); the closer stays
+            # outside the replacement span so the splice preserves it.
+            word_end = raw_end
+            while word_end > word_start and command[word_end - 1] in _WORD_TAIL_CLOSERS:
+                word_end -= 1
+            if word_end == word_start:
+                continue  # bare closer: structure, not a word
+            word = command[word_start:word_end]
+            if skip_next_wrapper_arg:
+                skip_next_wrapper_arg = False
+                continue
+            deobfuscated = _deobfuscate_shell_word_for_detection(word) or word
+            if _ENV_ASSIGNMENT_RE.fullmatch(deobfuscated):
+                continue  # VAR=value prefix: data, keep walking
+            if skip_wrapper_options and deobfuscated.startswith("-"):
+                option_name = deobfuscated.lower().split("=", 1)[0]
+                if wrapper_options is None:
+                    # sudo/env: their option lists are large and largely
+                    # long-form, so every dash word is still skipped. Left as
+                    # it was — narrowing them is a separate change.
+                    skip_next_wrapper_arg = (
+                        "=" not in deobfuscated
+                        and option_name in wrapper_arg_options
+                    )
+                    continue
+                # Wrappers whose option list is small enough to model exactly.
+                # `--` ends it: whatever follows is the program name even when
+                # it looks like an option (`command -- -p x` runs `-p`), and a
+                # word outside the list is not an option at all, so it falls
+                # through and is read as the program — which is what the shell
+                # does. Both directions matter: skipping every dash word
+                # blocked spellings the shell never executes.
+                if deobfuscated == "--":
+                    skip_wrapper_options = False
+                    continue
+                if command_option_grammar and _is_lookup_only_option(option_name):
+                    break  # `command -v`: a lookup, nothing is executed
+                if option_name in wrapper_options:
+                    skip_next_wrapper_arg = (
+                        "=" not in deobfuscated
+                        and option_name in wrapper_arg_options
+                    )
+                    continue
+            basename = _projected_executable_basename(word)
+            effective = (basename or deobfuscated).lower()
+            if basename is not None and word_start not in replacements:
+                replacements[word_start] = (word_end, basename)
+            if effective in _COMMAND_WRAPPER_WORDS:
+                wrapper_budget -= 1  # only the wrapper CHAIN is bounded
+                skip_wrapper_options = True
+                command_option_grammar = effective == "command"
+                if effective == "sudo":
+                    wrapper_options = None  # keep the existing skip-everything
+                    wrapper_arg_options = _SUDO_OPTIONS_WITH_ARG
+                elif effective == "env":
+                    wrapper_options = None
+                    wrapper_arg_options = _ENV_OPTIONS_WITH_ARG
+                elif effective == "command":
+                    wrapper_options = _COMMAND_OPTIONS
+                    wrapper_arg_options = frozenset()
+                elif effective == "exec":
+                    wrapper_options = _EXEC_OPTIONS
+                    wrapper_arg_options = _EXEC_OPTIONS_WITH_ARG
+                else:
+                    # nohup/setsid/time/builtin: nothing option-shaped precedes
+                    # the program, so a dash word is the program itself.
+                    wrapper_options = frozenset()
+                    wrapper_arg_options = frozenset()
+                continue  # wrapper (bare or path-spelled): walk to the command
+            break
+    if not replacements:
+        return None
+    projected = command
+    for word_start in sorted(replacements, reverse=True):
+        word_end, basename = replacements[word_start]
+        projected = projected[:word_start] + "\n" + basename + projected[word_end:]
+    return projected
+
+
 def _command_detection_variants(command: str):
     normalized = _normalize_command_for_detection(command)
     # Quote-aware grep parsing hides only structurally identified pattern
@@ -1984,6 +2180,16 @@ def _command_detection_variants(command: str):
                 if marked_payload != payload and marked_payload not in seen:
                     seen.add(marked_payload)
                     yield marked_payload
+                # A payload's own executable can be path-spelled too
+                # (`bash -c '/sbin/shutdown -h now'`), so it needs the same
+                # basename projection as the outer command. POSIX paths
+                # survive the normalization the payload came through;
+                # backslash Windows paths inside payloads stay out of reach
+                # until normalization preserves separators (#71919).
+                projected_payload = _project_path_spelled_executables(payload)
+                if projected_payload is not None and projected_payload not in seen:
+                    seen.add(projected_payload)
+                    yield projected_payload
                 pending.append(payload)
     # Subshell `(cmd)` and brace-group `{ cmd; }` openers put `cmd` at a real
     # command position, but the flat `_CMDPOS`-anchored patterns can't see it:
@@ -2000,6 +2206,21 @@ def _command_detection_variants(command: str):
     if marked != grep_safe and marked not in seen:
         seen.add(marked)
         yield marked
+    # Absolute-path spellings bypass every _CMDPOS-anchored rule the same
+    # way subshell openers did: the anchor class knows wrappers but not
+    # paths, so `/sbin/shutdown` or `C:\Windows\System32\shutdown.exe`
+    # never reaches `shutdown\b`. Project command-position executables to
+    # `\n<basename>` from the RAW command (normalization strips backslashes
+    # and fuses Windows paths before a basename could be recovered), then
+    # feed the projection through the standard normalize/grep-safe pipe.
+    projected = _project_path_spelled_executables(command)
+    if projected is not None:
+        projected_variant, _ = _grep_safe_detection_variant(
+            _normalize_command_for_detection(projected)
+        )
+        if projected_variant not in seen:
+            seen.add(projected_variant)
+            yield projected_variant
     # Shell quoting/escaping can spell a dangerous executable name in pieces
     # (for example r\m or r''m). Keep that deobfuscation scoped to command
     # words so similarly shaped arguments do not become false positives.
