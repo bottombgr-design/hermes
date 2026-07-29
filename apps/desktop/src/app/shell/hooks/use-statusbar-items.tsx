@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
@@ -49,6 +49,46 @@ import { CRON_ROUTE, SETTINGS_ROUTE, WEBHOOKS_ROUTE } from '../../routes'
 import type { StatusbarItem } from '../statusbar-controls'
 
 const EMPTY_USAGE = { calls: 0, input: 0, output: 0, total: 0 } as const
+
+// $currentUsage mirrors the ACTIVE session's usage, but the only writers are
+// gateway usage events and the context-usage menu/resume paths. Switching the
+// primary session fires none of those, so the mirror — and the statusbar's
+// context_max — keeps showing the previous session's value until the next
+// streamed turn. Pull session.usage once on first mount and whenever the
+// primary session actually changes to resync it. Background tiles never touch
+// $currentUsage (their readouts come from $focusedSessionState, already
+// correct), so this stays scoped to the primary.
+export function usePrimaryUsageSync(
+  primaryActiveSessionId: string | null,
+  requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+) {
+  // First mount counts as a change (null → id): the ref starts at null, so an
+  // initial real id always triggers one fetch while an initial null (no active
+  // session) does not. Re-renders that keep the same id — including a fresh
+  // requestGateway identity — are suppressed.
+  const prevSessionIdRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (prevSessionIdRef.current === primaryActiveSessionId) {
+      return
+    }
+
+    prevSessionIdRef.current = primaryActiveSessionId
+
+    if (!primaryActiveSessionId) {
+      return
+    }
+
+    void requestGateway<UsageStats>('session.usage', { session_id: primaryActiveSessionId })
+      .then(usage => {
+        if (usage) {
+          setCurrentUsage(current => ({ ...current, ...usage }))
+        }
+      })
+      .catch(() => undefined)
+  }, [primaryActiveSessionId, requestGateway])
+}
+
 
 function workspaceLabel(cwd: string): string {
   const normalized = cwd.replace(/[\\/]+$/, '')
@@ -181,6 +221,11 @@ export function useStatusbarItems({
     },
     []
   )
+
+  // Resync $currentUsage (the primary mirror) when the active session changes;
+  // see usePrimaryUsageSync above for why switching sessions otherwise leaves
+  // the statusbar showing the previous session's context_max.
+  usePrimaryUsageSync(primaryActiveSessionId, requestGateway)
 
   const approvalModeItem = useApprovalModeStatusbarItem(activeGatewayProfile, requestGateway)
 
