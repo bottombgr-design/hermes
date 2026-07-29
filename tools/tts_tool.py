@@ -3262,27 +3262,43 @@ def stream_tts_to_speaker(
 
     try:
         output_stream = None
+        output_stream_is_ffplay = False
         tts_config = _load_tts_config()
 
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
         # per-sentence sync synthesis (universal — edge + every non-streamer).
         from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
         streamer = resolve_streaming_provider(tts_config, preferred=provider)
+        stream_provider = (provider or _get_provider(tts_config)).lower()
 
         stream_max_len = 0
         if streamer is not None:
             try:
-                stream_max_len = _resolve_max_text_length(
-                    provider or _get_provider(tts_config), tts_config
-                )
+                stream_max_len = _resolve_max_text_length(stream_provider, tts_config)
             except Exception:
                 stream_max_len = 0
-            # On macOS, skip the sounddevice OutputStream entirely: PortAudio/
-            # CoreAudio init triggers a kTCCServiceMediaLibrary permission
-            # prompt even though output needs no media-library access. Leaving
-            # output_stream=None routes each sentence through the tempfile
-            # -> play_audio_file -> afplay path. See PR #62601 / #13291.
-            if platform.system() == "Darwin":
+            # Never initialize sounddevice output on macOS. For ElevenLabs,
+            # ffplay accepts raw PCM without the PortAudio/CoreAudio callback;
+            # other providers retain the existing tempfile -> afplay fallback.
+            if platform.system() == "Darwin" and stream_provider == "elevenlabs":
+                ffplay = shutil.which("ffplay")
+                if ffplay:
+                    try:
+                        output_stream = subprocess.Popen(
+                            [
+                                ffplay, "-f", "s16le", "-ar", str(streamer.sample_rate),
+                                "-ac", str(streamer.channels), "-nodisp", "-autoexit",
+                                "-loglevel", "quiet", "-",
+                            ],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=windows_hide_flags(),
+                        )
+                        output_stream_is_ffplay = True
+                    except OSError as exc:
+                        logger.debug("ffplay streaming failed to start: %s", exc)
+            elif platform.system() == "Darwin":
                 output_stream = None
             else:
                 try:
@@ -3331,11 +3347,16 @@ def stream_tts_to_speaker(
             try:
                 audio_iter = streamer.stream(cleaned)
                 if output_stream is not None:
-                    import numpy as _np
                     for chunk in audio_iter:
                         if stop_event.is_set():
                             break
-                        output_stream.write(_np.frombuffer(chunk, dtype=_np.int16).reshape(-1, 1))
+                        if output_stream_is_ffplay:
+                            output_stream.stdin.write(chunk)
+                            output_stream.stdin.flush()
+                        else:
+                            import numpy as _np
+                            audio_array = _np.frombuffer(chunk, dtype=_np.int16)
+                            output_stream.write(audio_array.reshape(-1, 1))
                 else:
                     # No audio device: buffer chunks to a temp WAV and play it.
                     _play_via_tempfile(audio_iter, stop_event, streamer.sample_rate)
@@ -3438,11 +3459,22 @@ def stream_tts_to_speaker(
     finally:
         # Always close the audio output stream to avoid locking the device
         if output_stream is not None:
-            try:
-                output_stream.stop()
-                output_stream.close()
-            except Exception:
-                pass
+            if output_stream_is_ffplay:
+                try:
+                    output_stream.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    output_stream.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    output_stream.kill()
+                    output_stream.wait()
+            else:
+                try:
+                    output_stream.stop()
+                    output_stream.close()
+                except Exception:
+                    pass
         tts_done_event.set()
 
 
