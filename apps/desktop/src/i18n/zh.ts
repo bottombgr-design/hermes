@@ -3092,5 +3092,5 @@ export const zh: Translations = {
       description: '显示移动端侧边栏。',
       toggle: '切换侧边栏'
     }
-  }
+  },
 }

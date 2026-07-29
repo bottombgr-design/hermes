@@ -2931,5 +2931,5 @@ export const en: Translations = {
       description: 'Displays the mobile sidebar.',
       toggle: 'Toggle Sidebar'
     }
-  }
+  },
 }

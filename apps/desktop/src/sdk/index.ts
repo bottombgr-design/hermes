@@ -23,8 +23,10 @@ import { atom, type ReadableAtom } from 'nanostores'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { getLogs, getStatus } from '@/hermes'
+import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
+import { openPreview } from '@/store/preview'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId, $currentCwd, $currentModel, $gatewayState } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
@@ -85,6 +87,26 @@ export const host = {
   /** Navigate the app router (hash routes, e.g. '/command-center?section=system'). */
   navigate: (path: string) => {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
+  },
+
+  /** Open a file (or http URL) in the preview rail — the same surface the file
+   *  browser and tool results use. `target` is an absolute path, a `file://`
+   *  URL, or an `https://` URL; main classifies it (text / image / html /
+   *  binary) so the caller doesn't have to sniff. Resolves false when the
+   *  target can't be previewed, so a caller can fall back (e.g. to a download)
+   *  instead of leaving the user with nothing. */
+  preview: async (target: string, cwd?: string): Promise<boolean> => {
+    const resolved = await normalizeOrLocalPreviewTarget(target, cwd ?? $currentCwd.get() ?? undefined)
+
+    // A binary blob has nothing to show — say so rather than opening a tab
+    // that renders an error.
+    if (!resolved || resolved.previewKind === 'binary') {
+      return false
+    }
+
+    openPreview(resolved, 'tool-result')
+
+    return true
   },
 
   /** HEAR the gateway stream (message deltas, session lifecycle, tool
@@ -200,6 +222,9 @@ export type {
  *  id with your plugin slug (`kanban:board-switcher`). */
 export { Contribute, type ContributeProps } from '@/contrib/react/contribute'
 export type { Contribution } from '@/contrib/types'
+/** Grab-to-pan for overflow containers (boards, timelines, wide tables) —
+ *  the shared scrub primitive; don't hand-roll drag-to-scroll. */
+export { type GrabScroll, useGrabScroll } from '@/hooks/use-grab-scroll'
 /** Localized copy. `useI18n` reuses the app's strings; `usePluginI18n(id)` +
  *  `ctx.i18n.register` let a plugin ship its OWN locale bundles, scoped like
  *  `ctx.storage` and resolved against the app's active locale — no core edit. */
@@ -213,6 +238,9 @@ export {
   useI18n,
   usePluginI18n
 } from '@/i18n'
+/** THE compact-number formatter — every user-facing count/token figure goes
+ *  through here (1230 → "1.2k", 1_500_000 → "1.5M"). Don't hand-roll `/1000`. */
+export { compactNumber } from '@/lib/format'
 export { triggerHaptic as haptic } from '@/lib/haptics'
 /** The app's lucide icon set (RefreshCw, LayoutDashboard, Activity, …). */
 export * as icons from '@/lib/icons'
@@ -234,8 +262,6 @@ export const TITLEBAR_AREAS = { center: 'titleBar.center', left: 'titleBar.left'
  *  setup.runtime_check, reconciled) — pass `host.request`. Don't hand-roll
  *  readiness from raw RPC shapes. */
 export { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
-/** Canonical time formatting — every timestamp/age string in the app comes
- *  from these (localized `Intl` under the hood). Don't hand-roll "Xm ago". */
 export { coarseElapsed, fmtDateTime, fmtDayTime, relativeTime } from '@/lib/time'
 export { cn } from '@/lib/utils'
 export { THEMES_AREA } from '@/themes/user-themes'

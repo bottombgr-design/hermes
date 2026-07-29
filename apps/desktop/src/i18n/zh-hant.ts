@@ -2684,5 +2684,5 @@ export const zhHant = defineLocale({
       description: '顯示行動裝置側邊欄。',
       toggle: '切換側邊欄'
     }
-  }
+  },
 })
