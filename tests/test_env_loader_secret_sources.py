@@ -410,3 +410,124 @@ def test_apply_external_secret_sources_bad_ttl_does_not_crash(tmp_path, monkeypa
 
     # Coerced to the 300s default rather than raising ValueError.
     assert captured["cache_ttl_seconds"] == 300
+
+
+# ---------------------------------------------------------------------------
+# #74265 — external-source secrets must survive a second load_dotenv(override=True)
+# ---------------------------------------------------------------------------
+
+
+def _stub_bitwarden(monkeypatch, value="sk-ant-real"):
+    """Wire a fake Bitwarden fetch so the registry sets os.environ directly."""
+    import agent.secret_sources.bitwarden as bw_module
+    from agent.secret_sources import registry as reg_module
+
+    monkeypatch.setattr(bw_module, "find_bws", lambda **_kw: Path("/fake/bws"))
+    monkeypatch.setattr(
+        bw_module,
+        "fetch_bitwarden_secrets",
+        lambda **_kw: ({"ANTHROPIC_API_KEY": value}, []),
+    )
+    reg_module._reset_registry_for_tests()
+
+
+def test_bsm_secret_survives_second_load_hermes_dotenv(tmp_path, monkeypatch):
+    """Regression for #74265: a BSM-resolved secret must survive a second
+    ``load_hermes_dotenv()`` call in the same process.
+
+    ``load_hermes_dotenv()`` is invoked at module-import time from several
+    hot modules (hermes_cli/main.py, gateway/run.py, ...).  The first call
+    lets Bitwarden override the .env placeholder; the second call re-runs
+    ``load_dotenv(override=True)``, which previously wrote the placeholder
+    back over the resolved value while ``_apply_external_secret_sources()``
+    was a no-op (idempotent via ``_APPLIED_HOMES``).  The resolved value
+    must win on every subsequent call.
+    """
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "BWS_ACCESS_TOKEN=token-123\n"
+        "ANTHROPIC_API_KEY=__BITWARDEN_MANAGED__\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        "secrets:\n"
+        "  bitwarden:\n"
+        "    enabled: true\n"
+        "    project_id: test-project\n"
+        "    access_token_env: BWS_ACCESS_TOKEN\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.test-token")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _stub_bitwarden(monkeypatch)
+
+    # First load — Bitwarden resolves the placeholder.
+    env_loader.load_hermes_dotenv(hermes_home=home)
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-real"
+
+    # Second load (simulates gateway/run.py import) — the .env placeholder
+    # must NOT clobber the resolved value.
+    env_loader.load_hermes_dotenv(hermes_home=home)
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-real", (
+        "BSM-resolved secret was clobbered by a second "
+        "load_dotenv(override=True) call (#74265)"
+    )
+
+
+def test_external_secret_survives_reload_with_project_env_only(tmp_path, monkeypatch):
+    """Sibling path (Layer 2 of #74265): with no user .env, the project .env
+    loads with ``override=True`` and must not clobber a BSM secret either."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    project_env = tmp_path / ".env"
+    project_env.write_text(
+        "BWS_ACCESS_TOKEN=token-123\n"
+        "ANTHROPIC_API_KEY=__BITWARDEN_MANAGED__\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        "secrets:\n"
+        "  bitwarden:\n"
+        "    enabled: true\n"
+        "    project_id: test-project\n"
+        "    access_token_env: BWS_ACCESS_TOKEN\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.test-token")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _stub_bitwarden(monkeypatch)
+
+    env_loader.load_hermes_dotenv(hermes_home=home, project_env=project_env)
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-real"
+
+    # Reload — project env override=True must not revert the BSM value.
+    env_loader.load_hermes_dotenv(hermes_home=home, project_env=project_env)
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-real"
+
+
+def test_non_secret_env_var_still_overridden_on_reload(tmp_path, monkeypatch):
+    """Layer 4: a normal (non-secret-source) env var must still be refreshed
+    from .env on every load — the #74265 protection must only guard keys that
+    an external secret source supplied, not all dotenv values."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "OPENAI_BASE_URL=https://fresh.example/v1\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://stale.example/v1")
+
+    env_loader.load_hermes_dotenv(hermes_home=home)
+    assert os.environ["OPENAI_BASE_URL"] == "https://fresh.example/v1"
+
+    # Simulate a stale shell value re-appearing between loads.
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://stale.example/v1")
+
+    env_loader.load_hermes_dotenv(hermes_home=home)
+    assert os.environ["OPENAI_BASE_URL"] == "https://fresh.example/v1"
