@@ -31,6 +31,7 @@ import {
 import { $sessionStates } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
+import { isSessionActivationPending, type SessionActivationRef } from '../../session-activation'
 import { sessionContextDrift } from '../session-context-drift'
 import { resolveSessionProfile } from '../use-session-actions/utils'
 
@@ -56,6 +57,7 @@ interface SubmitPromptDeps {
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
   requestGateway: GatewayRequest
+  sessionActivationRef?: SessionActivationRef
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   syncAttachmentsForSubmit: (
@@ -102,6 +104,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
     getRouteToken,
     requestGateway,
     resumeStoredSession,
+    sessionActivationRef,
     selectedStoredSessionIdRef,
     syncAttachmentsForSubmit,
     updateSessionState,
@@ -182,6 +185,15 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // must never inherit the currently selected session after the user moves
       // to another chat.
       const targetStoredSessionId = options?.storedSessionId ?? selectedStoredSessionIdRef.current
+
+      // A foreground session switch is not ready to accept prompts until the
+      // latest session.activate/session.resume handshake has been acknowledged.
+      // Returning false keeps the composer draft intact (dispatchSubmit restores
+      // rejected sends) instead of letting a closure-captured runtime id route
+      // the text into the previously active chat (#72971).
+      if (isSessionActivationPending(sessionActivationRef, targetStoredSessionId)) {
+        return false
+      }
 
       const targetStartedInCurrentView =
         !targetStoredSessionId || targetStoredSessionId === selectedStoredSessionIdRef.current
@@ -589,6 +601,32 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           return abortForSessionSwitch(sessionId)
         }
 
+        if (targetIsCurrentView()) {
+          // The submit pipeline can cross async boundaries (profile swap,
+          // session.activate, attachment upload). Re-read the live foreground
+          // runtime immediately before prompt.submit instead of trusting the
+          // runtime captured when Enter was pressed. A pending activation is a
+          // hard barrier; a mismatched stored->runtime mapping is fail-closed.
+          if (isSessionActivationPending(sessionActivationRef, startingStoredSessionId)) {
+            return abortForSessionSwitch(sessionId)
+          }
+
+          const currentRuntimeId = activeSessionIdRef.current
+          const mappedRuntimeId = startingStoredSessionId
+            ? getRuntimeIdForStoredSession(startingStoredSessionId)
+            : currentRuntimeId
+
+          if (!currentRuntimeId || (mappedRuntimeId && mappedRuntimeId !== currentRuntimeId)) {
+            return abortForSessionSwitch(sessionId)
+          }
+
+          if (currentRuntimeId !== sessionId) {
+            dropOptimistic(sessionId)
+            sessionId = currentRuntimeId
+            seedOptimistic(sessionId)
+          }
+        }
+
         // Rewrite the optimistic message + prompt text with the synced refs so
         // the gateway receives @file: paths that resolve in its workspace.
         // (Images keep their inline base64 preview — see optimisticAttachmentRef.)
@@ -732,6 +770,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       resumeStoredSession,
       scope,
       selectedStoredSessionIdRef,
+      sessionActivationRef,
       syncAttachmentsForSubmit,
       updateSessionState
     ]

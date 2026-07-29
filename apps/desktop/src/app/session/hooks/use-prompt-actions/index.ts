@@ -45,6 +45,7 @@ import type {
   ImageAttachResponse,
   SessionRedirectResponse
 } from '../../../types'
+import type { SessionActivationRef } from '../../session-activation'
 import { resolveSessionProfile } from '../use-session-actions/utils'
 
 import {
@@ -195,6 +196,7 @@ interface PromptActionsOptions {
   openMemoryGraph: () => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
+  sessionActivationRef?: SessionActivationRef
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
@@ -227,6 +229,7 @@ export function usePromptActions({
   refreshSessions,
   requestGateway,
   resumeStoredSession,
+  sessionActivationRef,
   selectedStoredSessionIdRef,
   startFreshSessionDraft,
   sttEnabled,
@@ -430,6 +433,7 @@ export function usePromptActions({
     getRouteToken,
     requestGateway,
     resumeStoredSession,
+    sessionActivationRef,
     selectedStoredSessionIdRef,
     syncAttachmentsForSubmit,
     updateSessionState
