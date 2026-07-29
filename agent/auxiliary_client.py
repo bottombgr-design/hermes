@@ -397,10 +397,18 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
 # 272K Codex cap — see _CODEX_OAUTH_CONTEXT_FALLBACK in model_metadata.py).
 # With a 272K ceiling the default 50% compaction trigger fires at ~136K —
 # wasteful, since the model can hold far more raw context before
-# summarization actually buys anything. We raise the trigger to 85% (~231K)
-# on this exact route so Codex gpt-5.4 / gpt-5.5 / gpt-5.6 sessions use the
-# window they actually have.
-_CODEX_GPT54_GPT55_COMPACTION_THRESHOLD = 0.85
+# summarization actually buys anything. We raise the trigger, but NOT all
+# the way to 0.85 (~231K, ~38-40K headroom) as originally shipped: the
+# 2026-07-27 all-hands incident (HC-80042, "6th stall tonight") measured a
+# SINGLE codex_app_server turn adding 46-91K real prompt tokens in one
+# preflight-to-next-preflight cycle (one moderate tool-output read), which
+# alone exceeds the old ~38-40K headroom before the backstop in
+# turn_context.py even gets a chance to force compact_thread() on the next
+# turn. Production sessions were observed climbing to 1.4-1.7x the 258-272K
+# window (379K-471K) before wedging — the thin headroom, not a broken
+# backstop, is why. 0.60 (~103K headroom on a 258K window) still avoids the
+# wasteful 136K trigger while surviving a single oversized agentic turn.
+_CODEX_GPT54_GPT55_COMPACTION_THRESHOLD = 0.60
 
 # gpt-5.3-codex-spark is Codex-OAuth-only (ChatGPT Pro entitlement) with a
 # native 128K context window.  The default 50% compaction trigger fires at
@@ -4995,6 +5003,14 @@ def _resolve_auto(
                             main_provider, resolved or main_model)
                 return client, resolved or main_model
 
+    if task and not _task_provider_fallback_enabled(task):
+        logger.warning(
+            "Auxiliary %s: main provider unavailable and fallback_policy=none; "
+            "refusing automatic provider discovery",
+            task,
+        )
+        return None, None
+
     # ── Step 2: user-configured fallback policy ─────────────────────────
     # In auto mode, respect the task-specific fallback chain first, then the
     # main agent's top-level fallback_providers/fallback_model chain. The
@@ -6988,6 +7004,31 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     return task_config
 
 
+def _task_provider_fallback_enabled(task: Optional[str]) -> bool:
+    """Return whether an auxiliary task may cross to another provider.
+
+    ``fallback_policy: none`` is a fail-closed boundary for tasks that must
+    stay on a pinned local or otherwise explicitly selected backend. The
+    default remains ``auto`` for backwards compatibility. Unknown values fail
+    closed so a typo cannot silently spend against an unintended provider.
+    Same-provider retries are unaffected.
+    """
+    if not task:
+        return True
+    raw = str(_get_auxiliary_task_config(task).get("fallback_policy", "auto"))
+    policy = raw.strip().lower() or "auto"
+    if policy == "auto":
+        return True
+    if policy == "none":
+        return False
+    logger.warning(
+        "Auxiliary %s: invalid fallback_policy=%r; failing closed",
+        task,
+        raw,
+    )
+    return False
+
+
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
     """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
     if not task:
@@ -8496,7 +8537,15 @@ def call_llm(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        fallback_enabled = _task_provider_fallback_enabled(task)
+        if should_fallback and (is_auto or is_capacity_error) and not fallback_enabled:
+            logger.warning(
+                "Auxiliary %s: provider failure on %s with "
+                "fallback_policy=none; refusing cross-provider fallback",
+                task or "call",
+                resolved_provider,
+            )
+        if should_fallback and (is_auto or is_capacity_error) and fallback_enabled:
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -9096,7 +9145,15 @@ async def async_call_llm(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        fallback_enabled = _task_provider_fallback_enabled(task)
+        if should_fallback and (is_auto or is_capacity_error) and not fallback_enabled:
+            logger.warning(
+                "Auxiliary %s (async): provider failure on %s with "
+                "fallback_policy=none; refusing cross-provider fallback",
+                task or "call",
+                resolved_provider,
+            )
+        if should_fallback and (is_auto or is_capacity_error) and fallback_enabled:
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):

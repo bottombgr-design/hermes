@@ -1111,6 +1111,12 @@ def init_agent(
         if not agent.quiet_mode:
             _gr_label = " + Guardrails" if agent._bedrock_guardrail_config else ""
             print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
+    elif agent.api_mode == "codex_app_server":
+        # The Codex subprocess owns authentication through CODEX_HOME/auth.json.
+        # It does not use Hermes' OpenAI client, so no Hermes OAuth/API key is
+        # required merely to construct the agent.
+        agent.client = None
+        agent._client_kwargs = {}
     else:
         if api_key and base_url:
             # Explicit credentials from CLI/gateway — construct directly.
@@ -1555,6 +1561,22 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+
+    # Optional executable override for the Codex app-server runtime. Keep the
+    # default PATH lookup for ordinary installs, while allowing managed
+    # workstations to pin the same Codex build used by another long-lived
+    # client that shares CODEX_HOME. Mixing Codex versions against one
+    # models_cache.json can make an older process reject a cache schema written
+    # by a newer process before a turn ever reaches the model.
+    agent.codex_app_server_binary = "codex"
+    try:
+        _model_section = _agent_cfg.get("model", {})
+        if isinstance(_model_section, dict):
+            _codex_binary = str(_model_section.get("codex_binary") or "").strip()
+            if _codex_binary:
+                agent.codex_app_server_binary = _codex_binary
+    except Exception:
+        agent.codex_app_server_binary = "codex"
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as

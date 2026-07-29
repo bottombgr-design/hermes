@@ -59,6 +59,74 @@ def _getenv(name: str, default: str = "") -> str:
     return val if val is not None else default
 
 
+_DISALLOWED_OPENROUTER_MODEL_RE = re.compile(
+    r"(?:^|[/:_-])(?:openai|gpt|chatgpt|o[134]|codex)(?:$|[/:_.-])|anthropic/|anthopic/|(?:^|[/:_-])claude(?:$|[/:_.-])|(?:^|[/:_-])fable(?:$|[/:_.-])",
+    re.IGNORECASE,
+)
+
+
+def _openrouter_guard_applies(
+    *,
+    requested_provider: str,
+    explicit_base_url: Optional[str],
+    model_cfg: Dict[str, Any],
+) -> bool:
+    """Return True when this runtime resolution would use OpenRouter.
+
+    The user may configure OpenRouter in two supported shapes:
+    ``provider: openrouter`` or ``provider: openai-api`` with
+    ``base_url: https://openrouter.ai/api/v1``.  Guard both, plus explicit
+    OpenRouter base_url overrides, without affecting direct OpenAI/Codex,
+    Anthropic, local, or other provider use.
+    """
+    requested_norm = str(requested_provider or "").strip().lower()
+    cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+    cfg_base_url = str(model_cfg.get("base_url") or "").strip()
+    explicit = str(explicit_base_url or "").strip()
+
+    if requested_norm == "openrouter":
+        return True
+    if explicit and base_url_host_matches(explicit, "openrouter.ai"):
+        return True
+    if cfg_base_url and base_url_host_matches(cfg_base_url, "openrouter.ai"):
+        return cfg_provider in {"openrouter", "openai-api", "auto", ""}
+    return False
+
+
+def _assert_openrouter_model_allowed(
+    *,
+    requested_provider: str,
+    explicit_base_url: Optional[str],
+    model_cfg: Dict[str, Any],
+    target_model: Optional[str],
+) -> None:
+    """Fail closed before any OpenRouter request can target banned families.
+
+    OpenRouter itself is allowed.  What is forbidden for this profile is routing
+    OpenRouter spend to Codex, Anthropic/Claude, or Fable-like model ids.  This
+    is a routing guard, not a model pin: any non-matching OpenRouter model still
+    resolves normally.
+    """
+    model = str(target_model or model_cfg.get("default") or "").strip()
+    if not model:
+        return
+    if not _openrouter_guard_applies(
+        requested_provider=requested_provider,
+        explicit_base_url=explicit_base_url,
+        model_cfg=model_cfg,
+    ):
+        return
+    if not _DISALLOWED_OPENROUTER_MODEL_RE.search(model):
+        return
+    raise AuthError(
+        "Refusing to route OpenRouter to a forbidden model family "
+        f"({model!r}). OpenRouter is allowed, but OpenAI/Codex, Anthropic/Claude, "
+        "and Fable-like model ids are blocked in this Hermes profile.",
+        provider="openrouter",
+        code="disallowed_openrouter_model",
+    )
+
+
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
 
@@ -1630,6 +1698,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    enforce_openrouter_policy: bool = True,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1640,6 +1709,14 @@ def resolve_runtime_provider(
     api_mode is derived from the model they are switching TO, not the stale
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
+
+    enforce_openrouter_policy: When True (default), reject forbidden
+    OpenRouter model families before resolving credentials — see
+    ``_assert_openrouter_model_allowed``. Callers that only need resolved
+    metadata (e.g. context-window lookups for display) and never send a
+    request with the returned credentials should pass False so a passive
+    introspection call cannot be mistaken for the live-routing spend it is
+    guarding against.
     """
     requested_provider = resolve_requested_provider(requested)
 
@@ -1652,7 +1729,10 @@ def resolve_runtime_provider(
     # for a provider the user explicitly turned off.
     #
     # Fail fast with a typed error so the fallback chain can advance to
-    # the next provider instead of using a disabled one.
+    # the next provider instead of using a disabled one. This must run
+    # BEFORE the OpenRouter model-family guard below: a provider the user
+    # has explicitly disabled should always fail with the same typed
+    # ValueError regardless of which model it was last configured with.
     from hermes_cli.config import is_provider_enabled, load_config
     _full_cfg = load_config()
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
@@ -1663,6 +1743,15 @@ def resolve_runtime_provider(
                 f"provider {requested_provider!r} is disabled in config "
                 f"(providers.{requested_provider}.enabled: false)"
             )
+
+    if enforce_openrouter_policy:
+        _model_cfg_for_guard = _get_model_config()
+        _assert_openrouter_model_allowed(
+            requested_provider=requested_provider,
+            explicit_base_url=explicit_base_url,
+            model_cfg=_model_cfg_for_guard,
+            target_model=target_model,
+        )
 
     if requested_provider == "moa":
         return {
@@ -1918,6 +2007,23 @@ def resolve_runtime_provider(
                         "falling through to next provider.")
 
     if provider == "openai-codex":
+        # ``codex app-server`` authenticates itself from CODEX_HOME/auth.json.
+        # Hermes does not send an OpenAI request on this path, so requiring its
+        # separate OAuth store here would spuriously force a second device login
+        # before the app-server session can start.
+        if _maybe_apply_codex_app_server_runtime(
+            provider=provider,
+            api_mode="codex_responses",
+            model_cfg=model_cfg,
+        ) == "codex_app_server":
+            return {
+                "provider": "openai-codex",
+                "api_mode": "codex_app_server",
+                "base_url": "",
+                "api_key": "",
+                "source": "codex-cli-app-server",
+                "requested_provider": requested_provider,
+            }
         try:
             creds = resolve_codex_runtime_credentials()
             return {

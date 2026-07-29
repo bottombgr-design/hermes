@@ -94,11 +94,43 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
-    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
+    # 2026-07-27 ALL-HANDS ANGLE D (#hermes-context-overrun) DOUBLE-COUNT FIX:
+    # verified against the actual installed codex-cli (0.144.1) protocol
+    # schema (`codex app-server generate-json-schema`) and the upstream
+    # codex-rs test fixture (codex-rs/codex-api/src/sse/responses.rs,
+    # `parses_cache_write_token_usage`): the wire's `inputTokens` is ALREADY
+    # inclusive of `cachedInputTokens` (input_tokens=100, cached_tokens=40 in
+    # the fixture -> total_tokens=110=100+10 output, NOT 100+40+10=150).
+    # `cachedInputTokens` is a breakdown annotation of `inputTokens`, not an
+    # additional bucket — same for `reasoningOutputTokens` inside
+    # `outputTokens`.
+    #
+    # CanonicalUsage.prompt_tokens is defined as
+    # input_tokens + cache_read_tokens + cache_write_tokens (correct ONLY
+    # when its `input_tokens` field holds the non-cached remainder, which is
+    # exactly the convention agent/usage_pricing.py already follows
+    # elsewhere: it subtracts cache from the raw total before constructing
+    # CanonicalUsage). This function instead fed the raw, cache-INCLUSIVE
+    # `inputTokens` straight into CanonicalUsage.input_tokens and then added
+    # `cachedInputTokens` again — double-counting the cached share every
+    # single turn. In a long session with a high cache-hit ratio (typical
+    # once context has grown) this inflates the reported/displayed prompt
+    # size by up to ~2x. That inflated number is exactly what
+    # turn_context.py's preflight/backstop compares against threshold_tokens
+    # and what the live status-bar gauge displays — explaining a
+    # 423K/258.4K (164%) gauge reading with ZERO real context-length-exceeded
+    # API errors anywhere in agent.log (a genuine 423K prompt against a
+    # 258.4K model would have been hard-rejected by the provider).
+    #
+    # Fix: normalize `inputTokens` to its non-cached remainder BEFORE
+    # constructing CanonicalUsage, matching the established convention, so
+    # `.prompt_tokens` reconstructs the correct (non-inflated) total.
+    raw_input_tokens = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
     reported_total = _coerce_usage_int(usage.get("totalTokens"))
+    input_tokens = max(0, raw_input_tokens - cache_read_tokens)
 
     canonical_usage = CanonicalUsage(
         input_tokens=input_tokens,
@@ -127,8 +159,27 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         try:
             compressor.update_from_response(usage_dict)
             context_window = getattr(turn, "model_context_window", None)
-            if isinstance(context_window, int) and context_window > 0:
+            if (
+                isinstance(context_window, int)
+                and context_window > 0
+                and context_window != compressor.context_length
+            ):
+                # HC-80042: this used to set context_length WITHOUT
+                # recomputing threshold_tokens, so the two silently drifted
+                # apart (observed live: context_length updated to Codex's
+                # reported 258,400 while threshold_tokens stayed frozen at
+                # 272,000 * threshold_percent from init — an ~11K-token
+                # stale-threshold gap). Recompute both from the live window
+                # so the backstop's >= threshold_tokens check compares
+                # against the SAME window it just adopted. Deliberately does
+                # NOT touch last_real_prompt_tokens / awaiting_real_usage_*
+                # (unlike update_model()) — those reflect real usage this
+                # turn just reported and must survive this resync.
                 compressor.context_length = context_window
+                compressor.threshold_tokens = compressor._compute_threshold_tokens(
+                    context_window, compressor.threshold_percent, compressor.max_tokens,
+                )
+                compressor._apply_threshold_tokens_cap()
         except Exception:
             logger.debug("codex app-server usage update failed", exc_info=True)
 
@@ -339,20 +390,40 @@ def _codex_item_to_args(item: dict) -> dict:
     _project_mcp_tool_call / _project_dynamic_tool_call shapes."""
     item_type = item.get("type") or ""
     if item_type == "commandExecution":
-        return {"command": item.get("command") or "",
+        args = {"command": item.get("command") or "",
                 "cwd": item.get("cwd") or ""}
+        return _redact_codex_event_value(args)
     if item_type == "fileChange":
-        return {"changes": [
+        return _redact_codex_event_value({"changes": [
             {"kind": (c.get("kind") or {}).get("type") or "update",
              "path": c.get("path") or ""}
             for c in (item.get("changes") or []) if isinstance(c, dict)
-        ]}
+        ]})
     if item_type in {"mcpToolCall", "dynamicToolCall"}:
         args = item.get("arguments") or {}
-        return args if isinstance(args, dict) else {"arguments": args}
+        args = args if isinstance(args, dict) else {"arguments": args}
+        return _redact_codex_event_value(args)
     if item_type == "webSearch":
-        return {"query": item.get("query") or ""}
+        return _redact_codex_event_value(
+            {"query": item.get("query") or ""}
+        )
     return {}
+
+
+def _redact_codex_event_value(value: Any) -> Any:
+    """Recursively scrub Codex event material before UI callbacks receive it."""
+    from agent.redact import redact_sensitive_text
+
+    if isinstance(value, str):
+        try:
+            return redact_sensitive_text(value)
+        except Exception:
+            return "«redacted-output-unavailable»"
+    if isinstance(value, dict):
+        return {key: _redact_codex_event_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_codex_event_value(item) for item in value]
+    return value
 
 
 def _codex_item_to_preview(item: dict) -> Any:
@@ -361,7 +432,7 @@ def _codex_item_to_preview(item: dict) -> Any:
     item_type = item.get("type") or ""
     if item_type == "commandExecution":
         cmd = item.get("command") or ""
-        return cmd[:120] if cmd else None
+        return _redact_codex_event_value(cmd[:120]) if cmd else None
     if item_type == "fileChange":
         paths = [c.get("path") for c in (item.get("changes") or [])
                  if isinstance(c, dict) and c.get("path")]
@@ -370,18 +441,20 @@ def _codex_item_to_preview(item: dict) -> Any:
         preview = ", ".join(paths[:3])
         if len(paths) > 3:
             preview += f", +{len(paths) - 3} more"
-        return preview
+        return _redact_codex_event_value(preview)
     if item_type in {"mcpToolCall", "dynamicToolCall"}:
         args = item.get("arguments") or {}
         if not isinstance(args, dict) or not args:
             return None
         try:
-            return json.dumps(args, ensure_ascii=False)[:120]
+            return _redact_codex_event_value(
+                json.dumps(args, ensure_ascii=False)[:120]
+            )
         except (TypeError, ValueError):
             return None
     if item_type == "webSearch":
         query = item.get("query") or ""
-        return query[:120] if query else None
+        return _redact_codex_event_value(query[:120]) if query else None
     return None
 
 
@@ -396,24 +469,39 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
         is_error = bool(exit_code is not None and exit_code != 0)
         if is_error:
             out = f"[exit {exit_code}]\n{out}"
+        from agent.redact import redact_terminal_output
+
+        try:
+            out = redact_terminal_output(
+                out,
+                str(item.get("command") or ""),
+            )
+        except Exception:
+            out = "«redacted-output-unavailable»"
         return out, is_error
     if item_type == "fileChange":
         status = item.get("status") or "unknown"
         n = len(item.get("changes") or [])
         return (
-            f"apply_patch status={status}, {n} change(s)",
+            _redact_codex_event_value(
+                f"apply_patch status={status}, {n} change(s)"
+            ),
             status not in {"completed", "applied", "success"},
         )
     if item_type == "mcpToolCall":
         error = item.get("error")
         if error:
             return (
-                f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}",
+                _redact_codex_event_value(
+                    f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
+                ),
                 True,
             )
         result = item.get("result")
         return (
-            json.dumps(result, ensure_ascii=False)[:4000]
+            _redact_codex_event_value(
+                json.dumps(result, ensure_ascii=False)[:4000]
+            )
             if result is not None else "",
             False,
         )
@@ -421,11 +509,15 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
         content_items = item.get("contentItems") or []
         if isinstance(content_items, list) and content_items:
             return (
-                json.dumps(content_items, ensure_ascii=False)[:4000],
+                _redact_codex_event_value(
+                    json.dumps(content_items, ensure_ascii=False)[:4000]
+                ),
                 not bool(item.get("success", True)),
             )
         success = item.get("success", True)
-        return f"success={success}", not bool(success)
+        return _redact_codex_event_value(
+            f"success={success}"
+        ), not bool(success)
     return "", False
 
 
@@ -548,6 +640,14 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
             return
+        # A credential can be split across arbitrary streaming chunks.  Once
+        # any prefix bytes have been emitted no completed-text redactor can
+        # claw them back, so secure mode withholds raw deltas and emits only
+        # the completed, fully-redacted assistant item.
+        from agent.redact import redaction_enabled
+
+        if redaction_enabled():
+            return
         fn = getattr(agent, "_fire_stream_delta", None)
         if fn is None:
             return
@@ -560,6 +660,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
             return
+        from agent.redact import redaction_enabled
+
+        if redaction_enabled():
+            return
         fn = getattr(agent, "_fire_reasoning_delta", None)
         if fn is None:
             return
@@ -569,7 +673,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             logger.debug("_fire_reasoning_delta raised", exc_info=True)
 
     def _fire_agent_message_completed(item: dict) -> None:
-        text = item.get("text") or ""
+        text = _redact_codex_event_value(item.get("text") or "")
         if not isinstance(text, str) or not text.strip():
             return
         # display.show_commentary=false — mid-turn narration stays off the
@@ -616,6 +720,95 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
+_CONTEXT_CEILING_CONTINUATION = (
+    "Continue the same objective from the turn that Hermes interrupted for "
+    "context safety. Native compaction has completed. Inspect the current "
+    "state, preserve completed work, and resume without repeating successful "
+    "side effects."
+)
+
+
+def _recover_codex_context_ceiling(agent, turn):
+    """Compact and resume the same Codex thread after a safety interruption.
+
+    A mid-turn ceiling is not a user interrupt and must not strand the active
+    objective. Recovery is deliberately bounded to one compact-and-resume
+    attempt so a broken compactor cannot create an infinite internal loop.
+    """
+    if not getattr(turn, "context_ceiling_hit", False):
+        return turn, 1
+
+    session = getattr(agent, "_codex_session", None)
+    if session is None:
+        turn.error = "context ceiling recovery lost the active Codex session"
+        turn.should_retire = True
+        return turn, 1
+
+    logger.warning(
+        "codex app-server context safety recovery: compacting and resuming "
+        "the same objective (session=%s thread=%s turn=%s)",
+        getattr(agent, "session_id", None) or "none",
+        getattr(turn, "thread_id", None) or "",
+        getattr(turn, "turn_id", None) or "",
+    )
+    compact_result = session.compact_thread()
+    if (
+        getattr(compact_result, "interrupted", False)
+        or getattr(compact_result, "error", None)
+    ):
+        turn.error = (
+            "context ceiling recovery compaction failed: "
+            f"{getattr(compact_result, 'error', None) or 'interrupted'}"
+        )
+        turn.should_retire = bool(
+            getattr(turn, "should_retire", False)
+            or getattr(compact_result, "should_retire", False)
+        )
+        return turn, 2
+
+    _record_codex_app_server_compaction(
+        agent,
+        compact_result,
+        force=True,
+    )
+    resumed = session.run_turn(user_input=_CONTEXT_CEILING_CONTINUATION)
+    # Preserve completed tool-call/result pairs from the interrupted attempt,
+    # but drop partial assistant narration at the recovery boundary. Keeping
+    # two adjacent assistant messages would violate the persisted alternation
+    # contract, while completed tool effects are essential recovery context.
+    completed_prior_work = [
+        message
+        for message in (getattr(turn, "projected_messages", None) or [])
+        if isinstance(message, dict)
+        and (
+            message.get("role") == "tool"
+            or bool(message.get("tool_calls"))
+        )
+    ]
+    resumed.projected_messages = [
+        *completed_prior_work,
+        *(getattr(resumed, "projected_messages", None) or []),
+    ]
+    resumed.tool_iterations = (
+        int(getattr(turn, "tool_iterations", 0) or 0)
+        + int(getattr(resumed, "tool_iterations", 0) or 0)
+    )
+    if getattr(resumed, "context_ceiling_hit", False):
+        resumed.error = (
+            "context ceiling recurred immediately after native compaction"
+        )
+        resumed.should_retire = True
+    else:
+        logger.info(
+            "codex app-server context safety recovery completed "
+            "(session=%s thread=%s turn=%s)",
+            getattr(agent, "session_id", None) or "none",
+            getattr(resumed, "thread_id", None) or "",
+            getattr(resumed, "turn_id", None) or "",
+        )
+    return resumed, 3
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -623,6 +816,7 @@ def run_codex_app_server_turn(
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
+    developer_instructions: str = "",
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
@@ -683,6 +877,8 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            codex_bin=getattr(agent, "codex_app_server_binary", "codex"),
+            developer_instructions=developer_instructions,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -697,6 +893,7 @@ def run_codex_app_server_turn(
 
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
+        turn, api_calls = _recover_codex_context_ceiling(agent, turn)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -764,9 +961,18 @@ def run_codex_app_server_turn(
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
-    # is exactly what curator.py / sessions DB expect.
-    if turn.projected_messages:
-        messages.extend(turn.projected_messages)
+    # is exactly what curator.py / sessions DB expect. Codex also projects a
+    # userMessage for the current input, but the standard run_conversation
+    # entry path already appended and flushed that user turn before this early
+    # return. Drop projected user rows here so every native turn is persisted
+    # exactly once rather than doubling context one request at a time.
+    projected_messages = [
+        msg
+        for msg in (turn.projected_messages or [])
+        if not (isinstance(msg, dict) and msg.get("role") == "user")
+    ]
+    if projected_messages:
+        messages.extend(projected_messages)
 
         # Persist the newly-projected assistant/tool messages ourselves.
         # This path is an early return that bypasses conversation_loop, whose
@@ -817,8 +1023,6 @@ def run_codex_app_server_turn(
     )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
-    api_calls = 1
-
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).
     should_review_skills = False

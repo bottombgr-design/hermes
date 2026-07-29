@@ -1399,10 +1399,17 @@ DEFAULT_CONFIG = {
     #                    being clamped (default 2000).
     # - max_line_length: per-line cap applied when read_file emits a
     #                    line-numbered view (default 2000 chars).
+    # - max_turn_bytes:  cumulative tool-output budget for ONE turn,
+    #                    independent of max_bytes (default 60_000 ≈
+    #                    15K tokens). Enforced by the codex app-server
+    #                    ingestion path so N tool calls in a single turn
+    #                    can't stack past the context window even though
+    #                    each individual result is already capped.
     "tool_output": {
         "max_bytes": 50_000,
         "max_lines": 2000,
         "max_line_length": 2000,
+        "max_turn_bytes": 60_000,
     },
 
     # Tool loop guardrails nudge models when they repeat failed or
@@ -1698,6 +1705,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "fallback_policy": "auto",  # auto | none (fail closed; same-provider retries still apply)
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
@@ -1859,6 +1867,8 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "fallback_policy": "auto",  # auto | none (fail closed; same-provider retries still apply)
+            "max_tokens": 1024,       # output cap for routed review forks
             "timeout": 120,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)

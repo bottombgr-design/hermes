@@ -71,6 +71,55 @@ class TestApiModeAccepted:
         agent = _make_codex_agent()
         assert agent.api_mode == "codex_app_server"
 
+    def test_codex_app_server_needs_no_hermes_openai_credentials(self):
+        agent = run_agent.AIAgent(
+            api_key="",
+            base_url="",
+            provider="openai-codex",
+            api_mode="codex_app_server",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+        assert agent.client is None
+        assert agent._client_kwargs == {}
+
+    def test_codex_binary_config_reaches_app_server_session(self, monkeypatch):
+        configured_binary = "/managed/codex"
+        captured = {}
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"model": {"codex_binary": configured_binary}},
+        )
+
+        def capture_init(self, **kwargs):
+            captured.update(kwargs)
+            self.thread_id = None
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-configured-binary",
+                thread_id="thread-configured-binary",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", capture_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("use the configured binary")
+
+        assert result["completed"] is True
+        assert captured["codex_bin"] == configured_binary
+
+    def test_codex_binary_defaults_to_path_lookup(self):
+        agent = _make_codex_agent()
+        assert agent.codex_app_server_binary == "codex"
+
 
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
@@ -94,7 +143,7 @@ class TestRunConversationCodexPath:
                 turn_id="turn-usage-1",
                 thread_id="thread-usage-1",
                 token_usage_last={
-                    "totalTokens": 130,
+                    "totalTokens": 105,
                     "inputTokens": 80,
                     "cachedInputTokens": 20,
                     "outputTokens": 25,
@@ -112,28 +161,28 @@ class TestRunConversationCodexPath:
             result = agent.run_conversation("hello")
 
         assert result["api_calls"] == 1
-        assert result["prompt_tokens"] == 100
+        assert result["prompt_tokens"] == 80
         assert result["completion_tokens"] == 25
-        assert result["total_tokens"] == 130
-        assert result["input_tokens"] == 80
+        assert result["total_tokens"] == 105
+        assert result["input_tokens"] == 60
         assert result["output_tokens"] == 25
         assert result["cache_read_tokens"] == 20
         assert result["cache_write_tokens"] == 0
         assert result["reasoning_tokens"] == 5
-        assert result["last_prompt_tokens"] == 100
+        assert result["last_prompt_tokens"] == 80
 
         assert agent.session_api_calls == 1
-        assert agent.session_prompt_tokens == 100
+        assert agent.session_prompt_tokens == 80
         assert agent.session_completion_tokens == 25
-        assert agent.session_total_tokens == 130
-        assert agent.session_input_tokens == 80
+        assert agent.session_total_tokens == 105
+        assert agent.session_input_tokens == 60
         assert agent.session_output_tokens == 25
         assert agent.session_cache_read_tokens == 20
         assert agent.session_cache_write_tokens == 0
         assert agent.session_reasoning_tokens == 5
-        assert agent.context_compressor.last_prompt_tokens == 100
+        assert agent.context_compressor.last_prompt_tokens == 80
         assert agent.context_compressor.last_completion_tokens == 25
-        assert agent.context_compressor.last_total_tokens == 130
+        assert agent.context_compressor.last_total_tokens == 105
         assert agent.context_compressor.context_length == 200000
 
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
@@ -619,6 +668,95 @@ class TestErrorHandling:
         assert result["partial"] is True
         assert result["error"] == "user interrupted"
 
+    def test_context_ceiling_compacts_and_resumes_same_objective(self, monkeypatch):
+        inputs = []
+        turns = iter([
+            TurnResult(
+                projected_messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "tool-before-compact",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{}",
+                            },
+                        }],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "tool-before-compact",
+                        "content": "completed work",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "partial narration",
+                    },
+                ],
+                tool_iterations=1,
+                interrupted=True,
+                error="codex app-server context ceiling reached mid-turn",
+                turn_id="turn-before-compact",
+                thread_id="thread-1",
+                context_ceiling_hit=True,
+            ),
+            TurnResult(
+                final_text="mission complete",
+                projected_messages=[
+                    {"role": "assistant", "content": "mission complete"},
+                ],
+                turn_id="turn-after-compact",
+                thread_id="thread-1",
+            ),
+        ])
+
+        def fake_run_turn(self, user_input, **kwargs):
+            inputs.append(user_input)
+            return next(turns)
+
+        def fake_compact_thread(self, **kwargs):
+            return TurnResult(
+                compacted=True,
+                turn_id="compact-turn",
+                thread_id="thread-1",
+            )
+
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-1",
+        )
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "compact_thread",
+            fake_compact_thread,
+        )
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("finish the mission")
+
+        assert result["completed"] is True
+        assert result["partial"] is False
+        assert result["final_response"] == "mission complete"
+        assert result["api_calls"] == 3
+        assert inputs[0] == "finish the mission"
+        assert inputs[1].startswith("Continue the same objective")
+        assert [
+            msg.get("content")
+            for msg in result["messages"]
+            if msg.get("role") == "user"
+        ] == ["finish the mission"]
+        assert "partial narration" not in [
+            msg.get("content") for msg in result["messages"]
+        ]
+        assert "completed work" in [
+            msg.get("content") for msg in result["messages"]
+        ]
+
 
 class TestSessionRetirementOnRunAgent:
     """run_agent.py side: when run_turn returns should_retire=True, the
@@ -782,8 +920,11 @@ class TestCodexToolProgressBridge:
         agent.tool_progress_callback = lambda kind, name, preview, args: events.append(
             (kind, name, preview))
         with patch.object(agent, "_spawn_background_review", return_value=None):
-            agent.run_conversation("run the tests")
+            agent.run_conversation(
+                "run the tests",
+                system_message="HERMES_SCOPED_SYSTEM_PROMPT",
+            )
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
+        assert "HERMES_SCOPED_SYSTEM_PROMPT" in captured_init["developer_instructions"]
         assert ("tool.started", "exec_command", "pytest") in events
-
