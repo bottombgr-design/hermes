@@ -20,6 +20,7 @@ from typing import Optional
 from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
+    _inject_profile_scoped_env_passthrough,
     _is_hermes_internal_secret,
 )
 
@@ -1491,12 +1492,20 @@ class DockerEnvironment(BaseEnvironment):
         }
         forward_keys = explicit_forward_keys | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
+        forwarded_env: dict[str, str] = {}
         for key in sorted(forward_keys):
             value = os.getenv(key)
             if not value:
                 value = hermes_env.get(key)
             if value:
-                exec_env[key] = value
+                forwarded_env[key] = value
+
+        # In a multi-profile process, the launch profile's os.environ must not
+        # win over the active profile's isolated secret scope. Only keys already
+        # approved by forward_keys are projected; the full scope is never
+        # exposed to the container.
+        _inject_profile_scoped_env_passthrough(forwarded_env, forward_keys)
+        exec_env.update({key: value for key, value in forwarded_env.items() if value})
 
         args = []
         for key in sorted(exec_env):

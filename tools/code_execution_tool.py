@@ -284,6 +284,26 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     return scrubbed
 
 
+def _build_child_process_env(source_env=None):
+    """Build execute_code's child env with active profile/session context.
+
+    ``_scrub_child_env`` remains the security boundary. After scrubbing, add
+    back only explicitly allowlisted profile secrets plus non-secret runtime
+    context that child processes cannot inherit from ContextVars directly.
+    """
+    from tools.environments.local import (
+        _inject_context_hermes_home,
+        _inject_profile_scoped_env_passthrough,
+        _inject_session_context_env,
+    )
+
+    child_env = _scrub_child_env(os.environ if source_env is None else source_env)
+    _inject_profile_scoped_env_passthrough(child_env)
+    _inject_context_hermes_home(child_env)
+    _inject_session_context_env(child_env)
+    return child_env
+
+
 def check_sandbox_requirements() -> bool:
     """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
     if not SANDBOX_AVAILABLE:
@@ -1360,7 +1380,7 @@ def execute_code(
         # OS-essential allowlist (SYSTEMROOT, WINDIR, COMSPEC, ...) is also
         # passed through — without those, the child can't create a socket
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
-        child_env = _scrub_child_env(os.environ)
+        child_env = _build_child_process_env()
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"

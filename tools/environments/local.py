@@ -401,6 +401,42 @@ def _inject_context_hermes_home(env: dict) -> None:
         pass
 
 
+def _inject_profile_scoped_env_passthrough(
+    env: dict,
+    allowed_names: set[str] | frozenset[str] | None = None,
+) -> None:
+    """Project explicitly-allowed values from the active profile secret scope.
+
+    A multi-profile host cannot copy the whole profile ``.env`` into a child:
+    that would defeat the sandbox's credential filtering.  It may only replace
+    names already approved by ``env_passthrough`` (or an equivalent caller
+    policy such as Docker's explicit ``forward_env`` list).
+
+    When a profile/home override or multiplexing is active, the scope is an
+    isolation boundary: an allowed name missing from the active profile must be
+    removed instead of falling through to the launch profile's ``os.environ``.
+    Outside profile isolation the scope remains an overlay, preserving the
+    existing single-profile process-environment fallback.
+    """
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
+    from hermes_constants import get_hermes_home_override
+
+    scope = current_secret_scope()
+    if scope is None:
+        return
+    if allowed_names is None:
+        from tools.env_passthrough import get_all_passthrough
+
+        allowed_names = get_all_passthrough()
+    authoritative = is_multiplex_active() or bool(get_hermes_home_override())
+
+    for name in allowed_names:
+        if name in scope:
+            env[name] = scope[name]
+        elif authoritative:
+            env.pop(name, None)
+
+
 def _inject_session_context_env(env: dict) -> None:
     """Bridge gateway session ContextVars into a subprocess environment dict.
 
@@ -476,6 +512,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
+    _inject_profile_scoped_env_passthrough(sanitized)
     _inject_context_hermes_home(sanitized)
 
     from hermes_constants import apply_subprocess_home_env
@@ -1167,6 +1204,8 @@ def _make_run_env(env: dict) -> dict:
             continue
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
+
+    _inject_profile_scoped_env_passthrough(run_env)
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
