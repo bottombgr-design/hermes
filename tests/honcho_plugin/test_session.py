@@ -932,7 +932,12 @@ class TestPerSessionMigrateGuard:
     containing only <prior_memory_file> wrappers.
     """
 
-    def _make_provider_with_strategy(self, strategy, init_on_session_start=True):
+    def _make_provider_with_strategy(
+        self,
+        strategy,
+        init_on_session_start=True,
+        existing_messages=None,
+    ):
         """Create a HonchoMemoryProvider and track migrate_memory_files calls."""
         from plugins.memory.honcho.client import HonchoClientConfig
         from unittest.mock import patch, MagicMock
@@ -949,7 +954,7 @@ class TestPerSessionMigrateGuard:
 
         mock_manager = MagicMock()
         mock_session = MagicMock()
-        mock_session.messages = []  # empty = new session → triggers migration path
+        mock_session.messages = existing_messages or []
         mock_manager.get_or_create.return_value = mock_session
 
         with patch("plugins.memory.honcho.client.HonchoClientConfig.from_global_config", return_value=cfg), \
@@ -966,8 +971,11 @@ class TestPerSessionMigrateGuard:
         mock_manager.migrate_memory_files.assert_not_called()
 
     def test_migrate_runs_for_per_directory(self):
-        """per-directory strategy with empty session SHOULD call migrate_memory_files."""
-        _, mock_manager = self._make_provider_with_strategy("per-directory")
+        """The ledger is checked even when the resolved session has messages."""
+        _, mock_manager = self._make_provider_with_strategy(
+            "per-directory",
+            existing_messages=[{"role": "user", "content": "existing"}],
+        )
         mock_manager.migrate_memory_files.assert_called_once()
 
 
