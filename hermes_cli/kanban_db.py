@@ -5474,6 +5474,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    evidence: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -5500,12 +5501,68 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    ``evidence`` is an optional falsification record the caller MUST supply
+    for non-dependency blocks (``needs_input`` / ``capability`` / ``None`` /
+    ``transient``) when the verified-blocker gate is enabled under
+    ``kanban.require_block_evidence`` in ``config.yaml``. It captures the
+    worker's attempt to verify the blocking condition before declaring the
+    block — the runtime gate against declaring a blocker without first
+    falsifying it (Article XII P5 falsify-before-concluding). When supplied,
+    the string is recorded in the ``blocked`` event payload and in the
+    synthesized run summary so the falsification is auditable post-hoc. When
+    the gate is enabled and ``evidence`` is empty/None on a block that would
+    land in ``blocked`` (not ``todo``, not ``triage``), ``block_task`` raises
+    ``ValueError`` — the transition is structurally impossible without
+    evidence. The validation is intentionally a hard error (not a warning):
+    the failure mode being prevented is "agent declared a false blocker,"
+    which Article XII P5 already declares an architectural violation.
+    Dependency blocks and loop-detected routing-to-triage are exempt: the
+    former is a routing decision not a claim about external state, and the
+    latter is detected by the runtime itself (no falsification needed).
+
+    When the gate is disabled (the default for backward compatibility with
+    existing code and tests), ``evidence`` is recorded when supplied but
+    is not required — call sites that have not yet been updated continue
+    to work. Operators enable the gate in their ``config.yaml`` under
+    ``kanban.require_block_evidence: true`` to opt into the
+    verified-blocker rule.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+        )
+    # Evidence gate (verified-blocker rule): a non-dependency block that
+    # would land in ``blocked`` (not ``todo``, not ``triage``) requires a
+    # falsification record from the caller when the gate is enabled in
+    # ``config.yaml`` under ``kanban.require_block_evidence: true``. This
+    # is the structural enforcement of "blockers create work, not waiting"
+    # (Article XIV P2) and "falsify before concluding" (Article XII P5).
+    # Without this gate, an agent can transition a task to ``blocked`` on
+    # a hypothetical or unverified condition — the failure mode observed in
+    # the 2026-07-19 ``Verify live state → Blocked on SSH key`` incident.
+    # Off by default so existing code and tests are not broken; production
+    # deployments enable it explicitly via config.
+    try:
+        from hermes_cli.config import load_config
+
+        _kanban_cfg = (load_config().get("kanban") or {})
+    except Exception:
+        _kanban_cfg = {}
+    _require_evidence = bool(_kanban_cfg.get("require_block_evidence", False))
+    if _require_evidence and kind != "dependency" and not (
+        evidence and evidence.strip()
+    ):
+        raise ValueError(
+            "block_task: evidence is required for non-dependency blocks when "
+            "kanban.require_block_evidence is enabled in config.yaml. The "
+            "caller MUST record the falsification attempt (e.g. the command "
+            "run, the result observed, the conclusion drawn) before "
+            "transitioning a task to 'blocked'. See Article XII P5 (falsify "
+            "before concluding) and Article XIV P2 (blockers create work, "
+            "not waiting). For dependency blocks use kind='dependency'."
         )
     routed_to = "blocked"
     recurrences = 0
@@ -5548,7 +5605,9 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=(
+                    f"{reason}\n\n[evidence]\n{evidence}" if evidence else reason
+                ),
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -5602,7 +5661,9 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=(
+                    f"{reason}\n\n[evidence]\n{evidence}" if evidence else reason
+                ),
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -5656,19 +5717,30 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=(
+                    f"{reason}\n\n[evidence]\n{evidence}" if evidence else reason
+                ),
             )
             # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
+            # reason is preserved in attempt history. When evidence was
+            # supplied, the run summary includes it so the falsification
+            # attempt is auditable in task_runs (not just in the event log).
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
-                    summary=reason,
+                    summary=(
+                        f"{reason}\n\n[evidence]\n{evidence}" if evidence else reason
+                    ),
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    "evidence": evidence,
+                },
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
