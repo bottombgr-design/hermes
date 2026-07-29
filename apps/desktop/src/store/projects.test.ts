@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $sidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
-import { applyConfiguredDefaultProjectDir } from '@/store/session'
+import { $currentCwd, $selectedStoredSessionId, applyConfiguredDefaultProjectDir } from '@/store/session'
 
 import {
   $activeProjectId,
@@ -20,6 +20,7 @@ import {
   endSessionMutation,
   enterProject,
   exitProjectScope,
+  followActiveSessionCwd,
   openProjectCreate,
   pickProjectFolder,
   projectNameForCwd,
@@ -483,5 +484,131 @@ describe('tombstone pruning', () => {
     await refreshProjectTree()
 
     expect($removedSessionIds.get().has('sess-1')).toBe(false)
+  })
+})
+
+describe('followActiveSessionCwd', () => {
+  const treeNode = (
+    over: Partial<SidebarProjectTree> & Pick<SidebarProjectTree, 'id' | 'label'>
+  ): SidebarProjectTree => ({
+    path: null,
+    repos: [],
+    sessionCount: 0,
+    ...over
+  })
+
+  const openGatewayReturning = (requestResult: unknown) => {
+    const gateway = {
+      connectionState: 'open',
+      request: vi.fn().mockResolvedValue(requestResult)
+    }
+
+    activeGateway.mockImplementation(() => gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    return gateway
+  }
+
+  beforeEach(() => {
+    $projectTree.set([])
+    $projectScope.set(ALL_PROJECTS)
+    $currentCwd.set('')
+    $selectedStoredSessionId.set(null)
+  })
+
+  it('skips refresh RPC round-trips when the project is already in the cached tree', async () => {
+    $projectTree.set([
+      treeNode({ id: 'p_known', label: 'Known', path: '/repos/known' })
+    ])
+    $currentCwd.set('/repos/known')
+
+    const gateway = openGatewayReturning({ active_id: null, projects: [], scoped_session_ids: [] })
+
+    await followActiveSessionCwd('/repos/known')
+
+    // Fast path: no projects.list / projects.tree RPC calls (enterProject may
+    // still fire projects.set_active, which is fine — it's not a refresh).
+    const calledMethods = gateway.request.mock.calls.map((c: unknown[]) => c[0])
+    expect(calledMethods).not.toContain('projects.list')
+    expect(calledMethods).not.toContain('projects.tree')
+    expect($projectScope.get()).toBe('p_known')
+  })
+
+  it('does not yank sidebar scope when the user switches sessions mid-flight', async () => {
+    // Unknown project → forces the RPC path
+    $currentCwd.set('/repos/unknown')
+    $selectedStoredSessionId.set('sess-a')
+
+    // Deferred RPC so we can mutate state while it's in flight
+    let resolveRpc!: (value: unknown) => void
+    const rpcPromise = new Promise(resolve => { resolveRpc = resolve })
+    const gateway = {
+      connectionState: 'open',
+      request: vi.fn().mockReturnValue(rpcPromise)
+    }
+    activeGateway.mockImplementation(() => gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    const followPromise = followActiveSessionCwd('/repos/unknown')
+
+    // User switches to another session while the RPC is in flight
+    $selectedStoredSessionId.set('sess-b')
+
+    // RPC resolves with a project that covers the old cwd
+    resolveRpc({
+      active_id: null,
+      projects: [treeNode({ id: 'p_unknown', label: 'Unknown', path: '/repos/unknown' })],
+      scoped_session_ids: []
+    })
+
+    await followPromise
+
+    // Staleness guard: scope must NOT have been yanked to the old session's project
+    expect($projectScope.get()).toBe(ALL_PROJECTS)
+  })
+
+  it('does not yank sidebar scope when the live cwd moved away mid-flight', async () => {
+    $currentCwd.set('/repos/old')
+    $selectedStoredSessionId.set('sess-a')
+
+    let resolveRpc!: (value: unknown) => void
+    const rpcPromise = new Promise(resolve => { resolveRpc = resolve })
+    const gateway = {
+      connectionState: 'open',
+      request: vi.fn().mockReturnValue(rpcPromise)
+    }
+    activeGateway.mockImplementation(() => gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    const followPromise = followActiveSessionCwd('/repos/old')
+
+    // Agent cd'd again while the RPC was in flight
+    $currentCwd.set('/repos/new')
+
+    resolveRpc({
+      active_id: null,
+      projects: [treeNode({ id: 'p_old', label: 'Old', path: '/repos/old' })],
+      scoped_session_ids: []
+    })
+
+    await followPromise
+
+    expect($projectScope.get()).toBe(ALL_PROJECTS)
+  })
+
+  it('follows into the project when nothing changed mid-flight', async () => {
+    $currentCwd.set('/repos/fresh')
+    $selectedStoredSessionId.set('sess-a')
+
+    const gateway = openGatewayReturning({
+      active_id: null,
+      projects: [treeNode({ id: 'p_fresh', label: 'Fresh', path: '/repos/fresh' })],
+      scoped_session_ids: []
+    })
+
+    await followActiveSessionCwd('/repos/fresh')
+
+    expect(gateway.request).toHaveBeenCalled()
+    expect($projectScope.get()).toBe('p_fresh')
   })
 })
