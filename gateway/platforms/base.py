@@ -5554,8 +5554,20 @@ class BasePlatformAdapter(ABC):
                 _response_pre_extract = response
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                _extracted_media_files, response = self.extract_media(response)
+                media_files = self.filter_media_delivery_paths(_extracted_media_files)
+                if _extracted_media_files and not media_files:
+                    logger.warning(
+                        "[%s] response_delivery_blocked: all %d MEDIA attachment(s) "
+                        "were rejected by delivery path policy for %s",
+                        self.name, len(_extracted_media_files), event.source.chat_id,
+                    )
+                    if not response.strip():
+                        response = (
+                            "⚠️ The file was generated, but its path is not authorized "
+                            "for attachment delivery, so it was not uploaded.\n"
+                            "Write the file under $HERMES_HOME/output/ and try again."
+                        )
 
                 # Deduplicate against media already delivered in prior turns.
                 # The model may echo a previous MEDIA: tag or bare file path in
