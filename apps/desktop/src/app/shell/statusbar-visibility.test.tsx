@@ -1,8 +1,17 @@
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
+const getHermesConfigRecord = vi.fn(async () => ({}))
+const saveHermesConfig = vi.fn(async (_config: unknown) => ({ ok: true }))
+
+vi.mock('@/hermes', () => ({
+  getHermesConfigRecord: () => getHermesConfigRecord(),
+  saveHermesConfig: (config: unknown) => saveHermesConfig(config)
+}))
+
 import { StatusbarControls, type StatusbarItem } from '@/app/shell/statusbar-controls'
+import { $desktopStatusbarMode, applyDesktopStatusbarFromConfig } from '@/store/desktop-statusbar'
 import {
   $statusbarHiddenIds,
   $statusbarVisible,
@@ -27,7 +36,7 @@ beforeAll(() => {
 afterEach(() => {
   cleanup()
   $statusbarHiddenIds.set([...STATUSBAR_HIDDEN_BY_DEFAULT])
-  $statusbarVisible.set(true)
+  applyDesktopStatusbarFromConfig({ display: { desktop_statusbar: 'on' } })
 })
 
 const item = (id: string, label: string, extra: Partial<StatusbarItem> = {}): StatusbarItem => ({
@@ -132,9 +141,11 @@ describe('whole-bar visibility', () => {
     openContextMenu(statusbar)
     fireEvent.click(await screen.findByRole('menuitem', { name: /hide status bar/i }))
 
+    await waitFor(() => expect($desktopStatusbarMode.get()).toBe('off'))
     expect($statusbarVisible.get()).toBe(false)
 
     toggleStatusbarVisible()
+    await waitFor(() => expect($desktopStatusbarMode.get()).toBe('on'))
     expect($statusbarVisible.get()).toBe(true)
   })
 

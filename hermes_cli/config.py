@@ -1987,6 +1987,11 @@ DEFAULT_CONFIG = {
         "focus_view": False,
         "focus_saved_tool_progress": "all",
         "skin": "default",
+        # Desktop bottom status bar visibility. Independent from the TUI's
+        # `/statusbar` setting because the two surfaces have different chrome.
+        # "auto-hide" reveals the bar when the pointer or keyboard focus moves
+        # to the bottom edge of the Desktop window.
+        "desktop_statusbar": "on",  # on | off | auto-hide
         # UI language for static user-facing messages (approval prompts, a
         # handful of gateway slash-command replies).  Does NOT affect agent
         # responses, log lines, tool outputs, or slash-command descriptions.
