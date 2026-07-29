@@ -145,6 +145,7 @@ import {
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
+  parseStoredTokenSet,
   parseTokenResponse,
   resolveLoginStrategy,
   tokenNeedsRefresh
@@ -6216,14 +6217,24 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
     const plaintext = decryptDesktopSecret(secret)
 
     if (!plaintext) {
+      rememberLog(
+        `[native-oauth] failed to decrypt stored tokens for ${baseUrl}; keeping stored entry for retry`
+      )
+
       return null
     }
 
-    const tokens = parseTokenResponse(JSON.parse(plaintext))
+    const tokens = parseStoredTokenSet(JSON.parse(plaintext))
     _nativeTokens.set(baseUrl, tokens)
 
     return tokens
-  } catch {
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+
+    rememberLog(
+      `[native-oauth] failed to load stored tokens for ${baseUrl}: ${detail}`
+    )
+
     return null
   }
 }
