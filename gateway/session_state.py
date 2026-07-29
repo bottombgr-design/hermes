@@ -148,6 +148,9 @@ class PersistentState:
     # Monotonic run-generation counter (#28686).  NEVER reset: clearing it
     # would break stale-run detection.
     run_generation: int = 0
+    # Generation created by the latest explicit invalidation. Ordinary later
+    # turns advance run_generation without changing this boundary marker.
+    last_invalidation_generation: int = 0
 
 
 @dataclass

@@ -1,5 +1,6 @@
 """Tests for gateway /fast support and Priority Processing routing."""
 
+import asyncio
 import sys
 import threading
 import types
@@ -10,9 +11,10 @@ import pytest
 import yaml
 
 import gateway.run as gateway_run
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from plugins.platforms.slack.adapter import SlackAdapter
 
 
 class _CapturingAgent:
@@ -97,6 +99,17 @@ def _make_discord_auto_thread_source() -> SessionSource:
         parent_chat_id="100",
         auto_thread_created=True,
         auto_thread_initial_name="raw user prompt",
+    )
+
+
+def _make_slack_assistant_thread_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.SLACK,
+        chat_id="D123",
+        chat_type="dm",
+        user_id="U_USER",
+        thread_id="171.111",
+        scope_id="T_TEAM",
     )
 
 
@@ -298,6 +311,200 @@ async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, 
     mock_schedule.assert_called_once()
     assert mock_schedule.call_args.args[1] == "session-1"
     assert mock_schedule.call_args.args[2] == "Semantic Session Title"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_passes_slack_generated_thread_title_callback(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    runner._session_db = SimpleNamespace(_db=MagicMock())  # type: ignore[assignment]
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    with patch("agent.title_generator.maybe_auto_title") as mock_title:
+        await runner._run_agent(
+            message="raw user prompt",
+            context_prompt="",
+            history=[],
+            source=_make_slack_assistant_thread_source(),
+            session_id="session-1",
+            session_key="agent:main:slack:dm:D123:thread:171.111",
+            run_generation=7,
+        )
+
+    mock_title.assert_called_once()
+    callback = mock_title.call_args.kwargs["title_callback"]
+    with patch.object(runner, "_schedule_slack_generated_thread_title") as mock_schedule:
+        callback("Semantic Session Title")
+    mock_schedule.assert_called_once()
+    assert mock_schedule.call_args.args[1] == "session-1"
+    assert mock_schedule.call_args.args[2] == "Semantic Session Title"
+    assert mock_schedule.call_args.kwargs == {
+        "session_key": "agent:main:slack:dm:D123:thread:171.111",
+        "run_generation": 7,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stale_slack_session_does_not_set_generated_thread_title():
+    runner = _make_runner()
+    adapter = SimpleNamespace(set_generated_assistant_thread_title=AsyncMock())
+    runner.adapters = {Platform.SLACK: adapter}  # type: ignore[dict-item]
+    runner.session_store = SimpleNamespace(  # type: ignore[assignment]
+        get_or_create_session=lambda source: SimpleNamespace(session_id="session-2")
+    )
+
+    await runner._set_slack_generated_thread_title(
+        _make_slack_assistant_thread_source(),
+        "session-1",
+        "Stale Session Title",
+    )
+
+    adapter.set_generated_assistant_thread_title.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reset_invalidation_blocks_old_slack_title_before_session_rotation(
+    monkeypatch, tmp_path
+):
+    """An old title cannot mutate Slack while /new cleanup still holds the old ID."""
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    runner._session_db = SimpleNamespace(_db=MagicMock())  # type: ignore[assignment]
+    source = _make_slack_assistant_thread_source()
+    session_key = runner._session_key_for_source(source)
+    old_generation = runner._begin_session_run_generation(session_key)
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(
+        tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"}
+    )
+
+    with patch("agent.title_generator.maybe_auto_title") as mock_title:
+        await runner._run_agent(
+            message="raw user prompt",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key=session_key,
+            run_generation=old_generation,
+        )
+    old_title_callback = mock_title.call_args.kwargs["title_callback"]
+
+    slack = SlackAdapter(PlatformConfig(enabled=True, token="***"))
+    slack._app = MagicMock()
+    slack._app.client = AsyncMock()
+    slack._team_clients = {"T_TEAM": slack._app.client}
+    slack._assistant_thread_title_started_at = 0.0
+    runner.adapters = {Platform.SLACK: slack}
+
+    old_entry = SimpleNamespace(session_id="session-1")
+    new_entry = SimpleNamespace(session_id="session-2")
+    runner.session_store = MagicMock()
+    runner.session_store._entries = {session_key: old_entry}
+    runner.session_store.get_or_create_session.return_value = old_entry
+    runner.session_store.reset_session.return_value = new_entry
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner._session_db = None
+    runner._clear_conversation_scope = MagicMock()
+    runner._evict_cached_agent = MagicMock()
+    runner._reset_notice_session_info = lambda _source: ""
+    runner._telegram_topic_new_header = lambda _source: ""
+    runner._is_telegram_topic_lane = lambda _source: False
+
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def pause_cleanup(*_args):
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    runner._run_in_executor_with_context = pause_cleanup
+    runner._agent_cache[session_key] = MagicMock()
+    reset_task = asyncio.create_task(
+        runner._handle_reset_command(MessageEvent(text="/new", source=source))
+    )
+    await cleanup_started.wait()
+
+    scheduled_titles = []
+
+    def capture_title_task(coro, loop, **_kwargs):
+        task = loop.create_task(coro)
+        scheduled_titles.append(task)
+        return task
+
+    monkeypatch.setattr(gateway_run, "safe_schedule_threadsafe", capture_title_task)
+    try:
+        old_title_callback("Stale Session Title")
+        assert len(scheduled_titles) == 1
+        await asyncio.gather(*scheduled_titles)
+
+        key = ("T_TEAM", "D123", "171.111")
+        slack._app.client.assistant_threads_setTitle.assert_not_awaited()
+        assert key not in slack._claimed_assistant_thread_titles
+        assert key not in slack._attempted_assistant_thread_titles
+    finally:
+        release_cleanup.set()
+        await reset_task
+
+
+@pytest.mark.asyncio
+async def test_later_turn_does_not_suppress_first_slack_generated_title():
+    runner = _make_runner()
+    source = _make_slack_assistant_thread_source()
+    session_key = runner._session_key_for_source(source)
+    title_generation = runner._begin_session_run_generation(session_key)
+    later_generation = runner._begin_session_run_generation(session_key)
+    assert later_generation > title_generation
+
+    adapter = SimpleNamespace(set_generated_assistant_thread_title=AsyncMock())
+    runner.adapters = {Platform.SLACK: adapter}  # type: ignore[dict-item]
+
+    await runner._set_slack_generated_thread_title(
+        source,
+        "session-1",
+        "First Generated Title",
+        session_key=session_key,
+        run_generation=title_generation,
+    )
+
+    adapter.set_generated_assistant_thread_title.assert_awaited_once()
 
 
 def test_session_source_preserves_discord_auto_thread_metadata():

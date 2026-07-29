@@ -1009,6 +1009,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Best-effort guard so automatic Slack AI thread titles are set once
         # per visible DM thread instead of on every reply.
         self._titled_assistant_threads: set = set()
+        self._titling_assistant_threads: set = set()
+        self._attempted_assistant_thread_titles: set = set()
+        # Exact ownership claims are intentionally retained for this process's
+        # lifetime. Evicting them would reauthorize an unconditional remote
+        # title mutation; restart safety is handled by the thread-age fence.
+        self._claimed_assistant_thread_titles: set = set()
+        self._assistant_thread_title_started_at = time.time()
         self._TITLED_ASSISTANT_THREADS_MAX = 5000
         # Slash-command contexts: stash response_url + user_id so send()
         # can route the first reply ephemerally.  Keyed by
@@ -4601,6 +4608,86 @@ class SlackAdapter(BasePlatformAdapter):
                 self._titled_assistant_threads, excess, lambda e: e[2]
             )
 
+    async def set_generated_assistant_thread_title(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        title: str,
+        *,
+        team_id: str = "",
+        is_current_session: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Set the first visible title from Hermes's generated session title."""
+        # This callback runs after the inbound event. Never fall back to the
+        # primary workspace client when its workspace stamp is missing or
+        # unknown; that could disclose the generated title to the wrong team.
+        if (
+            not self._assistant_thread_title_enabled()
+            or not team_id
+            or team_id not in self._team_clients
+        ):
+            return
+        key = self._workspace_thread_key(team_id, channel_id, thread_ts)
+        if not key:
+            return
+        try:
+            thread_started_at = float(thread_ts)
+        except (TypeError, ValueError):
+            return
+        if thread_started_at < self._assistant_thread_title_started_at:
+            # A reconstructed process has no authoritative title-ownership
+            # history for older remote threads. Do not reauthorize them.
+            return
+        if (
+            key in self._claimed_assistant_thread_titles
+            or key in self._titled_assistant_threads
+            or key in self._titling_assistant_threads
+            or key in self._attempted_assistant_thread_titles
+        ):
+            return
+        if is_current_session is not None:
+            try:
+                if is_current_session() is not True:
+                    return
+            except Exception:
+                logger.debug(
+                    "[Slack] failed to verify current session before setting title",
+                    exc_info=True,
+                )
+                return
+        # Consume the exact one-shot authorization before any await. This set
+        # deliberately is not evicted during the process lifetime.
+        self._claimed_assistant_thread_titles.add(key)
+        # Keep in-flight claims separate from the bounded attempt history so
+        # history eviction cannot admit a duplicate while Slack is awaiting.
+        self._titling_assistant_threads.add(key)
+        try:
+            await self._set_assistant_thread_title(
+                channel_id,
+                thread_ts,
+                title,
+                team_id=team_id,
+            )
+        finally:
+            # A timeout may mean Slack committed the title but the response was
+            # lost. Preserve an at-most-once attempt record before releasing the
+            # in-flight claim so no concurrent callback can slip between them.
+            self._attempted_assistant_thread_titles.add(key)
+            self._titling_assistant_threads.discard(key)
+            if (
+                len(self._attempted_assistant_thread_titles)
+                > self._TITLED_ASSISTANT_THREADS_MAX
+            ):
+                excess = (
+                    len(self._attempted_assistant_thread_titles)
+                    - self._TITLED_ASSISTANT_THREADS_MAX // 2
+                )
+                self._discard_oldest_by_thread_ts(
+                    self._attempted_assistant_thread_titles,
+                    excess,
+                    lambda e: e[2],
+                )
+
     def _seed_assistant_thread_session(self, metadata: Dict[str, str]) -> None:
         """Prime the session store so assistant threads get stable user scoping."""
         session_store = getattr(self, "_session_store", None)
@@ -6185,17 +6272,6 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve channel display name (cached after first lookup) so logs
         # and agent context show #channel / peer names instead of raw IDs.
         channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
-
-        # Slack's AI Agent Messages tab shows visible app threads; title the
-        # first DM thread turn from the user's prompt when Slack AI APIs are
-        # available. This is best-effort and configurable via config.yaml.
-        if is_dm and thread_ts and msg_type != MessageType.COMMAND:
-            await self._set_assistant_thread_title(
-                channel_id,
-                thread_ts,
-                original_text or text,
-                team_id=team_id,
-            )
 
         # Build source
         source = self.build_source(
