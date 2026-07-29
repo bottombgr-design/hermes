@@ -7909,6 +7909,9 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        An audited, deliberate ready/unblock/manual-promote event after the
+        newest PR-bearing comment overrides this guard.  Comment prose alone
+        never does, so an offline or unresolved PR remains fail-closed.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -7991,13 +7994,62 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    A later audited status-to-ready, unblock, or actor-bound manual
+    #    promotion is an explicit duplicate-PR override.  This deliberately
+    #    relies only on durable local board state: comment claims (including
+    #    "closed") cannot authorize a retry, and no network/API failure can
+    #    silently turn an unresolved PR into a closed one.  The strict
+    #    timestamp comparison stays fail-closed when ordering is ambiguous.
+    #
+    #    Comments and resume events must come from one SQLite statement.  The
+    #    connection runs in autocommit mode, so separate SELECTs would open
+    #    separate snapshots and let a newer unresolved PR commit between them
+    #    while an older resume event incorrectly authorizes another worker.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    pr_inputs = conn.execute(
+        "SELECT 'comment' AS record_type, id AS record_id, body, created_at, "
+        "NULL AS kind, NULL AS payload "
+        "FROM task_comments WHERE task_id = ? AND created_at >= ? "
+        "UNION ALL "
+        "SELECT 'event' AS record_type, id AS record_id, NULL AS body, "
+        "created_at, kind, payload FROM task_events "
+        "WHERE task_id = ? AND created_at >= ? "
+        "AND kind IN ('status', 'unblocked', 'promoted_manual') "
+        "ORDER BY record_type, created_at DESC, record_id DESC",
+        (task_id, pr_cutoff, task_id, pr_cutoff),
+    ).fetchall()
+
+    latest_pr_comment_at: Optional[int] = None
+    for record in pr_inputs:
+        if record["record_type"] != "comment":
+            continue
+        if record["body"] and _RESPAWN_GUARD_PR_URL_RE.search(record["body"]):
+            latest_pr_comment_at = int(record["created_at"])
+            break
+
+    if latest_pr_comment_at is not None:
+        for event in pr_inputs:
+            if (
+                event["record_type"] != "event"
+                or int(event["created_at"]) <= latest_pr_comment_at
+            ):
+                continue
+            if event["kind"] == "unblocked":
+                return None
+            try:
+                payload = json.loads(event["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if event["kind"] == "status" and payload.get("status") == "ready":
+                return None
+            if (
+                event["kind"] == "promoted_manual"
+                and str(payload.get("actor") or "").strip()
+            ):
+                return None
+        return "active_pr"
 
     return None
 

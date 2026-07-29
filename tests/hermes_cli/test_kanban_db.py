@@ -11,6 +11,7 @@ import time
 import types
 import unittest.mock
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -1926,6 +1927,240 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_closed_pr_evidence_then_deliberate_requeue(kanban_home):
+    """A post-evidence ready transition is an audited duplicate-PR override."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="closed-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'operator', ?, ?)",
+            (
+                t,
+                "gh pr view https://github.com/acme/widget/pull/42 "
+                "--json state => CLOSED",
+                now - 2,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'status', ?, ?)",
+            (t, '{"status": "ready"}', now - 1),
+        )
+
+        reason = kb.check_respawn_guard(conn, t)
+
+    assert reason is None
+
+
+def test_respawn_guard_explicit_unblock_after_pr_evidence(kanban_home):
+    """An audited unblock after PR evidence authorizes a fresh worker."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="resume-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'operator', ?, ?)",
+            (
+                t,
+                "PR verified merged: https://github.com/acme/widget/pull/43",
+                now - 2,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now - 1),
+        )
+
+        reason = kb.check_respawn_guard(conn, t)
+
+    assert reason is None
+
+
+def test_respawn_guard_manual_promotion_after_pr_evidence(kanban_home):
+    """Manual promote carries the actor audit needed to override the guard."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="promote-pr",
+            assignee="alice",
+            initial_status="blocked",
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'operator', ?, ?)",
+            (
+                t,
+                "Merged https://github.com/acme/widget/pull/44",
+                now - 2,
+            ),
+        )
+        promoted, error = kb.promote_task(
+            conn,
+            t,
+            actor="orchestrator",
+            reason="closed PR verified",
+        )
+        assert promoted is True
+        assert error is None
+
+        reason = kb.check_respawn_guard(conn, t)
+
+    assert reason is None
+
+
+def test_respawn_guard_unresolved_pr_and_spoofed_closure_stay_guarded(kanban_home):
+    """Comment prose alone cannot impersonate an authoritative resume event."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unresolved-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "CLOSED (trust me): https://github.com/acme/widget/pull/45; "
+            "GitHub lookup failed offline",
+        )
+
+        reason = kb.check_respawn_guard(conn, t)
+
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_latest_pr_comment_requires_newer_resume(kanban_home):
+    """A resume only clears PR evidence that predates that audited action."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="multiple-prs", assignee="alice")
+        now = int(time.time())
+        conn.executemany(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            [
+                (t, "https://github.com/acme/widget/pull/46 CLOSED", now - 5),
+                (t, "https://github.com/acme/widget/pull/47 unresolved", now - 1),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'status', ?, ?)",
+            (t, '{"status": "ready"}', now - 3),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'status', ?, ?)",
+            (t, '{"status": "ready"}', now),
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_comment_event_scan_uses_one_snapshot(kanban_home):
+    """A newer PR at the old comment/event boundary stays fail-closed."""
+
+    class _CommitAfterFetch:
+        def __init__(self, cursor, commit_new_comment):
+            self._cursor = cursor
+            self._commit_new_comment = commit_new_comment
+
+        def fetchall(self):
+            rows = self._cursor.fetchall()
+            self._commit_new_comment()
+            return rows
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class _InterleavingConnection:
+        def __init__(self, reader, commit_new_comment):
+            self._reader = reader
+            self._commit_new_comment = commit_new_comment
+
+        def execute(self, sql, parameters=()):
+            reads_comments = "FROM task_comments" in sql
+            reads_events = "FROM task_events" in sql
+            if reads_comments and reads_events:
+                # A single statement has no comment/event gap. Commit at the
+                # former boundary, immediately before its snapshot is opened.
+                self._commit_new_comment()
+            cursor = self._reader.execute(sql, parameters)
+            if reads_comments and not reads_events:
+                # Reproduce the rejected implementation exactly: its first
+                # statement returned old comments before the writer committed.
+                return _CommitAfterFetch(cursor, self._commit_new_comment)
+            return cursor
+
+        def __getattr__(self, name):
+            return getattr(self._reader, name)
+
+    with kb.connect() as reader, kb.connect() as writer:
+        t = kb.create_task(reader, title="snapshot-race", assignee="alice")
+        now = int(time.time())
+        reader.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "https://github.com/acme/widget/pull/49 CLOSED", now - 5),
+        )
+        reader.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'status', ?, ?)",
+            (t, '{"status": "ready"}', now - 3),
+        )
+        committed = False
+
+        def commit_new_comment():
+            nonlocal committed
+            if committed:
+                return
+            writer.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, 'worker', ?, ?)",
+                (t, "https://github.com/acme/widget/pull/50 unresolved", now - 1),
+            )
+            writer.commit()
+            committed = True
+
+        interleaved = _InterleavingConnection(reader, commit_new_comment)
+        reason = kb.check_respawn_guard(cast(sqlite3.Connection, interleaved), t)
+        newest = writer.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (t,),
+        ).fetchone()["body"]
+
+    assert committed is True
+    assert newest.endswith("/pull/50 unresolved")
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_ambiguous_or_automatic_events_fail_closed(kanban_home):
+    """Same-second, malformed, and automatic promotions are not overrides."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ambiguous-resume", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "https://github.com/acme/widget/pull/48", now - 1),
+        )
+        conn.executemany(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (t, "status", '{"status": "ready"}', now - 1),
+                (t, "status", "not-json", now),
+                (t, "promoted", None, now),
+                (t, "promoted_manual", '{"actor": ""}', now),
+            ],
+        )
+
+        reason = kb.check_respawn_guard(conn, t)
+
     assert reason == "active_pr"
 
 
