@@ -3,6 +3,8 @@
 import json
 
 from agent.tool_guardrails import (
+    IDEMPOTENT_TOOL_NAMES,
+    MUTATING_TOOL_NAMES,
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolCallSignature,
@@ -387,3 +389,80 @@ def test_other_tools_never_touched_by_loop_caps():
     # read_file / terminal / etc. are unaffected regardless of the web cap.
     for _ in range(10):
         assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+
+# ── Config-declared tool-set extension (#71585) ─────────────────────────
+
+
+def test_config_extends_idempotent_and_mutating_tool_sets():
+    """#71585: config-declared tool names EXTEND the built-in sets rather than
+    replacing them, so built-in tools keep their default classification."""
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {
+            "idempotent_tools": ["mcp__myserver__search", " mcp__myserver__lookup "],
+            "mutating_tools": ["mcp__myserver__delete"],
+        }
+    )
+
+    # Built-ins are preserved (union, not replace).
+    assert IDEMPOTENT_TOOL_NAMES <= cfg.idempotent_tools
+    assert MUTATING_TOOL_NAMES <= cfg.mutating_tools
+    # Declared names are added (whitespace stripped).
+    assert "mcp__myserver__search" in cfg.idempotent_tools
+    assert "mcp__myserver__lookup" in cfg.idempotent_tools
+    assert "mcp__myserver__delete" in cfg.mutating_tools
+
+
+def test_config_tool_sets_fall_back_to_defaults_when_absent_or_malformed():
+    """Missing or malformed tool-set entries keep the built-in defaults."""
+    # Absent entirely.
+    assert ToolCallGuardrailConfig.from_mapping({}).idempotent_tools == IDEMPOTENT_TOOL_NAMES
+    assert ToolCallGuardrailConfig.from_mapping({}).mutating_tools == MUTATING_TOOL_NAMES
+
+    # Malformed values (bare string / non-iterable) fall back unchanged.
+    for bad in ("read_file", 42, {"read_file": 1}):
+        cfg = ToolCallGuardrailConfig.from_mapping(
+            {"idempotent_tools": bad, "mutating_tools": bad}
+        )
+        assert cfg.idempotent_tools == IDEMPOTENT_TOOL_NAMES
+        assert cfg.mutating_tools == MUTATING_TOOL_NAMES
+
+
+def test_config_declared_idempotent_tool_triggers_no_progress_guardrail():
+    """A custom tool declared idempotent via config is treated as idempotent,
+    so repeated identical successful output trips the no-progress guardrail."""
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {
+            "idempotent_tools": ["mcp__myserver__search"],
+            "no_progress_warn_after": 2,
+            "no_progress_block_after": 2,
+        }
+    )
+    controller = ToolCallGuardrailController(cfg)
+    args = {"query": "same"}
+    result = "same results"
+
+    for _ in range(2):
+        assert controller.before_call("mcp__myserver__search", args).action == "allow"
+        decision = controller.after_call("mcp__myserver__search", args, result, failed=False)
+
+    assert decision.action == "warn"
+    assert decision.code == "idempotent_no_progress_warning"
+
+
+def test_config_declared_mutating_tool_is_not_treated_as_idempotent():
+    """A custom tool declared mutating is never flagged as no-progress even
+    when it returns identical output repeatedly."""
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {
+            "mutating_tools": ["mcp__myserver__write"],
+            "no_progress_warn_after": 2,
+            "no_progress_block_after": 2,
+        }
+    )
+    controller = ToolCallGuardrailController(cfg)
+    args = {"path": "/tmp/x"}
+
+    for _ in range(3):
+        assert controller.before_call("mcp__myserver__write", args).action == "allow"
+        assert controller.after_call("mcp__myserver__write", args, "ok", failed=False).action == "allow"
