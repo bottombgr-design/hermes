@@ -33,6 +33,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
+    PATH_LITERAL_GUIDANCE,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -1216,6 +1217,26 @@ class TestEnvironmentHints:
     def test_wsl_hint_constant_mentions_mnt(self):
         assert "/mnt/c/" in WSL_ENVIRONMENT_HINT
         assert "WSL" in WSL_ENVIRONMENT_HINT
+        # Mount translate must not invite segment respelling (#71943).
+        assert "segments" in WSL_ENVIRONMENT_HINT.lower()
+
+    def test_path_literal_guidance_blocks_segment_respelling(self):
+        assert "opaque" in PATH_LITERAL_GUIDANCE.lower()
+        assert "felsokning" in PATH_LITERAL_GUIDANCE
+        assert "felsökning" in PATH_LITERAL_GUIDANCE
+        assert "f elsökning" in PATH_LITERAL_GUIDANCE
+        # Separator/mount translation stays allowed.
+        assert "/mnt/c/" in PATH_LITERAL_GUIDANCE
+
+    def test_build_environment_hints_includes_path_literal_guidance(self, monkeypatch):
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.delenv("HERMES_ENVIRONMENT_HINT", raising=False)
+        _pb._clear_backend_probe_cache()
+        result = _pb.build_environment_hints()
+        assert "Path literals are opaque" in result
+        assert "felsokning" in result
 
     def test_build_environment_hints_on_wsl(self, monkeypatch):
         import agent.prompt_builder as _pb
@@ -1227,6 +1248,8 @@ class TestEnvironmentHints:
         assert "WSL" in result
         # WSL block still carries the always-on host info ahead of it.
         assert "User home directory:" in result
+        # Universal path-literal guard is present even on WSL.
+        assert "Path literals are opaque" in result
 
     def test_build_environment_hints_on_linux_local(self, monkeypatch):
         import agent.prompt_builder as _pb
@@ -1247,6 +1270,8 @@ class TestEnvironmentHints:
         assert "PowerShell" not in result
         assert "hostname" not in result
         assert "WSL" not in result
+        # Universal path-literal guard is always on.
+        assert "Path literals are opaque" in result
 
     def test_build_environment_hints_on_windows_local(self, monkeypatch):
         import agent.prompt_builder as _pb
@@ -1264,7 +1289,7 @@ class TestEnvironmentHints:
         assert "NOT the username" in result
         assert "bash" in result
         assert "PowerShell" in result
-
+        assert "Path literals are opaque" in result
     def test_build_environment_hints_on_macos_local(self, monkeypatch):
         import agent.prompt_builder as _pb
         import sys
