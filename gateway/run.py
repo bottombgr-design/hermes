@@ -41,6 +41,7 @@ import signal
 import threading
 import time
 from collections import OrderedDict
+from contextlib import nullcontext
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
@@ -2207,9 +2208,11 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _new_gateway_session_ipc_event,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
+    is_gateway_session_ipc_task,
     merge_pending_message_event,
     utf16_len,
 )
@@ -2648,6 +2651,28 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     to a placeholder string.
     """
     return adapter.get_pending_message(session_key)
+
+
+def _pending_slash_is_command_leak(
+    pending: str | None, pending_event: MessageEvent | None
+) -> bool:
+    """Whether pending text is a user command that must not reach the agent.
+
+    Trusted session-IPC tasks may intentionally have slash-leading text, so
+    retain those events even when the textual fallback resembles a command.
+    """
+    text = str(pending or "").strip()
+    if not text.startswith("/") or is_gateway_session_ipc_task(pending_event):
+        return False
+    command_word = text.split(None, 1)[0][1:].lower()
+    if not command_word:
+        return False
+    try:
+        from hermes_cli.commands import resolve_command
+
+        return resolve_command(command_word) is not None
+    except Exception:
+        return False
 
 
 _INTERRUPT_REASON_STOP = "Stop requested"
@@ -4187,6 +4212,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._booted_from_restart: bool = False
         self._stop_task: Optional[asyncio.Task] = None
         self._restart_task: Optional[asyncio.Task] = None
+        # Owner-only, profile-scoped Unix socket used by ``hermes gateway
+        # inject``.  It is created only after adapters are ready and closed at
+        # the start of shutdown so no new internal work can enter a drain.
+        self._session_ipc_server = None
         self._executor_lock = threading.Lock()
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
@@ -5889,17 +5918,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
         """Append a /queue event to the FIFO chain for a session."""
-        if adapter is None:
-            return
-        pending_slot = getattr(adapter, "_pending_messages", None)
-        if pending_slot is None:
-            return
-        if session_key in pending_slot:
-            self._session_state(session_key).conversation.queued_events.append(
-                queued_event
-            )
-        else:
-            pending_slot[session_key] = queued_event
+        with self._busy_queue_guard():
+            if adapter is None:
+                return
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            if pending_slot is None:
+                return
+            if session_key in pending_slot:
+                self._session_state(session_key).conversation.queued_events.append(queued_event)
+            else:
+                pending_slot[session_key] = queued_event
 
     def _promote_queued_event(
         self,
@@ -5918,27 +5946,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             the slot so the NEXT recursion picks it up.
         Returns the (possibly updated) pending_event for drain to use.
         """
-        _q_state = self._peek_session_state(session_key)
-        overflow = _q_state.conversation.queued_events if _q_state else None
-        if not overflow:
+        with self._busy_queue_guard():
+            _q_state = self._peek_session_state(session_key)
+            overflow = _q_state.conversation.queued_events if _q_state else None
+            if not overflow:
+                return pending_event
+            next_queued = overflow.pop(0)
+            if pending_event is None:
+                return next_queued
+            if adapter is not None and hasattr(adapter, "_pending_messages"):
+                adapter._pending_messages[session_key] = next_queued
+            else:
+                # No adapter — push back so we don't silently drop the item.
+                overflow.insert(0, next_queued)
             return pending_event
-        next_queued = overflow.pop(0)
-        if pending_event is None:
-            return next_queued
-        if adapter is not None and hasattr(adapter, "_pending_messages"):
-            adapter._pending_messages[session_key] = next_queued
-        else:
-            # No adapter — push back so we don't silently drop the item.
-            overflow.insert(0, next_queued)
-        return pending_event
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
-        _q_state = self._peek_session_state(session_key)
-        depth = len(_q_state.conversation.queued_events) if _q_state else 0
-        if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
-            depth += 1
-        return depth
+        with self._busy_queue_guard():
+            _q_state = self._peek_session_state(session_key)
+            depth = len(_q_state.conversation.queued_events) if _q_state else 0
+            if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
+                depth += 1
+            return depth
+
+    def _dequeue_and_promote_queued_event(
+        self, session_key: str, adapter: Any
+    ) -> Optional["MessageEvent"]:
+        """Atomically consume the queue head and promote its successor."""
+        with self._busy_queue_guard():
+            pending_event = _dequeue_pending_event(adapter, session_key)
+            return self._promote_queued_event(session_key, adapter, pending_event)
 
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
@@ -5958,6 +5996,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         queued by the judge.  Remove only synthetic goal continuations while
         preserving normal /queue and user follow-up events.
         """
+        with self._busy_queue_guard():
+            return self._clear_goal_pending_continuations_locked(session_key, adapter)
+
+    def _clear_goal_pending_continuations_locked(self, session_key: str, adapter: Any) -> int:
         removed = 0
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
@@ -6839,7 +6881,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    def _busy_queue_guard(self):
+        """Return the re-entrant lock protecting one gateway's busy queues."""
+        guard = getattr(self, "_busy_queue_lock", None)
+        if guard is None:
+            guard = threading.RLock()
+            self._busy_queue_lock = guard
+        return guard
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+        with self._busy_queue_guard():
+            self._queue_or_replace_pending_event_locked(session_key, event)
+
+    def _queue_or_replace_pending_event_locked(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return
@@ -6914,6 +6968,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not successful_transcripts:
             return text
         return (enriched_text or text).strip()
+
+    def _enqueue_internal_fifo_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        adapter: Any,
+    ) -> bool:
+        """Admit one internal IPC task without touching user media merge state."""
+        with self._busy_queue_guard():
+            return self._enqueue_internal_fifo_event_locked(session_key, event, adapter)
+
+    def _enqueue_internal_fifo_event_locked(
+        self, session_key: str, event: MessageEvent, adapter: Any
+    ) -> bool:
+        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+            return False
+        before = self._queue_depth(session_key, adapter=adapter)
+        self._enqueue_fifo(session_key, event, adapter)
+        return self._queue_depth(session_key, adapter=adapter) == before + 1
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -8657,7 +8730,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Empty-text internal event — the _is_resume_pending branch in
             # _handle_message_with_agent prepends the proper reason-aware
             # system note before the turn runs.
-            event = MessageEvent(
+            event = _new_gateway_session_ipc_event(
                 text="",
                 message_type=MessageType.TEXT,
                 source=source,
@@ -9436,6 +9509,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._update_runtime_status("running")
 
+        # Local exact-session control plane.  This is deliberately a Unix
+        # socket under the active HERMES_HOME (mode 0600), never a TCP listener.
+        try:
+            from gateway.session_ipc import GatewaySessionIPCServer
+
+            self._session_ipc_server = GatewaySessionIPCServer(
+                self._inject_exact_session,
+                profile=self._active_profile_name(),
+            )
+            await self._session_ipc_server.start()
+            logger.info(
+                "Gateway session IPC listening at %s",
+                self._session_ipc_server.socket_path,
+            )
+        except Exception:
+            self._session_ipc_server = None
+            logger.warning("Gateway session IPC unavailable", exc_info=True)
+
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
         # other background tasks during stop(). Best-effort — a liveness probe
@@ -10173,6 +10264,271 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
+    def _resolve_exact_session_route(self, session_key: str):
+        """Return one exact live routing entry or fail closed.
+
+        The dictionary key and the entry's embedded key must agree.  A mismatch
+        means the durable routing index is corrupt/ambiguous; silently choosing
+        either side could inject work into another conversation.
+        """
+        from gateway.session_ipc import SessionIPCRequestError
+
+        session_store = getattr(self, "session_store", None)
+        if session_store is None:
+            raise SessionIPCRequestError("route_not_found", "Gateway session store is unavailable")
+        with session_store._lock:  # noqa: SLF001 - exact live routing snapshot
+            session_store._ensure_loaded_locked()  # noqa: SLF001
+            entry = session_store._entries.get(session_key)  # noqa: SLF001
+            if entry is None:
+                raise SessionIPCRequestError(
+                    "route_not_found",
+                    f"No live gateway route for exact session_key {session_key!r}",
+                )
+            if getattr(entry, "session_key", None) != session_key:
+                raise SessionIPCRequestError(
+                    "route_ambiguous",
+                    f"Gateway route key disagrees with its stored session_key for {session_key!r}",
+                )
+            return entry
+
+    async def _inject_exact_session(
+        self,
+        *,
+        profile: str,
+        session_key: str,
+        expected_session_id: str,
+        idempotency_key: str,
+        message: str,
+    ) -> Dict[str, Any]:
+        """Run exact-route validation and acceptance away from the event loop."""
+        cancelled = threading.Event()
+        mutation_gate = threading.Lock()
+        committed = threading.Event()
+        event_loop = asyncio.get_running_loop()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._inject_exact_session_sync,
+                profile=profile,
+                session_key=session_key,
+                expected_session_id=expected_session_id,
+                idempotency_key=idempotency_key,
+                message=message,
+                cancelled=cancelled,
+                mutation_gate=mutation_gate,
+                committed=committed,
+                event_loop=event_loop,
+            )
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while not mutation_gate.acquire(blocking=False):
+                await asyncio.sleep(0.001)
+            try:
+                if not committed.is_set():
+                    cancelled.set()
+                    raise
+            finally:
+                mutation_gate.release()
+            # A synchronous side effect already crossed the commit gate.  Wait
+            # for its definitive result instead of returning a false timeout
+            # that could trigger a duplicate retry.
+            return await asyncio.shield(worker)
+
+    @staticmethod
+    async def _accept_internal_task_on_loop(
+        adapter: Any,
+        event: MessageEvent,
+        session_key: str,
+        cancelled: threading.Event,
+    ) -> bool:
+        """Run adapter task creation on its owning event-loop thread."""
+        if cancelled.is_set():
+            return False
+        return bool(adapter.accept_internal_task(event, session_key))
+
+    def _inject_exact_session_sync(
+        self,
+        *,
+        profile: str,
+        session_key: str,
+        expected_session_id: str,
+        idempotency_key: str,
+        message: str,
+        cancelled: threading.Event,
+        mutation_gate: threading.Lock,
+        committed: threading.Event,
+        event_loop: asyncio.AbstractEventLoop,
+    ) -> Dict[str, Any]:
+        """Atomically validate and accept one non-command task on an exact route."""
+        from gateway.session_ipc import SessionIPCRequestError
+
+        def ensure_not_cancelled() -> None:
+            if cancelled.is_set():
+                raise SessionIPCRequestError(
+                    "request_timeout",
+                    "Gateway session acceptance timed out before mutation",
+                )
+
+        active_profile = self._active_profile_name()
+        if profile != active_profile:
+            raise SessionIPCRequestError(
+                "profile_mismatch",
+                f"Gateway serves profile {active_profile!r}, not {profile!r}",
+            )
+        if not message.strip():
+            raise SessionIPCRequestError("invalid_request", "message is required")
+        if not expected_session_id.strip():
+            raise SessionIPCRequestError("invalid_request", "expected_session_id is required")
+        if not idempotency_key.strip():
+            raise SessionIPCRequestError("invalid_request", "idempotency_key is required")
+        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
+            raise SessionIPCRequestError(
+                "route_unavailable",
+                "Gateway is not accepting new session tasks",
+            )
+
+        lock = getattr(self.session_store, "_lock", nullcontext())
+        with lock:
+            ensure_loaded = getattr(self.session_store, "_ensure_loaded_locked", None)
+            if callable(ensure_loaded):
+                ensure_loaded()
+            entries = getattr(self.session_store, "_entries", {})
+            entry = entries.get(session_key)
+            if entry is None:
+                raise SessionIPCRequestError(
+                    "route_not_found",
+                    f"No live gateway route for exact session_key {session_key!r}",
+                )
+            if getattr(entry, "session_key", None) != session_key:
+                raise SessionIPCRequestError(
+                    "route_ambiguous",
+                    f"Gateway route key disagrees with stored session_key {session_key!r}",
+                )
+
+            session_id = str(getattr(entry, "session_id", "") or "")
+            if session_id != expected_session_id:
+                raise SessionIPCRequestError(
+                    "route_rotated",
+                    f"Exact route no longer points to expected session {expected_session_id!r}",
+                )
+            if getattr(entry, "suspended", False):
+                raise SessionIPCRequestError("session_suspended", "Exact session is suspended")
+            if getattr(entry, "ended_at", None) or str(
+                getattr(entry, "status", "") or ""
+            ).lower() in {"ended", "closed", "terminated"}:
+                raise SessionIPCRequestError("session_ended", "Exact session has ended")
+            if self.session_store._is_session_ended_in_db(session_id):
+                raise SessionIPCRequestError("session_ended", "Exact session has ended")
+            ensure_not_cancelled()
+            if self.session_store._is_session_expired(entry):
+                raise SessionIPCRequestError("session_expired", "Exact session has expired")
+            ensure_not_cancelled()
+            if self.session_store._compression_tip_for_session_id(session_id) != session_id:
+                raise SessionIPCRequestError(
+                    "route_rotated",
+                    "Expected session is a stale parent of a newer compressed session",
+                )
+            ensure_not_cancelled()
+
+            source = getattr(entry, "origin", None)
+            if source is None:
+                raise SessionIPCRequestError(
+                    "route_ambiguous",
+                    f"Exact route {session_key!r} has no delivery origin",
+                )
+            source_profile = (getattr(source, "profile", None) or "").strip()
+            if source_profile and source_profile != profile:
+                raise SessionIPCRequestError(
+                    "profile_mismatch",
+                    f"Exact route belongs to profile {source_profile!r}, not {profile!r}",
+                )
+            if self._session_key_for_source(source) != session_key:
+                raise SessionIPCRequestError(
+                    "route_ambiguous",
+                    f"Stored route origin does not reproduce exact session_key {session_key!r}",
+                )
+
+            adapter = self._adapter_for_source(source)
+            if adapter is None:
+                raise SessionIPCRequestError(
+                    "route_unavailable",
+                    f"No live adapter owns exact route {session_key!r}",
+                )
+
+            event = MessageEvent(
+                text=message.strip(),
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=True,
+                metadata={
+                    "gateway_session_ipc_task": True,
+                    "gateway_session_key": session_key,
+                    "gateway_session_id": session_id,
+                    "gateway_session_idempotency_key": idempotency_key,
+                },
+            )
+
+            running_agent = getattr(self, "_running_agents", {}).get(session_key)
+            ensure_not_cancelled()
+            if (
+                running_agent is not None
+                and running_agent is not _AGENT_PENDING_SENTINEL
+                and hasattr(running_agent, "steer")
+            ):
+                try:
+                    with mutation_gate:
+                        ensure_not_cancelled()
+                        if running_agent.steer(event.text):
+                            committed.set()
+                            disposition = "steered"
+                        else:
+                            disposition = ""
+                except Exception:
+                    logger.warning("Exact-session IPC steer failed; queueing", exc_info=True)
+                    disposition = ""
+                if disposition:
+                    return {
+                        "ok": True,
+                        "profile": profile,
+                        "session_key": session_key,
+                        "session_id": session_id,
+                        "disposition": disposition,
+                    }
+
+            with mutation_gate:
+                ensure_not_cancelled()
+                if session_key in getattr(self, "_running_agents", {}):
+                    if not self._enqueue_internal_fifo_event(session_key, event, adapter):
+                        raise SessionIPCRequestError(
+                            "queue_full",
+                            f"Pending queue is full for exact route {session_key!r}",
+                        )
+                else:
+                    accepted = asyncio.run_coroutine_threadsafe(
+                        self._accept_internal_task_on_loop(
+                            adapter,
+                            event,
+                            session_key,
+                            cancelled,
+                        ),
+                        event_loop,
+                    ).result()
+                    if not accepted:
+                        raise SessionIPCRequestError(
+                            "acceptance_failed",
+                            f"Exact route {session_key!r} could not be synchronously claimed",
+                        )
+                committed.set()
+
+            return {
+                "ok": True,
+                "profile": profile,
+                "session_key": session_key,
+                "session_id": session_id,
+                "disposition": "queued",
+            }
+
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
     # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
@@ -10614,6 +10970,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+
+            session_ipc_server = getattr(self, "_session_ipc_server", None)
+            self._session_ipc_server = None
+            if session_ipc_server is not None:
+                try:
+                    await session_ipc_server.stop()
+                except Exception:
+                    logger.warning("Failed to stop gateway session IPC", exc_info=True)
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -20334,20 +20698,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return
-        # Structural clear: every conversation-scoped field resets in one
-        # call — no per-attribute pop-list to drift.
-        state = self._peek_session_state(session_key)
-        if state is not None:
-            state.conversation.clear()
-        # Legacy plain-dict stores still registered in
-        # _CONVERSATION_SCOPED_STATE (not yet folded into SessionState),
-        # e.g. _pending_model_notes.  SessionState-backed names resolve to
-        # MutableMapping views (not dict), so the isinstance(dict) guard
-        # skips them — already handled above.
-        for attr in _CONVERSATION_SCOPED_STATE:
-            store = getattr(self, attr, None)
-            if isinstance(store, dict):
-                store.pop(session_key, None)
+        with self._busy_queue_guard():
+            # Structural clear: every conversation-scoped field resets in one
+            # call — no per-attribute pop-list to drift.
+            state = self._peek_session_state(session_key)
+            if state is not None:
+                state.conversation.clear()
+            # Legacy plain-dict stores still registered in
+            # _CONVERSATION_SCOPED_STATE (not yet folded into SessionState),
+            # e.g. _pending_model_notes.  SessionState-backed names resolve to
+            # MutableMapping views (not dict), so the isinstance(dict) guard
+            # skips them — already handled above.
+            for attr in _CONVERSATION_SCOPED_STATE:
+                store = getattr(self, attr, None)
+                if isinstance(store, dict):
+                    store.pop(session_key, None)
         self._clear_session_boundary_security_state(session_key)
         logger.debug(
             "Cleared conversation scope for %s (%s)", session_key, reason
@@ -24042,14 +24407,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending_event = None
             pending = None
             if result and adapter and session_key:
-                pending_event = _dequeue_pending_event(adapter, session_key)
+                pending_event = self._dequeue_and_promote_queued_event(session_key, adapter)
                 # /queue overflow: after consuming the adapter's "next-up"
                 # slot, promote the next queued event into it so the
                 # recursive run's drain will see it.  This keeps the slot
                 # occupied for the full FIFO chain, which (a) preserves
                 # order, and (b) causes any mid-chain /queue to correctly
                 # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
@@ -24100,22 +24464,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # as user input.  The primary fix is in base.py (commands bypass the
             # active-session guard), but this catches edge cases where command
             # text leaks through the interrupt_message fallback.
-            if pending and pending.strip().startswith("/"):
+            if _pending_slash_is_command_leak(pending, pending_event):
                 _pending_parts = pending.strip().split(None, 1)
                 _pending_cmd_word = _pending_parts[0][1:].lower() if _pending_parts else ""
-                if _pending_cmd_word:
-                    try:
-                        from hermes_cli.commands import resolve_command as _rc_pending
-                        if _rc_pending(_pending_cmd_word):
-                            logger.info(
-                                "Discarding command '/%s' from pending queue — "
-                                "commands must not be passed as agent input",
-                                _pending_cmd_word,
-                            )
-                            pending_event = None
-                            pending = None
-                    except Exception:
-                        pass
+                logger.info(
+                    "Discarding command '/%s' from pending queue — "
+                    "commands must not be passed as agent input",
+                    _pending_cmd_word,
+                )
+                pending_event = None
+                pending = None
 
             if self._draining and (pending_event or pending):
                 logger.info(
