@@ -172,6 +172,43 @@ def test_runtime_resolution_failure_is_not_sticky(monkeypatch):
     assert shell.agent is not None
 
 
+def test_runtime_fallback_resolves_its_configured_model(monkeypatch):
+    """Fallback auth must be resolved against the fallback model, not the primary."""
+    cli = _import_cli()
+    calls = []
+
+    def _runtime_resolve(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("requested") == "kimi-coding":
+            raise AuthError("primary exhausted")
+        assert kwargs["requested"] == "openai-codex"
+        assert kwargs["target_model"] == "gpt-5.6-sol"
+        return {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "test-key",
+            "source": "credential_pool",
+        }
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+
+    shell = cli.HermesCLI(model="k3", provider="kimi-coding", compact=True, max_turns=1)
+    shell._fallback_model = [
+        {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        }
+    ]
+
+    assert shell._ensure_runtime_credentials() is True
+    assert shell.provider == "openai-codex"
+    assert shell.model == "gpt-5.6-sol"
+    assert len(calls) == 2
+
+
 def test_runtime_resolution_rebuilds_agent_on_routing_change(monkeypatch):
     cli = _import_cli()
 
