@@ -169,6 +169,7 @@ def _run_and_exit_oneshot(
     *,
     model: object = None,
     provider: object = None,
+    fallbacks: object = None,
     toolsets: object = None,
     usage_file: object = None,
 ) -> None:
@@ -179,6 +180,7 @@ def _run_and_exit_oneshot(
             prompt,
             model=model,
             provider=provider,
+            fallbacks=fallbacks,
             toolsets=toolsets,
             usage_file=usage_file,
         )
@@ -2245,6 +2247,7 @@ def _launch_tui(
     tui_dev: bool = False,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    fallbacks: object = None,
     toolsets: object = None,
     skills: object = None,
     verbose: Optional[bool] = None,
@@ -2258,6 +2261,12 @@ def _launch_tui(
     accept_hooks: bool = False,
 ):
     """Replace current process with the TUI."""
+    if fallbacks:
+        print(
+            "✗ --fallback is not yet supported with --tui; use `hermes --cli chat ...` or `hermes -z ...`.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     tui_dir = PROJECT_ROOT / "ui-tui"
 
     import tempfile
@@ -2657,6 +2666,7 @@ def cmd_chat(args):
             tui_dev=getattr(args, "tui_dev", False),
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
+            fallbacks=getattr(args, "fallbacks", None),
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             verbose=getattr(args, "verbose", None),
@@ -2677,6 +2687,7 @@ def cmd_chat(args):
     kwargs = {
         "model": args.model,
         "provider": getattr(args, "provider", None),
+        "fallbacks": getattr(args, "fallbacks", None),
         "toolsets": args.toolsets,
         "skills": getattr(args, "skills", None),
         "verbose": getattr(args, "verbose", None),
@@ -10524,6 +10535,7 @@ def _try_termux_fast_cli_launch() -> bool:
             args.oneshot,
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
+            fallbacks=getattr(args, "fallbacks", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
         )
@@ -12127,6 +12139,7 @@ def main():
             args.oneshot,
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
+            fallbacks=getattr(args, "fallbacks", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
         )
