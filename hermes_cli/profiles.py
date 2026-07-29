@@ -439,8 +439,13 @@ def create_wrapper_script(name: str, target: Optional[str] = None) -> Optional[P
     activates is ``target`` if given, otherwise ``name`` — this lets a custom
     alias name point at a differently-named profile without a post-hoc rewrite.
 
-    On Windows, creates a ``.bat`` file instead of a POSIX shell script.
-    Returns the path to the created wrapper, or None if creation failed.
+    On Windows, creates both a ``.bat`` file (for cmd.exe / PowerShell) and an
+    extensionless bash script (for git-bash / MSYS2).  Wrappers are subcommand-
+    agnostic pass-throughs: bare ``hermes -p <profile>`` defaults to ``chat``
+    when no positional is given, while ``<alias> gateway start`` etc. still
+    forward correctly (#74074).
+
+    Returns the path to the primary created wrapper, or None if creation failed.
     """
     canon = normalize_profile_name(name)
     profile = normalize_profile_name(target) if target else canon
@@ -454,20 +459,47 @@ def create_wrapper_script(name: str, target: Optional[str] = None) -> Optional[P
         print(f"⚠ Could not create {wrapper_dir}: {e}")
         return None
 
+    # Resolve the real hermes executable so wrappers bypass any shim (e.g.
+    # hermes.cmd on Windows that injects ``-p default``) (#74074).
+    hermes_exe = shutil.which("hermes") or "hermes"
+
     is_windows = sys.platform == "win32"
     if is_windows:
+        # Primary: .bat for cmd.exe / PowerShell.
         wrapper_path = wrapper_dir / f"{canon}.bat"
         try:
-            wrapper_path.write_text(f"@echo off\r\nhermes -p {profile} %*\r\n", encoding="utf-8")
-            return wrapper_path
+            # Quote the exe path in case it contains spaces.  The wrapper is
+            # deliberately subcommand-agnostic: bare ``hermes -p <profile>``
+            # already defaults to ``chat`` when no positional is given, and
+            # the pass-through (%*) lets ``<alias> gateway start`` etc. work.
+            # Resolving the real exe bypasses the hermes.cmd shim that would
+            # inject a second ``-p default`` (#74074).
+            wrapper_path.write_text(
+                f'@echo off\r\n"{hermes_exe}" -p {profile} %*\r\n',
+                encoding="utf-8",
+            )
         except OSError as e:
             print(f"⚠ Could not create wrapper at {wrapper_path}: {e}")
             return None
+        # Secondary: extensionless bash script for git-bash / MSYS2 (#74074).
+        bash_path = wrapper_dir / canon
+        try:
+            bash_path.write_text(
+                f'#!/bin/sh\nexec {shlex.quote(hermes_exe)} -p {profile} "$@"\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+        except OSError:
+            # Non-fatal: the .bat is the primary wrapper on Windows.
+            pass
+        return wrapper_path
     else:
         wrapper_path = wrapper_dir / canon
         try:
-            hermes_exe = shutil.which("hermes") or "hermes"
-            wrapper_path.write_text(f'#!/bin/sh\nexec {shlex.quote(hermes_exe)} -p {profile} "$@"\n', encoding="utf-8")
+            wrapper_path.write_text(
+                f'#!/bin/sh\nexec {shlex.quote(hermes_exe)} -p {profile} "$@"\n',
+                encoding="utf-8",
+            )
             wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
             return wrapper_path
         except OSError as e:
@@ -476,7 +508,11 @@ def create_wrapper_script(name: str, target: Optional[str] = None) -> Optional[P
 
 
 def remove_wrapper_script(name: str) -> bool:
-    """Remove the wrapper script for a profile. Returns True if removed."""
+    """Remove the wrapper script(s) for a profile. Returns True if any removed.
+
+    On Windows both the ``.bat`` and the extensionless bash script (created
+    for git-bash by #74074) are removed.
+    """
     wrapper_dir = _get_wrapper_dir()
     canon = normalize_profile_name(name)
     # A traversal-shaped name could point unlink() at a file outside the
@@ -487,22 +523,23 @@ def remove_wrapper_script(name: str) -> bool:
         return False
     is_windows = sys.platform == "win32"
 
-    # Check both the extensionless path (POSIX) and .bat (Windows)
+    # Check both the extensionless path (POSIX / git-bash) and .bat (Windows)
     candidates = [wrapper_dir / canon]
     if is_windows:
         candidates.insert(0, wrapper_dir / f"{canon}.bat")
 
+    removed = False
     for wrapper_path in candidates:
         if wrapper_path.exists():
             try:
                 # Verify it's our wrapper before removing
                 content = wrapper_path.read_text(encoding="utf-8")
-                if "hermes -p" in content:
+                if "hermes" in content and "-p" in content:
                     wrapper_path.unlink()
-                    return True
+                    removed = True
             except Exception:
                 pass
-    return False
+    return removed
 
 
 def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
