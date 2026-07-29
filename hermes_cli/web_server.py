@@ -102,7 +102,7 @@ from utils import env_var_enabled
 
 try:
     from fastapi import (
-        FastAPI, File, Form, HTTPException, Request, UploadFile,
+        FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
@@ -118,7 +118,7 @@ except ImportError:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
         from fastapi import (
-            FastAPI, File, Form, HTTPException, Request, UploadFile,
+            FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
         from fastapi.middleware.cors import CORSMiddleware
@@ -4732,8 +4732,8 @@ def _strip_session_list_rows(sessions: List[Dict[str, Any]]) -> List[Dict[str, A
 
 @app.get("/api/sessions")
 def get_sessions(
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=0, le=500),
+    offset: int = Query(0, ge=0),
     min_messages: int = 0,
     archived: str = "exclude",
     order: str = "created",
@@ -4845,8 +4845,8 @@ def get_sessions(
 
 @app.get("/api/profiles/sessions")
 def get_profiles_sessions(
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=0, le=500),
+    offset: int = Query(0, ge=0),
     min_messages: int = 0,
     archived: str = "exclude",
     order: str = "recent",
@@ -11871,8 +11871,8 @@ async def get_session_latest_descendant(
 async def get_session_messages(
     session_id: str,
     profile: Optional[str] = None,
-    limit: Optional[int] = None,
-    offset: int = 0,
+    limit: Optional[int] = Query(None, ge=0, le=500),
+    offset: int = Query(0, ge=0),
 ):
     def _read():
         db = _open_session_db_for_profile(profile)
