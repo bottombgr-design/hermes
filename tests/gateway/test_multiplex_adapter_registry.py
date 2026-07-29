@@ -450,6 +450,12 @@ class TestSecondaryProfileConfigHandling:
                 enabled=True, extra={"connection_mode": "webhook"}
             ),
             Platform.WEBHOOK: PlatformConfig(enabled=True, extra={"port": 8644}),
+            Platform.MATTERMOST: PlatformConfig(
+                enabled=True,
+                extra={
+                    "interaction_url": "https://hermes.example.com/mattermost/actions"
+                },
+            ),
             Platform.TELEGRAM: PlatformConfig(enabled=True, token="t"),
         }
         monkeypatch.setattr(
@@ -461,6 +467,7 @@ class TestSecondaryProfileConfigHandling:
         message = str(ei.value)
         assert "feishu" in message
         assert "webhook" in message
+        assert "mattermost" in message
         assert "telegram" not in message
         assert "reviewer" not in runner._profile_adapters
 
@@ -1076,3 +1083,11 @@ class TestFeishuPortBindingConditional:
 
         # Feishu: webhook = port binding
         assert _platform_binds_port("feishu", {"connection_mode": "webhook"}) is True
+
+        # Mattermost only binds its optional interaction callback listener.
+        assert _platform_binds_port("mattermost", {}) is False
+        assert _platform_binds_port("mattermost", {"interaction_url": ""}) is False
+        assert _platform_binds_port(
+            "mattermost",
+            {"interaction_url": "https://hermes.example.com/mattermost/actions"},
+        ) is True
