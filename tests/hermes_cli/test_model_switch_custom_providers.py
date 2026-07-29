@@ -958,11 +958,8 @@ def test_lmstudio_picker_lm_base_url_env_wins_over_active_config(monkeypatch):
     assert captured["base_url"] == "http://override.local:9999/v1"
 
 
-def test_lmstudio_picker_skips_probe_when_not_configured(monkeypatch):
-    """If the user has never configured LM Studio (no LM_API_KEY / LM_BASE_URL
-    and not on lmstudio), the picker must not pay the localhost probe cost
-    just to discover LM Studio is unavailable.
-    """
+def test_lmstudio_non_picker_skips_probe_when_not_configured(monkeypatch):
+    """Non-picker callers must not probe an unconfigured local server."""
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
     monkeypatch.delenv("LM_BASE_URL", raising=False)
@@ -982,6 +979,42 @@ def test_lmstudio_picker_skips_probe_when_not_configured(monkeypatch):
     )
 
     assert "base_url" not in captured
+
+
+def test_lmstudio_picker_discovers_default_noauth_server(monkeypatch):
+    """A responsive default LM Studio server is selectable without env vars."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(
+        providers_mod,
+        "HERMES_OVERLAYS",
+        {"lmstudio": providers_mod.HERMES_OVERLAYS["lmstudio"]},
+    )
+    monkeypatch.delenv("LM_BASE_URL", raising=False)
+    monkeypatch.delenv("LM_API_KEY", raising=False)
+    monkeypatch.setattr("hermes_cli.models.cached_provider_model_ids", lambda *_a, **_kw: [])
+
+    captured: dict = {}
+
+    def _fake_fetch(api_key=None, base_url=None, timeout=5.0):
+        captured.update(api_key=api_key, base_url=base_url, timeout=timeout)
+        return ["qwen/qwen3-coder-30b"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_lmstudio_models", _fake_fetch)
+
+    providers = list_authenticated_providers(
+        current_provider="openrouter",
+        current_base_url="https://openrouter.ai/api/v1",
+        for_picker=True,
+    )
+
+    assert captured == {
+        "api_key": "",
+        "base_url": "http://127.0.0.1:1234/v1",
+        "timeout": 1.5,
+    }
+    lmstudio = next(p for p in providers if p["slug"] == "lmstudio")
+    assert lmstudio["models"] == ["qwen/qwen3-coder-30b"]
+    assert lmstudio["is_locally_discovered"] is True
 
 
 def test_custom_providers_uses_live_models_for_multi_model_endpoint(monkeypatch):
