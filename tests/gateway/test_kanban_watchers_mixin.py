@@ -8,11 +8,13 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 from gateway.kanban_watchers import (
     DISPATCHER_HEALTH_WINDOW,
     GatewayKanbanWatchersMixin,
     _next_dispatcher_health,
+    _persist_dispatcher_health,
 )
 
 KANBAN_METHODS = [
@@ -110,3 +112,51 @@ def test_dispatcher_health_resets_for_correctly_idle_ticks():
         )
         assert ticks == 0
         assert signal["actionable"] is False
+
+
+def test_dispatcher_health_probe_failure_is_unavailable_and_preserves_window():
+    ticks, signal = _next_dispatcher_health(
+        DISPATCHER_HEALTH_WINDOW - 1,
+        any_spawned=False,
+        capacity={
+            "probe_ok": False,
+            "probe_errors": [{"slug": "broken", "error": "DatabaseError"}],
+            "dispatchable_count": 0,
+            "free_global_slots": None,
+        },
+        now=100,
+    )
+
+    assert ticks == DISPATCHER_HEALTH_WINDOW - 1
+    assert signal["status"] == "unavailable"
+    assert signal["degraded"] is True
+    assert signal["probe_ok"] is False
+    assert signal["probe_errors"][0]["slug"] == "broken"
+
+
+def test_health_persistence_failure_does_not_change_dispatch_result(
+    tmp_path, monkeypatch
+):
+    """A telemetry write failure cannot erase or alter a successful spawn."""
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+
+    spawned = []
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="spawn-me", assignee="worker")
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace: spawned.append(task.id)
+        )
+
+    def fail_write(_snapshot):
+        raise OSError("read-only health directory")
+
+    assert _persist_dispatcher_health(fail_write, {"status": "ok"}) is False
+    assert spawned == [task_id]
+    assert result.spawned[0][0] == task_id
