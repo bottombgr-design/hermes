@@ -23,7 +23,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         fr = final if silent_marker_in is None else silent_marker_in
         return (success, output, fr, error)
 
-    def fake_save(jid, out):
+    def fake_save(jid, out, job_name=None):
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
@@ -195,7 +195,7 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
         return (True, "out", "final", None)
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
-    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out, job_name=None: f"/tmp/{jid}.txt")
     monkeypatch.setattr(s, "_deliver_result", lambda *a, **k: None)
     monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
 
@@ -338,7 +338,7 @@ def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
         return None
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
-    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out, job_name=None: f"/tmp/{jid}.txt")
     monkeypatch.setattr(s, "_deliver_result", fake_deliver)
     monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
     # cleanup_stale_async_clients is imported lazily inside _teardown_cron_agent;
@@ -373,7 +373,7 @@ def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch)
         raise RuntimeError("send blew up")
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
-    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out, job_name=None: f"/tmp/{jid}.txt")
     monkeypatch.setattr(s, "_deliver_result", boom_deliver)
     monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
     import agent.auxiliary_client as aux
@@ -403,7 +403,7 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
-    def boom_save(jid, out):
+    def boom_save(jid, out, job_name=None):
         order.append("save-raise")
         raise RuntimeError("disk full")
 
