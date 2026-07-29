@@ -2683,6 +2683,32 @@ class OpenVikingMemoryProvider(MemoryProvider):
             ]
         }
 
+    # Official OpenViking (>=0.3.x) no longer auto-creates a session on the
+    # first messages/batch POST: an unregistered sid answers 404, every turn
+    # degrades to the fallback (which 404s the same way), and the final
+    # session commit fails with "Session not found" — so memory extraction
+    # silently never runs. Register the sid once per provider lifetime; an
+    # ALREADY_EXISTS answer (racing writer / prior run) counts as registered.
+    def _ensure_ov_session(self, client: "_VikingClient", sid: str) -> None:
+        if not sid:
+            return
+        registered = getattr(self, "_registered_session_ids", None)
+        if registered is None:
+            registered = set()
+            self._registered_session_ids = registered
+        if sid in registered:
+            return
+        try:
+            client.post("/api/v1/sessions", {"session_id": sid})
+        except Exception as exc:
+            msg = str(exc).upper()
+            if not ("EXIST" in msg or "ALREADY" in msg or "DUPLICATE" in msg):
+                logger.warning(
+                    "OpenViking session register failed for %s: %s", sid, exc
+                )
+                return
+        registered.add(sid)
+
     def _post_session_turn(
         self,
         client: _VikingClient,
@@ -4023,6 +4049,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
             def _post_turn(client: _VikingClient) -> None:
                 nonlocal next_batch_index
+                # Register the sid before any message POST (see
+                # _ensure_ov_session) — covers the batch path and the
+                # per-message fallback alike.
+                self._ensure_ov_session(client, sid)
                 if batch_messages:
                     while next_batch_index < len(batch_messages):
                         batch_end = min(
