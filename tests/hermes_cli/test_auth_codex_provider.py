@@ -15,6 +15,7 @@ from hermes_cli.auth import (
     _read_codex_tokens,
     _save_codex_tokens,
     _import_codex_cli_tokens,
+    _recover_codex_tokens_from_cli,
     _login_openai_codex,
     refresh_codex_oauth_pure,
     resolve_codex_runtime_credentials,
@@ -1093,3 +1094,156 @@ def test_device_code_login_non_429_error_unchanged(monkeypatch):
         auth_mod._codex_device_code_login()
 
     assert exc_info.value.code == "device_code_request_error"
+
+
+# ---------------------------------------------------------------------------
+# #73667 — automatic Codex CLI recovery must not silently replace a credential
+# with a different ChatGPT workspace.  Before persisting an imported token the
+# recovery path compares its ``chatgpt_account_id`` against the stored
+# credential; a KNOWN mismatch fails closed while preserving compatibility when
+# either side lacks an identity claim.
+# ---------------------------------------------------------------------------
+
+
+def _codex_jwt_with_account(account_id=None, exp_offset=3600):
+    """Build a synthetic Codex OAuth JWT carrying a chatgpt_account_id claim.
+
+    Mirrors the claim layout codex-rs places under the namespaced
+    ``https://api.openai.com/auth`` object.  Pass ``account_id=None`` to omit
+    the claim entirely (for the missing-identity compatibility cases).
+    """
+    payload: dict = {"exp": int(time.time()) + exp_offset}
+    if account_id is not None:
+        payload["https://api.openai.com/auth"] = {"chatgpt_account_id": account_id}
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).rstrip(b"=").decode("utf-8")
+    return f"h.{encoded}.s"
+
+
+def _seed_codex_store(hermes_home, access_token, refresh_token="rt-stored"):
+    """Write a Codex provider singleton into a temp HERMES_HOME auth.json."""
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    auth_store = {
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                },
+                "last_refresh": "2026-07-28T00:00:00Z",
+                "auth_mode": "chatgpt",
+            },
+        },
+    }
+    auth_file = hermes_home / "auth.json"
+    auth_file.write_text(json.dumps(auth_store, indent=2))
+    return auth_file
+
+
+def test_recover_codex_refuses_cross_workspace_mismatch(tmp_path, monkeypatch):
+    """Layer 1+3: a Team-workspace import must NOT overwrite a Personal cred.
+
+    RED on upstream/main: the recovery saves the imported token unconditionally,
+    silently swapping the billed workspace.  After the fix it refuses, returns
+    None, and leaves the auth store byte-for-byte unchanged.
+    """
+    hermes_home = tmp_path / "hermes"
+    personal_jwt = _codex_jwt_with_account("acct-personal")
+    team_jwt = _codex_jwt_with_account("acct-team")
+    auth_file = _seed_codex_store(hermes_home, personal_jwt)
+    before = auth_file.read_text()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: {"access_token": team_jwt, "refresh_token": "rt-imported"},
+    )
+
+    result = _recover_codex_tokens_from_cli("refresh_token rejected: test")
+
+    assert result is None  # recovery refused
+    assert auth_file.read_text() == before  # store byte-for-byte unchanged
+    # The Personal credential is preserved.
+    assert (
+        json.loads(before)["providers"]["openai-codex"]["tokens"]["access_token"]
+        == personal_jwt
+    )
+
+
+def test_recover_codex_allows_same_workspace(tmp_path, monkeypatch):
+    """Layer 2: same workspace id -> recovery proceeds and persists the import."""
+    hermes_home = tmp_path / "hermes"
+    personal_jwt = _codex_jwt_with_account("acct-personal")
+    refreshed_jwt = _codex_jwt_with_account("acct-personal")  # same workspace
+    _seed_codex_store(hermes_home, personal_jwt)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: {"access_token": refreshed_jwt, "refresh_token": "rt-refreshed"},
+    )
+
+    result = _recover_codex_tokens_from_cli("refresh_token rejected: test")
+
+    assert result is not None
+    assert result["access_token"] == refreshed_jwt
+    data = _read_codex_tokens()
+    assert data["tokens"]["access_token"] == refreshed_jwt
+
+
+def test_recover_codex_allows_when_imported_lacks_identity(tmp_path, monkeypatch):
+    """Layer 4: imported token with no chatgpt_account_id -> compatibility allow."""
+    hermes_home = tmp_path / "hermes"
+    personal_jwt = _codex_jwt_with_account("acct-personal")
+    no_id_jwt = _codex_jwt_with_account(None)
+    _seed_codex_store(hermes_home, personal_jwt)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: {"access_token": no_id_jwt, "refresh_token": "rt-imported"},
+    )
+
+    assert _recover_codex_tokens_from_cli("test") is not None
+
+
+def test_recover_codex_allows_when_store_lacks_identity(tmp_path, monkeypatch):
+    """Layer 4: stored token with no chatgpt_account_id -> compatibility allow."""
+    hermes_home = tmp_path / "hermes"
+    no_id_jwt = _codex_jwt_with_account(None)
+    team_jwt = _codex_jwt_with_account("acct-team")
+    _seed_codex_store(hermes_home, no_id_jwt)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: {"access_token": team_jwt, "refresh_token": "rt-imported"},
+    )
+
+    assert _recover_codex_tokens_from_cli("test") is not None
+
+
+def test_recover_codex_allows_into_empty_store(tmp_path, monkeypatch):
+    """Layer 4 / read-failure caller path: no codex provider -> allow recovery."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    team_jwt = _codex_jwt_with_account("acct-team")
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: {"access_token": team_jwt, "refresh_token": "rt-imported"},
+    )
+
+    assert _recover_codex_tokens_from_cli("test") is not None
+
+
+def test_codex_chatgpt_account_id_extracts_claim():
+    """Direct unit test for the identity-extraction helper (#73667)."""
+    from hermes_cli.auth import _codex_chatgpt_account_id
+
+    assert _codex_chatgpt_account_id(_codex_jwt_with_account("acct-1")) == "acct-1"
+    assert _codex_chatgpt_account_id(_codex_jwt_with_account(None)) is None
+    assert _codex_chatgpt_account_id("not-a-jwt") is None
+    assert _codex_chatgpt_account_id(None) is None

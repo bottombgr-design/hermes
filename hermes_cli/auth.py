@@ -2425,6 +2425,24 @@ def _codex_access_token_is_expiring(access_token: Any, skew_seconds: int) -> boo
     return float(exp) <= (time.time() + max(0, int(skew_seconds)))
 
 
+def _codex_chatgpt_account_id(access_token: Any) -> Optional[str]:
+    """Return the ChatGPT workspace/account id from a Codex OAuth JWT, or None.
+
+    The ``chatgpt_account_id`` claim lives under the namespaced
+    ``https://api.openai.com/auth`` object (mirroring codex-rs ``auth.rs``).
+    Missing or malformed tokens return None so callers treat "no identity" as
+    compatibility-safe rather than a mismatch.
+    """
+    claims = _decode_jwt_claims(access_token)
+    auth_claim = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth_claim, dict):
+        return None
+    acct_id = auth_claim.get("chatgpt_account_id")
+    if isinstance(acct_id, str) and acct_id.strip():
+        return acct_id.strip()
+    return None
+
+
 def _qwen_cli_auth_path() -> Path:
     return Path.home() / ".qwen" / "oauth_creds.json"
 
@@ -3629,6 +3647,30 @@ def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
         and str(imported.get("access_token", "") or "").strip()
         and str(imported.get("refresh_token", "") or "").strip()
     ):
+        return None
+    # Fail closed on a KNOWN cross-workspace identity mismatch.  Automatic
+    # recovery must not silently replace a credential whose ChatGPT workspace
+    # differs from the token the Codex CLI/Desktop just refreshed into
+    # ~/.codex/auth.json (e.g. a user switched Desktop to a Team workspace
+    # while Hermes held a Personal/Pro credential).  When either side lacks a
+    # chatgpt_account_id claim we cannot establish a mismatch, so we preserve
+    # the existing recovery behavior rather than blocking legitimate
+    # same-account imports.  See #73667.
+    try:
+        current = _read_codex_tokens(_lock=False)
+        current_account = _codex_chatgpt_account_id(
+            current.get("tokens", {}).get("access_token")
+        )
+    except AuthError:
+        current_account = None
+    imported_account = _codex_chatgpt_account_id(imported.get("access_token"))
+    if current_account and imported_account and current_account != imported_account:
+        logger.warning(
+            "Codex CLI recovery refused: the imported token targets a different "
+            "ChatGPT workspace than the stored credential (%s). Re-authenticate "
+            "the intended Hermes credential explicitly with `hermes auth`.",
+            reason,
+        )
         return None
     logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
     _save_codex_tokens(imported)
