@@ -18364,6 +18364,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
             media_files, cleaned = adapter.extract_media(response)
+            # Docker terminal backend writes inside the container; remap container
+            # paths to host equivalents before the host-side path filter runs.
+            # No task_id reaches this path (it's called after streaming, from
+            # the raw response text) — translation degrades to mount-table-only
+            # and single-Docker-environment-only; see translate_docker_media_paths's
+            # docstring and NousResearch/hermes-agent#64889.
+            media_files = BasePlatformAdapter.translate_docker_media_paths(media_files)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
             # Deduplicate against media already delivered in prior turns —
             # the model may echo a previous turn's MEDIA: tag in a later
@@ -18587,6 +18594,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if response:
                 media_files, response = adapter.extract_media(response)
                 from gateway.platforms.base import BasePlatformAdapter
+                media_files = BasePlatformAdapter.translate_docker_media_paths(media_files, task_id=task_id)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
 
