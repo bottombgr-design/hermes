@@ -101,13 +101,19 @@ def test_auth_add_anthropic_oauth_persists_pool_entry(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
     token = _jwt_with_email("claude@example.com")
-    monkeypatch.setattr(
-        "agent.anthropic_adapter.run_hermes_oauth_login_pure",
-        lambda: {
+    oauth_options = {}
+
+    def fake_oauth_login(*, open_browser=True):
+        oauth_options["open_browser"] = open_browser
+        return {
             "access_token": token,
             "refresh_token": "refresh-token",
             "expires_at_ms": 1711234567000,
-        },
+        }
+
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.run_hermes_oauth_login_pure",
+        fake_oauth_login,
     )
 
     from hermes_cli.auth_commands import auth_add_command
@@ -117,6 +123,7 @@ def test_auth_add_anthropic_oauth_persists_pool_entry(tmp_path, monkeypatch):
         auth_type = "oauth"
         api_key = None
         label = None
+        no_browser = True
 
     auth_add_command(_Args())
 
@@ -127,6 +134,7 @@ def test_auth_add_anthropic_oauth_persists_pool_entry(tmp_path, monkeypatch):
     assert entry["source"] == "manual:hermes_pkce"
     assert entry["refresh_token"] == "refresh-token"
     assert entry["expires_at_ms"] == 1711234567000
+    assert oauth_options == {"open_browser": False}
 
 
 def test_auth_add_qwen_oauth_sets_active_provider(tmp_path, monkeypatch):
