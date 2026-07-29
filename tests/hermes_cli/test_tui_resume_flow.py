@@ -403,6 +403,9 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "provider": "openai",
         "toolsets": None,
         "usage_file": "usage.json",
+        "resume_session_id": None,
+        "continue_last": None,
+        "restore_resume_cwd": True,
     }
 
 
@@ -657,6 +660,9 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
         "provider": None,
         "toolsets": "web,terminal",
         "usage_file": "usage.json",
+        "resume_session_id": None,
+        "continue_last": None,
+        "restore_resume_cwd": True,
     }
 
 
@@ -1126,6 +1132,46 @@ def test_run_and_exit_oneshot_passes_through_nonzero_return(monkeypatch, main_mo
     assert exits == [2]
 
 
+def test_run_and_exit_oneshot_forwards_resume_options(monkeypatch, main_mod):
+    calls = []
+    exits = []
+
+    def fake_run_oneshot(prompt, **kwargs):
+        calls.append((prompt, kwargs))
+        return 0
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.oneshot",
+        types.SimpleNamespace(run_oneshot=fake_run_oneshot),
+    )
+    monkeypatch.setattr(main_mod, "_cleanup_oneshot_runtime", lambda: None)
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", lambda rc: exits.append(rc))
+
+    main_mod._run_and_exit_oneshot(
+        "continue",
+        resume_session_id="session-1",
+        continue_last=False,
+        restore_resume_cwd=False,
+    )
+
+    assert calls == [
+        (
+            "continue",
+            {
+                "model": None,
+                "provider": None,
+                "toolsets": None,
+                "usage_file": None,
+                "resume_session_id": "session-1",
+                "continue_last": False,
+                "restore_resume_cwd": False,
+            },
+        )
+    ]
+    assert exits == [0]
+
+
 def test_main_oneshot_path_bypasses_late_atexit_abort():
     # End-to-end through the real top-level ``main()`` ``-z`` path: a valid
     # response prints, then a late atexit handler that would abort is bypassed
@@ -1217,6 +1263,202 @@ def test_oneshot_run_agent_closes_agent_after_chat(monkeypatch):
     )
     assert closed == [True]
     assert shutdown_messages == [[{"role": "user", "content": "hello"}]]
+
+
+def test_oneshot_run_agent_resumes_existing_session(monkeypatch):
+    import hermes_cli.oneshot as oneshot_mod
+
+    initialized = []
+    run_calls = []
+    reopened = []
+    db_closed = []
+
+    history = [
+        {"role": "session_meta", "content": "internal"},
+        {"role": "user", "content": "before"},
+        {"role": "assistant", "content": "context"},
+    ]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            initialized.append(kwargs)
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+            self._session_messages = []
+
+        def run_conversation(self, prompt, **kwargs):
+            run_calls.append((prompt, kwargs))
+            return {"final_response": "continued"}
+
+        def shutdown_memory_provider(self, messages=None):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeSessionDB:
+        def get_session(self, session_id):
+            if session_id == "root":
+                return {"id": "root", "cwd": "/missing"}
+            if session_id == "tip":
+                return {"id": "tip", "cwd": "/missing"}
+            return None
+
+        def resolve_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            assert session_id == "root"
+            return "tip"
+
+        def get_resume_conversations(self, session_id):
+            assert session_id == "tip"
+            return list(history), list(history)
+
+        def reopen_session(self, session_id):
+            reopened.append(session_id)
+
+        def close(self):
+            db_closed.append(True)
+
+    monkeypatch.setitem(
+        sys.modules, "run_agent", types.SimpleNamespace(AIAgent=FakeAgent)
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"default": "gpt-test", "provider": "openai"}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "api_key": "key",
+            "base_url": "https://example.invalid",
+            "provider": "openai",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        },
+    )
+    monkeypatch.setattr(
+        oneshot_mod, "_create_session_db_for_oneshot", lambda: FakeSessionDB()
+    )
+
+    assert oneshot_mod._run_agent(
+        "continue",
+        model="gpt-test",
+        provider="openai",
+        use_config_toolsets=False,
+        resume_session_id="root",
+        restore_resume_cwd=False,
+    ) == ("continued", {"final_response": "continued"})
+
+    assert initialized[0]["session_id"] == "tip"
+    assert reopened == ["tip"]
+    assert run_calls == [
+        (
+            "continue",
+            {
+                "conversation_history": [
+                    {"role": "user", "content": "before"},
+                    {"role": "assistant", "content": "context"},
+                ]
+            },
+        )
+    ]
+    assert db_closed == [True]
+
+
+def test_oneshot_continue_prefers_current_workspace(monkeypatch):
+    import hermes_cli.oneshot as oneshot_mod
+
+    calls = []
+
+    class FakeSessionDB:
+        def search_sessions(self, **kwargs):
+            calls.append(kwargs)
+            return [{"id": "workspace-session"}]
+
+        def get_session(self, session_id):
+            return {"id": session_id, "cwd": "/missing"}
+
+        def resolve_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def get_resume_conversations(self, _session_id):
+            return ([{"role": "user", "content": "workspace context"}], [])
+
+        def reopen_session(self, _session_id):
+            pass
+
+    monkeypatch.setattr(
+        oneshot_mod,
+        "_resolve_oneshot_workspace_key",
+        lambda: "/workspace/a",
+    )
+
+    session_id, history = oneshot_mod._load_oneshot_resume(
+        FakeSessionDB(),
+        resume_session_id=None,
+        continue_last=True,
+        restore_resume_cwd=False,
+    )
+
+    assert calls == [
+        {"source": "cli", "limit": 1, "workspace_key": "/workspace/a"}
+    ]
+    assert session_id == "workspace-session"
+    assert history == [{"role": "user", "content": "workspace context"}]
+
+
+def test_oneshot_continue_falls_back_to_global_mru(monkeypatch):
+    import hermes_cli.oneshot as oneshot_mod
+
+    calls = []
+
+    class FakeSessionDB:
+        def search_sessions(self, **kwargs):
+            calls.append(kwargs)
+            if "workspace_key" in kwargs:
+                return []
+            return [{"id": "global-session"}]
+
+        def get_session(self, session_id):
+            return {"id": session_id, "cwd": "/missing"}
+
+        def resolve_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def get_resume_conversations(self, _session_id):
+            return ([{"role": "user", "content": "global context"}], [])
+
+        def reopen_session(self, _session_id):
+            pass
+
+    monkeypatch.setattr(
+        oneshot_mod,
+        "_resolve_oneshot_workspace_key",
+        lambda: "/workspace/new",
+    )
+
+    session_id, history = oneshot_mod._load_oneshot_resume(
+        FakeSessionDB(),
+        resume_session_id=None,
+        continue_last=True,
+        restore_resume_cwd=False,
+    )
+
+    assert calls == [
+        {"source": "cli", "limit": 1, "workspace_key": "/workspace/new"},
+        {"source": "cli", "limit": 1},
+    ]
+    assert session_id == "global-session"
+    assert history == [{"role": "user", "content": "global context"}]
 
 
 def test_oneshot_run_agent_closes_agent_when_chat_raises(monkeypatch):
