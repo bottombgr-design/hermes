@@ -35,8 +35,10 @@ class FakeStreamer:
         self.channels = channels
         self.sample_width = sample_width
         self._clause_count = 0
+        self.spoken_texts: list[str] = []
 
     def stream(self, text: str):
+        self.spoken_texts.append(text)
         self._clause_count += 1
         if self.fail_on_clause and self._clause_count >= self.fail_on_clause:
             raise RuntimeError(f"fake streamer failure on clause {self._clause_count}")
@@ -193,6 +195,7 @@ def _make_consumer(adapter, chat_id, loop, streamer):
     consumer._task = None
     consumer._lock = threading.Lock()
     consumer._strip_markdown = None
+    consumer._pronunciation_substitutions = {}
     return consumer
 
 
@@ -460,6 +463,31 @@ class TestStreamerFormatAndLooping:
         finally:
             tts_streaming.resolve_streaming_provider = original_resolve
             loop.close()
+
+    def test_pronunciation_config_reaches_streaming_provider_without_rechunking(self):
+        async def run(loop):
+            streamer = FakeStreamer(chunks_per_clause=1)
+            adapter = FakeVoiceAdapter()
+            import tools.tts_streaming as tts_streaming
+            original_resolve = tts_streaming.resolve_streaming_provider
+            tts_streaming.resolve_streaming_provider = lambda *_args, **_kwargs: streamer
+            try:
+                config = {
+                    "pronunciation": {
+                        "substitutions": {"C++": "C plus plus", "alpha": "beta"},
+                    },
+                }
+                consumer = StreamingTTSConsumer(adapter, "chat1", config, loop)
+                consumer.start()
+                consumer.on_delta("Use C++ first. Then alpha second. ")
+                consumer.finish()
+
+                assert await consumer.wait_complete(timeout=5.0) is True
+                assert streamer.spoken_texts == ["Use C plus plus first. Then beta second."]
+            finally:
+                tts_streaming.resolve_streaming_provider = original_resolve
+
+        _run_test(run)
 
     def test_provider_iteration_runs_off_the_event_loop(self):
         async def run(loop):
