@@ -370,9 +370,27 @@ class TestBuildSessionContextPrompt:
             _os.environ.pop("SLACK_BOT_TOKEN", None)
             _mcp_tool_mod._track_mcp_tool_server("mcp-github_create_issue", "github")
             try:
-                assert _slack_tools_loaded() is False
+                with patch("hermes_cli.config.load_config", return_value={}), patch(
+                    "hermes_cli.tools_config._get_platform_tools", return_value=[]
+                ):
+                    assert _slack_tools_loaded() is False
             finally:
                 _mcp_tool_mod._forget_mcp_tool_server("mcp-github_create_issue")
+
+    def test_slack_tools_loaded_detects_native_bundle_without_global_token(self):
+        """Scoped and OAuth-file credentials do not require a process-global token."""
+        import os as _os
+        from unittest.mock import patch
+        from gateway.session import _slack_tools_loaded
+
+        with patch.dict(_os.environ, {}, clear=False), patch(
+            "hermes_cli.config.load_config", return_value={}
+        ), patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            return_value=["hermes-slack"],
+        ):
+            _os.environ.pop("SLACK_BOT_TOKEN", None)
+            assert _slack_tools_loaded() is True
 
     def test_slack_prompt_includes_platform_notes(self):
         """Legacy: backward-compat alias -- no tools loaded shows disclaimer."""
