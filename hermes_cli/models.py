@@ -1270,6 +1270,7 @@ _PROVIDER_ALIASES = {
     "arceeai": "arcee",
     "gmi-cloud": "gmi",
     "gmicloud": "gmi",
+    "antling": "ant-ling",
     "fireworks-ai": "fireworks",
     "fw": "fireworks",
     "minimax-china": "minimax-cn",
