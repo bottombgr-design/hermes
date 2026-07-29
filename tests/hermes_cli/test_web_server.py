@@ -5582,6 +5582,48 @@ class TestBuildSchemaFromConfig:
             assert "options" in entry
             assert "local" in entry["options"]
 
+    def test_web_backend_fields_render_as_selects(self):
+        """web.backend / search_backend / extract_backend must be dropdowns.
+
+        Previously they rendered as bare text inputs, so a user had to know the
+        exact backend string (e.g. ``brave-free``, not ``brave``) with no hint
+        of valid values (#71929). Each is a leaf key in DEFAULT_CONFIG, so the
+        _SCHEMA_OVERRIDES entry attaches.
+        """
+        from hermes_cli.web_server import CONFIG_SCHEMA
+
+        for key in ("web.backend", "web.search_backend", "web.extract_backend"):
+            entry = CONFIG_SCHEMA[key]
+            assert entry["type"] == "select", key
+            # Leading "" = shared-backend / auto-detect fallback stays selectable.
+            assert entry["options"][0] == "", key
+
+    def test_web_backend_options_match_runtime_backends(self):
+        """Search-backend options must equal the runtime's built-in web set.
+
+        Guards against the schema drifting from ``tools/web_tools.py`` — a stale
+        option would silently offer a backend the runtime rejects.
+        """
+        from hermes_cli.web_server import CONFIG_SCHEMA
+        from tools.web_tools import _LEGACY_WEB_BACKENDS
+
+        for key in ("web.backend", "web.search_backend"):
+            offered = {o for o in CONFIG_SCHEMA[key]["options"] if o}
+            assert offered == set(_LEGACY_WEB_BACKENDS), key
+
+    def test_web_extract_backend_omits_search_only(self):
+        """Extract options are the extract-capable subset only.
+
+        Search-only providers (searxng, brave-free, ddgs, xai) cannot extract —
+        the runtime rejects them with a "search-only backend" error — so they
+        must not be offered for web.extract_backend.
+        """
+        from hermes_cli.web_server import CONFIG_SCHEMA
+
+        offered = {o for o in CONFIG_SCHEMA["web.extract_backend"]["options"] if o}
+        assert offered == {"firecrawl", "tavily", "exa", "parallel"}
+        assert offered.isdisjoint({"searxng", "brave-free", "ddgs", "xai"})
+
     def test_memory_provider_field_present_as_select(self):
         """memory.provider must stay in the config schema.
 
@@ -5672,6 +5714,48 @@ class TestBuildSchemaFromConfig:
         fields = web_server._schema_with_dynamic_provider_options()
 
         assert "gone_from_disk" in fields["memory.provider"]["options"]
+
+    def test_dynamic_merge_preserves_configured_web_backend(self, monkeypatch):
+        """A plugin/custom web backend outside the built-in list stays selectable.
+
+        Web backends are plugin-extensible and the dashboard renders a select as
+        a closed gate, so a configured value the built-in list doesn't contain
+        must be appended — otherwise it silently vanishes and the next save
+        clobbers it.
+        """
+        from hermes_cli import web_server
+
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {"web": {"backend": "my_plugin_backend", "extract_backend": "custom_extract"}},
+        )
+
+        fields = web_server._schema_with_dynamic_provider_options()
+
+        assert "my_plugin_backend" in fields["web.backend"]["options"]
+        assert "custom_extract" in fields["web.extract_backend"]["options"]
+        # The module-level schema is copied, not mutated in place.
+        assert web_server.CONFIG_SCHEMA["web.backend"] is not fields["web.backend"]
+        assert web_server.CONFIG_SCHEMA["web.backend"]["type"] == "select"
+
+    def test_dynamic_merge_no_overlay_for_builtin_web_backend(self, monkeypatch):
+        """A built-in (or blank) web backend needs no overlay — options unchanged.
+
+        The merge only fires when a configured value falls outside the list, so
+        the common case returns the frozen import-time entry untouched.
+        """
+        from hermes_cli import web_server
+
+        monkeypatch.setattr(
+            web_server, "load_config", lambda: {"web": {"backend": "searxng", "search_backend": ""}}
+        )
+
+        fields = web_server._schema_with_dynamic_provider_options()
+
+        # No web override was added → identity with the module-level schema.
+        assert fields["web.backend"] is web_server.CONFIG_SCHEMA["web.backend"]
+        assert fields["web.search_backend"] is web_server.CONFIG_SCHEMA["web.search_backend"]
 
     def test_approvals_mode_options_match_config_values(self):
         """approvals.mode select options must match the values accepted by config.py.

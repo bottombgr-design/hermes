@@ -815,6 +815,19 @@ def _timezone_options() -> List[str]:
         return ["UTC"]
 
 
+# Built-in web backends, mirrored from ``tools/web_tools.py`` (_LEGACY_WEB_BACKENDS
+# for search; the extract-capable subset the runtime names in its "search-only"
+# error). Leading "" = fall back to the shared ``web.backend`` / auto-detect.
+# Kept as module constants so the static override and the per-request
+# current-value preservation in _schema_with_dynamic_provider_options share one
+# source of truth. Web backends are plugin-extensible, so these are suggestions,
+# not an exhaustive gate — a configured name outside the list is preserved.
+_WEB_SEARCH_BACKEND_OPTIONS = [
+    "", "firecrawl", "searxng", "brave-free", "ddgs", "tavily", "exa", "parallel", "xai",
+]
+_WEB_EXTRACT_BACKEND_OPTIONS = ["", "firecrawl", "tavily", "exa", "parallel"]
+
+
 _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "timezone": {
         "type": "select",
@@ -847,6 +860,21 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "type": "select",
         "description": "Modal sandbox mode",
         "options": ["sandbox", "function"],
+    },
+    "web.backend": {
+        "type": "select",
+        "description": "Shared web search + extract backend (blank = auto-detect from credentials)",
+        "options": _WEB_SEARCH_BACKEND_OPTIONS,
+    },
+    "web.search_backend": {
+        "type": "select",
+        "description": "Per-capability override for web_search (blank = fall back to web.backend)",
+        "options": _WEB_SEARCH_BACKEND_OPTIONS,
+    },
+    "web.extract_backend": {
+        "type": "select",
+        "description": "Per-capability override for web_extract (blank = fall back to web.backend)",
+        "options": _WEB_EXTRACT_BACKEND_OPTIONS,
     },
     "proxy.enabled": {
         "type": "boolean",
@@ -1226,6 +1254,22 @@ def _memory_provider_schema_options(cfg: Dict[str, Any]) -> List[str]:
     return options
 
 
+def _web_backend_schema_options(base: List[str], configured: Any) -> List[str]:
+    """Preserve a configured web backend that isn't one of the built-ins.
+
+    Web backends are plugin-extensible, so a config value can legitimately be a
+    name outside :data:`_WEB_SEARCH_BACKEND_OPTIONS` /
+    :data:`_WEB_EXTRACT_BACKEND_OPTIONS`. The dashboard's select is a closed
+    gate, so append the active value to keep it selectable — matching the
+    current-value preservation used for tts/stt/memory providers. Returns the
+    ``base`` list unchanged when nothing needs appending.
+    """
+    current = str(configured or "").strip()
+    if current and current not in base:
+        return [*base, current]
+    return base
+
+
 def _schema_with_dynamic_provider_options() -> Dict[str, Dict[str, Any]]:
     """Return CONFIG_SCHEMA with per-request discovery-driven options merged.
 
@@ -1263,6 +1307,16 @@ def _schema_with_dynamic_provider_options() -> Dict[str, Dict[str, Any]]:
             merge(f"{kind}.provider", _custom_provider_options(kind, list(existing), cfg))
 
     merge("memory.provider", _memory_provider_schema_options(cfg))
+
+    # Web backends are plugin-extensible, and the dashboard renders a select as
+    # a closed gate. Preserve a configured value outside the built-in list so a
+    # plugin/custom backend never silently vanishes from the dropdown (mirrors
+    # the tts/stt/memory current-value preservation above).
+    web = cfg.get("web")
+    web = web if isinstance(web, dict) else {}
+    merge("web.backend", _web_backend_schema_options(_WEB_SEARCH_BACKEND_OPTIONS, web.get("backend")))
+    merge("web.search_backend", _web_backend_schema_options(_WEB_SEARCH_BACKEND_OPTIONS, web.get("search_backend")))
+    merge("web.extract_backend", _web_backend_schema_options(_WEB_EXTRACT_BACKEND_OPTIONS, web.get("extract_backend")))
 
     if not overlay:
         return CONFIG_SCHEMA
