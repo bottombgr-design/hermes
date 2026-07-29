@@ -4376,6 +4376,51 @@ class TestAuxiliaryAuthRefreshRetry:
         assert stale_client.chat.completions.create.call_count == 1
         assert fresh_client.chat.completions.create.call_count == 1
 
+    def test_call_llm_anthropic_401_retry_does_not_reuse_stale_api_key(self):
+        """Regression: _refresh_provider_credentials() rotates the on-disk
+        OAuth credential and evicts the cached client, but the retry used to
+        pass the exact ``resolved_api_key`` that just 401'd back into
+        ``_get_cached_client`` — which treats an explicit api_key as
+        authoritative and never re-derives it. That rebuilt a client with
+        the same dead token and 401'd forever (observed: title_generation
+        and context_compressor stuck 401ing for hours in production while
+        the main loop's credential_pool kept rotating fine). The retry must
+        re-resolve the token instead of reusing the stale one.
+        """
+        stale_client = MagicMock()
+        stale_client.base_url = "https://api.anthropic.com"
+        stale_client.chat.completions.create.side_effect = _AuxAuth401("OAuth access token has been revoked.")
+
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://api.anthropic.com"
+        fresh_client.chat.completions.create.return_value = _DummyResponse("fresh-anthropic")
+
+        seen_api_keys = []
+
+        def _fake_get_cached_client(provider, model, **kwargs):
+            seen_api_keys.append(kwargs.get("api_key"))
+            if len(seen_api_keys) == 1:
+                return stale_client, model
+            return fresh_client, model
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("anthropic", "claude-haiku-4-5-20251001", None, "stale-dead-token", None)),
+            patch("agent.auxiliary_client._get_cached_client", side_effect=_fake_get_cached_client),
+            patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True),
+            patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="fresh-rotated-token"),
+        ):
+            resp = call_llm(
+                task="compression",
+                provider="anthropic",
+                model="claude-haiku-4-5-20251001",
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="stale-dead-token",
+            )
+
+        assert resp.choices[0].message.content == "fresh-anthropic"
+        assert seen_api_keys[0] == "stale-dead-token"
+        assert seen_api_keys[1] == "fresh-rotated-token"
+
     @pytest.mark.asyncio
     async def test_async_call_llm_refreshes_codex_on_401_for_vision(self):
         failing_client = MagicMock()
