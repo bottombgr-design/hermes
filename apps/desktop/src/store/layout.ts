@@ -221,6 +221,18 @@ export function dismissAutoProject(id: string): void {
   }
 }
 
+// Reverse a dismiss: un-hide an auto-derived project so its row returns to the
+// overview. Powers the "Undo" affordance on the hide toast (accidental hides
+// were otherwise irreversible — there is no other restore control). Idempotent
+// when the id isn't currently dismissed.
+export function restoreAutoProject(id: string): void {
+  const current = $dismissedAutoProjectIds.get()
+
+  if (current.includes(id)) {
+    $dismissedAutoProjectIds.set(current.filter(projectId => projectId !== id))
+  }
+}
+
 // Hide a worktree row after it's been removed via git.
 export function dismissWorktree(id: string): void {
   const current = $dismissedWorktreeIds.get()
