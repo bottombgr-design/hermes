@@ -101,6 +101,48 @@ def test_arm_shutdown_watchdog_fires_with_dump_and_exit(tmp_path):
     assert get_shutdown_watchdog_dump_path(tmp_path).name == "gateway-shutdown-watchdog.log"
 
 
+def test_arm_shutdown_watchdog_exits_despite_wedged_pid_cleanup(tmp_path, monkeypatch):
+    """Hard-exit must survive a hung remove_pid_file (wedged NFS/flock).
+
+    try/except only catches raised exceptions; a blocking unlink/flock never
+    returns. Without a join timeout the watchdog thread itself freezes and
+    os._exit never runs — the failure mode this module exists to recover from.
+    """
+    monkeypatch.setattr(
+        "gateway.shutdown_watchdog.DEFAULT_WATCHDOG_CLEANUP_TIMEOUT_S",
+        0.15,
+    )
+    done = threading.Event()
+    fired = threading.Event()
+    blocked = threading.Event()
+    exit_codes = []
+
+    def wedged_remove_pid_file():
+        blocked.set()
+        threading.Event().wait()  # hang until process exit; no sleep timer
+
+    def fake_exit(code):
+        exit_codes.append(code)
+        fired.set()
+
+    with (
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=fake_exit),
+        patch("gateway.status.remove_pid_file", side_effect=wedged_remove_pid_file),
+        patch("gateway.status.release_gateway_runtime_lock"),
+        patch("hermes_logging.drain_log_queue"),
+    ):
+        arm_shutdown_watchdog(
+            0.1,
+            done_event=done,
+            dump_path=tmp_path / "dump.log",
+            exit_code=11,
+        )
+        assert fired.wait(timeout=3.0), "watchdog hung on PID cleanup and never exited"
+
+    assert exit_codes == [11]
+    assert blocked.is_set()
+
+
 @pytest.mark.asyncio
 async def test_loop_heartbeat_rewrites_until_cancelled(tmp_path):
     path = get_loop_heartbeat_path(tmp_path)

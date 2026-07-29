@@ -167,3 +167,34 @@ def test_exit_backstop_releases_pid_file_and_runtime_lock(monkeypatch):
     assert exc_info.value.code == 78
     remove_pid.assert_called_once_with()
     release_lock.assert_called_once_with()
+
+
+def test_exit_backstop_exits_despite_wedged_pid_cleanup(monkeypatch):
+    """Hard-exit must survive a hung remove_pid_file on the graceful-exit path."""
+    import threading
+    import time
+
+    from gateway import status as gateway_status
+    from gateway import shutdown_watchdog as watchdog_mod
+
+    blocked = threading.Event()
+
+    def wedged_remove_pid_file():
+        blocked.set()
+        threading.Event().wait()
+
+    monkeypatch.setattr(watchdog_mod, "DEFAULT_WATCHDOG_CLEANUP_TIMEOUT_S", 0.15)
+    monkeypatch.setattr(gateway_status, "remove_pid_file", wedged_remove_pid_file)
+    monkeypatch.setattr(gateway_status, "release_gateway_runtime_lock", Mock())
+    monkeypatch.setattr(gateway_run.os, "_exit", _raise_exit)
+    monkeypatch.setattr(gateway_run.sys, "stdout", SimpleNamespace(flush=Mock()))
+    monkeypatch.setattr(gateway_run.sys, "stderr", SimpleNamespace(flush=Mock()))
+
+    started = time.monotonic()
+    with pytest.raises(_ExitCalled) as exc_info:
+        gateway_run._exit_after_graceful_shutdown(42)
+    elapsed = time.monotonic() - started
+
+    assert exc_info.value.code == 42
+    assert blocked.is_set()
+    assert elapsed < 2.0, f"exit backstop hung on PID cleanup ({elapsed:.2f}s)"
