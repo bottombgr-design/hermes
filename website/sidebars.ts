@@ -199,6 +199,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-email',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/bundled/email/email-atomicmail',
                     'user-guide/skills/bundled/email/email-himalaya',
                   ],
                 },
