@@ -1,6 +1,7 @@
 """Tests for WSL detection and WSL-aware gateway behavior."""
 
 import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, mock_open
 
@@ -119,6 +120,10 @@ class TestWslSystemdOperational:
 # supports_systemd_services() WSL integration
 # =============================================================================
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only: supports_systemd_services checks for systemd (a Linux init system)",
+)
 class TestSupportsSystemdServicesWSL:
     """Test that supports_systemd_services() handles WSL correctly."""
 

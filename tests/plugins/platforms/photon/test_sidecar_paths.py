@@ -9,6 +9,7 @@ volume when a runtime install is unavoidable.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -136,6 +137,10 @@ def test_mirror_failure_falls_back_to_source(tmp_path, monkeypatch) -> None:
     assert sidecar_paths.resolve_sidecar_dir(source) == source
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only: uses os.geteuid() and chmod 0o555 which Windows doesn't honor",
+)
 def test_dir_writable_probe(tmp_path) -> None:
     assert sidecar_paths.dir_writable(tmp_path) is True
     ro = tmp_path / "ro"

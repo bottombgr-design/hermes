@@ -2,7 +2,6 @@
 
 import argparse
 import os
-import pty
 import signal
 import subprocess
 import sys
@@ -105,6 +104,10 @@ def test_run_gateway_exits_nonzero_when_start_gateway_reports_failure(monkeypatc
 def test_gateway_run_subprocess_preserves_daemon_exit_codes(
     tmp_path, stdin_is_tty, outcome, expected_exit
 ):
+    # POSIX-only; Windows has no PTY (no termios) so the import would fail at
+    # collection time. Lazy-import here so the skipif on the parametrize covers
+    # Windows before this line is reached.
+    import pty
     """TTY state must not rewrite the gateway's process-level exit contract.
 
     Exit 75 is the intentional systemd/launchd restart handoff, exit 78 is a
@@ -174,6 +177,10 @@ def test_gateway_run_subprocess_preserves_daemon_exit_codes(
     assert completed.returncode == expected_exit, completed.stderr
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only test",
+)
 def test_run_gateway_refuses_root_in_official_docker(monkeypatch, tmp_path, capsys):
     project_root = tmp_path / "opt" / "hermes"
     (project_root / "docker").mkdir(parents=True)
@@ -193,6 +200,10 @@ def test_run_gateway_refuses_root_in_official_docker(monkeypatch, tmp_path, caps
     assert "/opt/hermes/docker/entrypoint.sh" in out
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only test",
+)
 def test_run_gateway_root_guard_has_escape_hatch(monkeypatch):
     calls = []
 
@@ -656,6 +667,10 @@ def test_gateway_restart_on_windows_preserves_failure_fallback(monkeypatch):
     assert calls == ["restart", "stop", "wait", "run"]
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only test",
+)
 def test_systemd_status_warns_when_linger_disabled(monkeypatch, tmp_path, capsys):
     unit_path = tmp_path / "hermes-gateway.service"
     unit_path.write_text("[Unit]\n")
@@ -686,6 +701,10 @@ def test_systemd_status_warns_when_linger_disabled(monkeypatch, tmp_path, capsys
     assert "loginctl enable-linger" in out
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only test",
+)
 def test_systemd_install_checks_linger_status(monkeypatch, tmp_path, capsys):
     unit_path = tmp_path / "systemd" / "user" / "hermes-gateway.service"
 
@@ -817,6 +836,10 @@ def test_conflicting_systemd_units_warning(monkeypatch, tmp_path, capsys):
     assert "--system" in out
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only test",
+)
 def test_install_linux_gateway_from_setup_non_root_never_offers_system(monkeypatch, capsys):
     # Non-root sessions must not be offered system scope, and must never be
     # handed a `sudo hermes …` self-elevation recipe.
@@ -838,6 +861,10 @@ def test_install_linux_gateway_from_setup_non_root_never_offers_system(monkeypat
     assert "sudo hermes" not in out
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only test",
+)
 def test_install_linux_gateway_from_setup_system_choice_without_root_no_sudo_recipe(monkeypatch, capsys):
     # Defensive guard: if "system" is forced non-root (not reachable via wizard),
     # we refuse and do NOT print a self-elevation recipe.
@@ -854,6 +881,10 @@ def test_install_linux_gateway_from_setup_system_choice_without_root_no_sudo_rec
     assert "requires root" in out
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only test",
+)
 def test_install_linux_gateway_from_setup_system_choice_as_root_installs(monkeypatch):
     monkeypatch.setattr(gateway, "prompt_linux_gateway_install_scope", lambda: "system")
     monkeypatch.setattr(gateway.os, "geteuid", lambda: 0)
@@ -1088,6 +1119,10 @@ def test_reap_unsupervised_orphans_noop_on_systemd_hosts(monkeypatch):
     assert killed == []
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only test",
+)
 def test_reap_unsupervised_orphans_sigterms_then_sigkills_survivor(monkeypatch):
     """No-systemd: orphan gets SIGTERM, and a survivor is force-killed."""
     monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
