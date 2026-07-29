@@ -7,7 +7,7 @@ description: >-
   Nessie is the context layer for AI-native work - search and read your
   own and your team's AI conversation history, notes, and shared sources
   from Hermes via the hosted Nessie MCP server.
-source: https://nessielabs.com
+source: https://nessielabs.com/docs/
 
 # Hosted Streamable HTTP endpoint. Auth is a per-user API key sent as a
 # bearer Authorization header - the same header template that
