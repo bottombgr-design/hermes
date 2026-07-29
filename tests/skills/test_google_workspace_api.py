@@ -245,15 +245,42 @@ def test_api_gmail_get_reads_headers_case_insensitively(api_module, capsys, head
         return {
             "id": "msg-1",
             "threadId": "thread-1",
+            "internalDate": "1780056000000",
             "labelIds": ["INBOX"],
             "payload": {
                 "headers": [
                     {"name": from_name, "value": "sender@example.com"},
                     {"name": to_name, "value": "recipient@example.com"},
+                    {"name": "Cc", "value": "copy@example.com"},
                     {"name": subject_name, "value": "case bug"},
                     {"name": date_name, "value": "Fri, 29 May 2026 12:00:00 +0000"},
                 ],
+                "mimeType": "multipart/mixed",
                 "body": {},
+                "parts": [
+                    {
+                        "mimeType": "text/plain",
+                        "body": {
+                            "data": api_module.base64.urlsafe_b64encode(
+                                b"Plain body"
+                            ).decode()
+                        },
+                    },
+                    {
+                        "mimeType": "multipart/related",
+                        "body": {},
+                        "parts": [
+                            {
+                                "filename": "example.pdf",
+                                "mimeType": "application/pdf",
+                                "body": {
+                                    "attachmentId": "attachment-1",
+                                    "size": 1234,
+                                },
+                            }
+                        ],
+                    },
+                ],
             },
         }
 
@@ -265,8 +292,19 @@ def test_api_gmail_get_reads_headers_case_insensitively(api_module, capsys, head
     result = json.loads(capsys.readouterr().out)
     assert result["from"] == "sender@example.com"
     assert result["to"] == "recipient@example.com"
+    assert result["cc"] == "copy@example.com"
     assert result["subject"] == "case bug"
     assert result["date"] == "Fri, 29 May 2026 12:00:00 +0000"
+    assert result["internalDate"] == "1780056000000"
+    assert result["body"] == "Plain body"
+    assert result["attachments"] == [
+        {
+            "filename": "example.pdf",
+            "mimeType": "application/pdf",
+            "attachmentId": "attachment-1",
+            "size": 1234,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -300,6 +338,7 @@ def test_api_gmail_search_reads_headers_case_insensitively(
         return {
             "id": "msg-1",
             "threadId": "thread-1",
+            "internalDate": "1780056000000",
             "labelIds": ["INBOX"],
             "snippet": "preview",
             "payload": {
@@ -331,6 +370,7 @@ def test_api_gmail_search_reads_headers_case_insensitively(
             "to": "recipient@example.com",
             "subject": "case bug",
             "date": "Fri, 29 May 2026 12:00:00 +0000",
+            "internalDate": "1780056000000",
             "snippet": "preview",
             "labels": ["INBOX"],
         }
