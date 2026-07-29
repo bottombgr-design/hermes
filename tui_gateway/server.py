@@ -2713,6 +2713,24 @@ def _apply_managed(cfg: dict) -> dict:
         return cfg
 
 
+def _load_cfg_for_write() -> dict:
+    """Deep-copy of on-disk user config (no managed overlay) for mutate-then-save.
+
+    ``_load_cfg()`` returns the managed overlay for read-side effective values.
+    Callers that mutate and pass the result to ``_save_cfg`` must use this
+    instead, or administrator-pinned leaves get baked into the user's file.
+    """
+    _load_cfg()  # refresh cache / mtime
+    with _cfg_lock:
+        if not isinstance(_cfg_cache, dict):
+            return {}
+        return copy.deepcopy(_cfg_cache)
+
+
+class _ManagedConfigWriteError(ValueError):
+    """Raised when a write targets a key pinned by HERMES_MANAGED_DIR."""
+
+
 def _save_cfg(cfg: dict):
     global _cfg_cache, _cfg_mtime, _cfg_path
 
@@ -3513,7 +3531,16 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
 
 
 def _write_config_key(key_path: str, value):
-    cfg = _load_cfg()
+    from hermes_cli import managed_scope
+
+    if managed_scope.is_key_managed(key_path):
+        managed_dir = managed_scope.get_managed_dir()
+        src = (managed_dir / "config.yaml") if managed_dir else "the managed scope"
+        raise _ManagedConfigWriteError(
+            f"Cannot set '{key_path}': it is managed by your administrator ({src}) "
+            "and cannot be changed."
+        )
+    cfg = _load_cfg_for_write()
     current = cfg
     keys = key_path.split(".")
     for key in keys[:-1]:
@@ -13533,6 +13560,13 @@ def _(rid, params: dict) -> dict:
 
 @method("config.set")
 def _(rid, params: dict) -> dict:
+    try:
+        return _config_set(rid, params)
+    except _ManagedConfigWriteError as e:
+        return _err(rid, 4030, str(e))
+
+
+def _config_set(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     session = _sessions.get(params.get("session_id", ""))
 
@@ -13875,6 +13909,8 @@ def _(rid, params: dict) -> dict:
                     os.environ.pop("HERMES_YOLO_MODE", None)
                     nv = "0"
             return _ok(rid, {"key": key, "value": nv, "scope": "session"})
+        except _ManagedConfigWriteError:
+            raise
         except Exception as e:
             return _err(rid, 5001, str(e))
 
@@ -13886,7 +13922,7 @@ def _(rid, params: dict) -> dict:
             scope = str(params.get("scope") or "").strip().lower()
             global_scope = scope == "global"
             if arg in {"show", "on"}:
-                cfg = _load_cfg()
+                cfg = _load_cfg_for_write()
                 display = (
                     cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
                 )
@@ -13904,7 +13940,7 @@ def _(rid, params: dict) -> dict:
                     session["show_reasoning"] = True
                 return _ok(rid, {"key": key, "value": "show"})
             if arg in {"hide", "off"}:
-                cfg = _load_cfg()
+                cfg = _load_cfg_for_write()
                 display = (
                     cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
                 )
@@ -13929,7 +13965,7 @@ def _(rid, params: dict) -> dict:
             # display.reasoning_full is persisted too so the config key stays
             # consistent across the CLI and TUI surfaces.
             if arg in {"full", "all"}:
-                cfg = _load_cfg()
+                cfg = _load_cfg_for_write()
                 display = (
                     cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
                 )
@@ -13945,7 +13981,7 @@ def _(rid, params: dict) -> dict:
                 _save_cfg(cfg)
                 return _ok(rid, {"key": key, "value": "full"})
             if arg in {"clamp", "collapse", "short"}:
-                cfg = _load_cfg()
+                cfg = _load_cfg_for_write()
                 display = (
                     cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
                 )
@@ -13984,6 +14020,8 @@ def _(rid, params: dict) -> dict:
                     _session_info(session["agent"], session),
                 )
             return _ok(rid, {"key": key, "value": arg})
+        except _ManagedConfigWriteError:
+            raise
         except Exception as e:
             return _err(rid, 5001, str(e))
 
@@ -13991,7 +14029,7 @@ def _(rid, params: dict) -> dict:
         nv = str(value or "").strip().lower()
         if nv not in _DETAIL_MODES:
             return _err(rid, 4002, f"unknown details_mode: {value}")
-        cfg = _load_cfg()
+        cfg = _load_cfg_for_write()
         display = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
         sections = (
             display.get("sections") if isinstance(display.get("sections"), dict) else {}
@@ -14013,7 +14051,7 @@ def _(rid, params: dict) -> dict:
         if section not in _DETAIL_SECTION_NAMES:
             return _err(rid, 4002, f"unknown section: {section}")
 
-        cfg = _load_cfg()
+        cfg = _load_cfg_for_write()
         display = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
         sections_cfg = (
             display.get("sections") if isinstance(display.get("sections"), dict) else {}
@@ -14158,8 +14196,8 @@ def _(rid, params: dict) -> dict:
 
     if key in {"prompt", "personality", "skin"}:
         try:
-            cfg = _load_cfg()
             if key == "prompt":
+                cfg = _load_cfg_for_write()
                 if value == "clear":
                     cfg.pop("custom_prompt", None)
                     nv = ""
@@ -14168,6 +14206,7 @@ def _(rid, params: dict) -> dict:
                     nv = value
                 _save_cfg(cfg)
             elif key == "personality":
+                cfg = _load_cfg()
                 sid_key = params.get("session_id", "")
                 pname, new_prompt = _validate_personality(str(value or ""), cfg)
                 _write_config_key("display.personality", pname)
@@ -14191,6 +14230,8 @@ def _(rid, params: dict) -> dict:
                 if info is not None:
                     resp["info"] = info
             return _ok(rid, resp)
+        except _ManagedConfigWriteError:
+            raise
         except Exception as e:
             return _err(rid, 5001, str(e))
 
