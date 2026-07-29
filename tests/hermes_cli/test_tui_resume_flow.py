@@ -369,6 +369,7 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
             "gpt-test",
             "--provider",
             "openai",
+            "--ignore-rules",
             "--usage-file",
             "usage.json",
         ],
@@ -403,6 +404,7 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "provider": "openai",
         "toolsets": None,
         "usage_file": "usage.json",
+        "ignore_rules": True,
     }
 
 
@@ -606,6 +608,7 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
             "hermes",
             "-z",
             "hello",
+            "--ignore-rules",
             "--toolsets",
             "web,terminal",
             "--usage-file",
@@ -657,6 +660,7 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
         "provider": None,
         "toolsets": "web,terminal",
         "usage_file": "usage.json",
+        "ignore_rules": True,
     }
 
 
@@ -1567,7 +1571,28 @@ def test_oneshot_distinguishes_disabled_mcp_from_unknown(monkeypatch, capsys):
     assert "mcp-off" in err
 
 
-def test_oneshot_wires_session_db_for_recall(monkeypatch):
+@pytest.mark.parametrize("env_name", ["HERMES_IGNORE_RULES", "HERMES_SAFE_MODE"])
+def test_run_oneshot_passes_ignore_rules_env(monkeypatch, capsys, env_name):
+    import hermes_cli.oneshot as oneshot_mod
+
+    captured = {}
+    monkeypatch.setenv(env_name, "1")
+    monkeypatch.setattr(
+        oneshot_mod,
+        "_run_agent",
+        lambda prompt, **kwargs: captured.update({"prompt": prompt, **kwargs})
+        or ("ok", {"final_response": "ok"}),
+    )
+
+    assert oneshot_mod.run_oneshot("hello") == 0
+
+    assert captured["prompt"] == "hello"
+    assert captured["ignore_rules"] is True
+    assert capsys.readouterr().out == "ok\n"
+
+
+@pytest.mark.parametrize("ignore_rules", [False, True])
+def test_oneshot_wires_session_db_for_recall(monkeypatch, ignore_rules):
     """hermes -z bypasses HermesCLI, but recall still needs SessionDB."""
     from hermes_cli.oneshot import _run_agent
 
@@ -1627,11 +1652,13 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
         mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: {"session_search"}),
     )
 
-    text, result = _run_agent("recall this")
+    text, result = _run_agent("recall this", ignore_rules=ignore_rules)
     assert text == "ok"
     assert not result.get("failed")
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
+    assert captured["skip_context_files"] is ignore_rules
+    assert captured["skip_memory"] is ignore_rules
     assert captured["prompt"] == "recall this"
 
 
