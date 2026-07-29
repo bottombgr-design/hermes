@@ -3,6 +3,8 @@
 import json
 from typing import List, Optional
 
+import pytest
+
 
 from tools.clarify_tool import (
     clarify_tool,
@@ -78,18 +80,62 @@ class TestClarifyToolChoicesValidation:
 
         assert len(choices_passed) == MAX_CHOICES
 
-    def test_empty_choices_become_none(self):
-        """Empty choices list should become None (open-ended)."""
-        choices_received = ["marker"]
+    @pytest.mark.parametrize("choices", [None, []])
+    def test_null_or_empty_choices_are_open_ended(self, choices):
+        """Null and an explicitly empty list preserve open-ended mode."""
+        choices_received: list[object] = ["marker"]
 
-        def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+        def mock_callback(
+            question: str, normalized_choices: Optional[List[str]]
+        ) -> str:
             choices_received.clear()
-            if choices is not None:
-                choices_received.extend(choices)
+            choices_received.append(normalized_choices)
             return "answer"
 
-        clarify_tool("Open question?", choices=[], callback=mock_callback)
-        assert choices_received == []  # Was cleared, nothing added
+        clarify_tool("Open question?", choices=choices, callback=mock_callback)
+        assert choices_received == [None]
+
+    @pytest.mark.parametrize(
+        "choices",
+        [
+            ["", "   ", "\n"],
+            [None, {}, {"value": "raw-id"}, []],
+        ],
+    )
+    def test_nonempty_choices_with_no_usable_labels_return_error(self, choices):
+        """Malformed structured prompts must not silently become open-ended."""
+        callback_called = False
+
+        def mock_callback(
+            question: str, normalized_choices: Optional[List[str]]
+        ) -> str:
+            nonlocal callback_called
+            callback_called = True
+            return "unexpected"
+
+        result = json.loads(
+            clarify_tool("Pick one", choices=choices, callback=mock_callback)
+        )
+
+        assert result == {
+            "error": (
+                "choices contained no non-empty options; resend with meaningful "
+                "labels or omit choices for an open-ended question."
+            )
+        }
+        assert callback_called is False
+
+    def test_multi_select_with_no_usable_choices_returns_error(self):
+        result = json.loads(
+            clarify_tool(
+                "Pick several",
+                choices=["", "\n"],
+                multi_select=True,
+                callback=lambda *_args, **_kwargs: "unexpected",
+            )
+        )
+
+        assert "no non-empty options" in result["error"]
 
     def test_choices_with_only_whitespace_stripped(self):
         """Whitespace-only choices should be stripped out."""
@@ -459,7 +505,6 @@ class TestInvokeCallbackDispatch:
             calls.append(1)
             raise TypeError("internal bug")
 
-        import pytest
         with pytest.raises(TypeError, match="internal bug"):
             _invoke_callback(bad_callback, "Q?", ["a"], True)
         assert len(calls) == 1
