@@ -137,6 +137,26 @@ async def test_send_voice_missing_reply_target_sends_without_reference(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_send_rejects_whitespace_without_calling_discord(caplog):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(send=AsyncMock())
+    get_channel = MagicMock(return_value=channel)
+    adapter._client = SimpleNamespace(
+        get_channel=get_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    with caplog.at_level("WARNING"):
+        result = await adapter.send("555", "  \n\t ")
+
+    assert result.success is False
+    assert result.error == "Refusing to send empty message"
+    get_channel.assert_not_called()
+    channel.send.assert_not_awaited()
+    assert "Dropped empty message to chat=555" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_send_retries_without_reference_when_reply_target_is_system_message():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
 
