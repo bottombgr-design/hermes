@@ -376,9 +376,22 @@ class TestResolveConfigPath:
     def test_falls_back_to_global_without_hermes_home_env(self, tmp_path):
         fake_home = tmp_path / "fakehome"
         fake_home.mkdir()
+        fake_native_hermes = fake_home / ".hermes"
 
         with patch.dict(os.environ, {}, clear=False), \
-             patch.object(Path, "home", return_value=fake_home):
+             patch.object(Path, "home", return_value=fake_home), \
+             patch(
+                 "hermes_cli.profiles._get_default_hermes_home",
+                 return_value=fake_native_hermes,
+             ), \
+             patch(
+                 "plugins.memory.honcho.client.get_hermes_home",
+                 return_value=fake_native_hermes,
+             ), \
+             patch(
+                 "hermes_constants._get_platform_default_hermes_home",
+                 return_value=fake_native_hermes,
+             ):
             os.environ.pop("HERMES_HOME", None)
             result = resolve_config_path()
         assert result == fake_home / ".honcho" / "config.json"

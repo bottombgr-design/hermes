@@ -747,6 +747,10 @@ class TestPinTransition:
         cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor", "pinPeerName": True}))
         sig_pinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
+        # Clear the memo so the second read actually re-reads honcho.json
+        # (same rationale as test_cache_busting_signature_reflects_user_peer_aliases)
+        GatewayRunner._HONCHO_CACHE_BUSTING_MEMO = {}
+
         cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor", "pinPeerName": False}))
         sig_unpinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
@@ -760,6 +764,13 @@ class TestPinTransition:
 
         cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor"}))
         sig_no_aliases = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+
+        # The Honcho cache-busting memo is keyed on (path, mtime_ns); on some
+        # filesystems the second write_text can land in the same mtime tick
+        # as the first, which would make the memo return stale values and
+        # the signature comparison unreliable. Clear the memo between
+        # writes — we're testing the signature, not the memo.
+        GatewayRunner._HONCHO_CACHE_BUSTING_MEMO = {}
 
         cfg_path.write_text(json.dumps({
             "apiKey": "k",
@@ -778,6 +789,10 @@ class TestPinTransition:
 
         cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor"}))
         sig_no_prefix = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+
+        # Clear the memo so the second read actually re-reads honcho.json
+        # (same rationale as test_cache_busting_signature_reflects_user_peer_aliases)
+        GatewayRunner._HONCHO_CACHE_BUSTING_MEMO = {}
 
         cfg_path.write_text(json.dumps({
             "apiKey": "k",
@@ -806,6 +821,10 @@ class TestPinTransition:
             "aiPeer": "hermes",
         }))
         sig_before = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+
+        # Clear the memo so the second read actually re-reads honcho.json
+        # (same rationale as test_cache_busting_signature_reflects_user_peer_aliases)
+        GatewayRunner._HONCHO_CACHE_BUSTING_MEMO = {}
 
         cfg_path.write_text(json.dumps({
             "apiKey": "k",
