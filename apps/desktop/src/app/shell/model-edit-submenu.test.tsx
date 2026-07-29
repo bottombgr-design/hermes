@@ -19,7 +19,7 @@ import {
   setCurrentReasoningEffort
 } from '@/store/session'
 
-import { type FastControl, ModelEditSubmenu } from './model-edit-submenu'
+import { type FastControl, ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
 
 vi.mock('@/hermes', async importOriginal => {
   const actual = await importOriginal<typeof HermesApi>()
@@ -45,6 +45,31 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+})
+
+describe('resolveFastControl', () => {
+  const baseId = 'accounts/fireworks/models/kimi-k3'
+  const fastId = 'accounts/fireworks/routers/kimi-k3-fast'
+  const family = { baseId, fastId }
+  const models = [baseId, fastId]
+
+  it('uses a cross-path speed variant for the base model', () => {
+    expect(resolveFastControl(baseId, models, false, false, family)).toEqual({
+      kind: 'variant',
+      baseId,
+      fastId,
+      on: false
+    })
+  })
+
+  it('recognizes the cross-path speed variant as enabled', () => {
+    expect(resolveFastControl(fastId, models, false, false, family)).toEqual({
+      kind: 'variant',
+      baseId,
+      fastId,
+      on: true
+    })
+  })
 })
 
 // Render the submenu inside an open menu/sub so its content (switches) mounts.
