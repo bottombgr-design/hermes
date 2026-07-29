@@ -6520,9 +6520,20 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             tc_info = tool_call_args.get(tc_id) if tc_id else None
             name = (tc_info[0] if tc_info else None) or m.get("tool_name") or "tool"
             args = (tc_info[1] if tc_info else None) or {}
-            messages.append(
-                {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
-            )
+            # Preserve the original tool result so the desktop resume payload
+            # can pair the tool result with the call that produced it. The
+            # legacy code path dropped ``content`` and ``tool_call_id`` here,
+            # which broke the link for any consumer that needed the raw result
+            # (e.g. the assistant frame re-injection on resume). Keep the
+            # synthesized ``name`` + ``context`` for the human-readable
+            # affordance, but also carry the original id + payload forward.
+            messages.append({
+                "role": "tool",
+                "name": name,
+                "context": _tool_ctx(name, args),
+                "tool_call_id": tc_id,
+                "text": content_text,
+            })
             continue
         # An assistant turn may carry only reasoning/thinking content with no
         # visible text (extended-thinking turns, thinking-only recovery
