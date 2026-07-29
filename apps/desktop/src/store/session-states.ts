@@ -172,7 +172,9 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
   } else if (!next.busy && wasWorking) {
     markSettled(storedId)
 
-    if (storedId !== $selectedStoredSessionId.get()) {
+    // FOCUSED, not selected: a session finishing in the tile the user is
+    // watching is already seen, and a tile is never the primary selection.
+    if (storedId !== $focusedStoredSessionId.get()) {
       const cur = $unreadFinishedSessionIds.get()
 
       if (!cur.includes(storedId)) {
@@ -731,6 +733,18 @@ export const $focusedSessionState = computed([$focusedRuntimeId, $sessionStates]
  *  behind the workspace (A+B "disappear" when switching to C). */
 export const selectionHomesToWorkspace = (selected: null | string, tiles: readonly SessionTile[]): boolean =>
   !(selected && tiles.some(t => t.storedSessionId === selected))
+
+// Bringing a finished session to the front clears its green dot. Keyed on the
+// FOCUSED session, not the selected one: a tile is never $selectedStoredSessionId,
+// and a tile tab click goes through activateTreePane rather than focusOpenSession,
+// so this is the one hook that catches every way a tile reaches the front.
+$focusedStoredSessionId.listen(focused => {
+  const cur = $unreadFinishedSessionIds.get()
+
+  if (focused && cur.includes(focused)) {
+    $unreadFinishedSessionIds.set(cur.filter(id => id !== focused))
+  }
+})
 
 // Homing also FRONTS the workspace tab: the resumed chat loads in the workspace
 // pane, so a zone parked on a tile tab must switch back or the click looks dead.
