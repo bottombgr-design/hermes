@@ -89,7 +89,14 @@ def _extract_notebook(path: str) -> str:
             continue
         counts[typ] += 1
         suffix = f" {counts[typ]}" if typ != "raw" else ""
-        out.extend((f"# ── {labels[typ]} cell{suffix} ──", _source_text(cell.get("source", "")).rstrip("\n"), ""))
+        # nbformat v3 code cells store their text under "input"; markdown/raw
+        # cells (and every v4 cell) use "source". Prefer "source", falling back
+        # to "input" so legacy-v3 code cells — reached via the "worksheets"
+        # branch above — aren't silently dropped as empty.
+        body = cell.get("source")
+        if not body:
+            body = cell.get("input", "")
+        out.extend((f"# ── {labels[typ]} cell{suffix} ──", _source_text(body).rstrip("\n"), ""))
     if not out:
         raise ExtractionError("Notebook contains no readable cells")
     return "\n".join(out).rstrip("\n") + "\n"

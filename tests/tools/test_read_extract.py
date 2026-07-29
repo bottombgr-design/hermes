@@ -114,6 +114,20 @@ class TestNotebookExtraction(unittest.TestCase):
             json.dump(nb, fh)
         self.assertIn("legacy cell", extract_document_text(p))
 
+    def test_legacy_v3_code_cell_uses_input(self):
+        # Real nbformat v3 code cells carry their text in "input" (not
+        # "source"); markdown cells use "source". Both must survive.
+        p = os.path.join(self.tmp, "nb3_input.ipynb")
+        nb = {"worksheets": [{"cells": [
+            {"cell_type": "code", "input": ["import os\n", "print(os.getcwd())"]},
+            {"cell_type": "markdown", "source": "## v3 heading text"}]}],
+            "nbformat": 3}
+        with open(p, "w") as fh:
+            json.dump(nb, fh)
+        text = extract_document_text(p)
+        self.assertIn("print(os.getcwd())", text)
+        self.assertIn("v3 heading text", text)
+
     def test_malformed_notebook_raises(self):
         p = os.path.join(self.tmp, "bad.ipynb")
         with open(p, "w") as fh:
