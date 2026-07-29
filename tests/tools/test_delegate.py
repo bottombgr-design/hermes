@@ -71,6 +71,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertIn("read_only", props)
+        self.assertIn("read_only", props["tasks"]["items"]["properties"])
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -155,8 +157,90 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_read_only_prompt_states_enforced_runtime_boundary(self):
+        prompt = _build_child_system_prompt("Audit files", read_only=True)
+        self.assertIn("READ-ONLY MODE", prompt)
+        self.assertIn("runtime-enforced", prompt)
+        self.assertIn("must not modify", prompt)
+
+
+class TestChildIntentAckContinuation(unittest.TestCase):
+    def _build_with_mode(self, mode):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["file"]
+        parent.disabled_toolsets = []
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child._intent_ack_continuation = mode
+            MockAgent.return_value = child
+            built = _build_child_agent(
+                task_index=0,
+                goal="Read the files and report findings",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+            )
+        return built
+
+    def test_auto_mode_is_hardened_for_autonomous_children(self):
+        child = self._build_with_mode("auto")
+        self.assertIs(getattr(child, "_intent_ack_continuation"), True)
+
+    def test_explicit_user_modes_are_preserved(self):
+        self.assertIs(
+            getattr(self._build_with_mode(False), "_intent_ack_continuation"),
+            False,
+        )
+        model_list = ["gemini", "qwen"]
+        self.assertEqual(
+            getattr(self._build_with_mode(model_list), "_intent_ack_continuation"),
+            model_list,
+        )
+
 
 class TestStripBlockedTools(unittest.TestCase):
+    def test_read_only_child_gets_exact_tool_allowlist_and_forces_leaf(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["hermes-cli"]
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
+        ):
+            child = MagicMock()
+            MockAgent.return_value = child
+            _build_child_agent(
+                task_index=0,
+                goal="Audit safely",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="orchestrator",
+                read_only=True,
+            )
+
+        _, kwargs = MockAgent.call_args
+        allowed = set(kwargs["allowed_tool_names"])
+        self.assertIn("read_file", allowed)
+        self.assertIn("search_files", allowed)
+        self.assertIn("web_search", allowed)
+        self.assertNotIn("terminal", allowed)
+        self.assertNotIn("execute_code", allowed)
+        self.assertNotIn("write_file", allowed)
+        self.assertNotIn("patch", allowed)
+        self.assertNotIn("tool_call", allowed)
+        self.assertNotIn("browser_click", allowed)
+        self.assertEqual(child._delegate_role, "leaf")
+        self.assertTrue(child._delegate_read_only)
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
         self.assertEqual(sorted(result), ["code_execution", "file", "terminal"])
@@ -826,6 +910,9 @@ class TestDelegateObservability(unittest.TestCase):
             # Core observability fields
             self.assertEqual(entry["model"], "claude-sonnet-4-6")
             self.assertEqual(entry["exit_reason"], "completed")
+            # "completed" is a mechanical lifecycle state, not a semantic
+            # endorsement of the child's claims or deliverables.
+            self.assertEqual(entry["semantic_status"], "unverified")
             self.assertEqual(entry["tokens"]["input"], 5000)
             self.assertEqual(entry["tokens"]["output"], 1200)
 
@@ -1047,6 +1134,88 @@ class TestDelegateObservability(unittest.TestCase):
 
             result = json.loads(delegate_task(goal="Test empty sentinel", parent_agent=parent))
             self.assertEqual(result["results"][0]["status"], "failed")
+
+    def test_future_intent_summary_is_not_completed(self):
+        """A child that only announces its next action has not completed the
+        delegated task, even when run_conversation returned completed=True.
+        """
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.model = "deepseek-ai/deepseek-v4-flash"
+            child.session_prompt_tokens = 0
+            child.session_completion_tokens = 0
+            child._strip_think_blocks = lambda text: text
+            child.run_conversation.return_value = {
+                "final_response": "Let me start by reading the files and analyzing the logs.",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "user", "content": "Audit the delegation failures"},
+                    {"role": "assistant", "content": "Let me start by reading the files and analyzing the logs."},
+                ],
+            }
+            MockAgent.return_value = child
+
+            result = json.loads(
+                delegate_task(goal="Audit the delegation failures", parent_agent=parent)
+            )
+            entry = result["results"][0]
+
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exit_reason"], "incomplete_intent")
+        self.assertIn("announced another action", entry["error"])
+
+    def test_future_intent_after_tools_is_not_completed(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.model = "deepseek-ai/deepseek-v4-flash"
+            child.session_prompt_tokens = 0
+            child.session_completion_tokens = 0
+            child._strip_think_blocks = lambda text: text
+            child.run_conversation.return_value = {
+                "final_response": "I will now analyze the files and write the final report.",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 2,
+                "messages": [
+                    {"role": "user", "content": "Audit the repository"},
+                    {"role": "assistant", "tool_calls": [{"id": "t1", "function": {"name": "read_file", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "t1", "content": "file contents"},
+                    {"role": "assistant", "content": "I will now analyze the files and write the final report."},
+                ],
+            }
+            MockAgent.return_value = child
+
+            result = json.loads(delegate_task(goal="Audit the repository", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "failed")
+
+    def test_factual_summary_without_tools_remains_completed(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.model = "deepseek-ai/deepseek-v4-flash"
+            child.session_prompt_tokens = 0
+            child.session_completion_tokens = 0
+            child._strip_think_blocks = lambda text: text
+            child.run_conversation.return_value = {
+                "final_response": "The supplied evidence confirms the invariant holds.",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [{"role": "assistant", "content": "The supplied evidence confirms the invariant holds."}],
+            }
+            MockAgent.return_value = child
+
+            result = json.loads(delegate_task(goal="Evaluate the supplied evidence", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "completed")
 
 
 class TestSubagentCostRollup(unittest.TestCase):

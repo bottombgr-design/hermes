@@ -1282,9 +1282,14 @@ def test_run_agent_dispatch_forces_background():
         assert captured["background"] is True
 
         run_agent.AIAgent._dispatch_delegate_task(
-            agent, {"tasks": [{"goal": "a"}, {"goal": "b"}]}
+            agent,
+            {
+                "tasks": [{"goal": "a"}, {"goal": "b"}],
+                "read_only": True,
+            },
         )
         assert captured["background"] is True
+        assert captured["read_only"] is True
 
         sub = _FakeAgent()
         sub._delegate_depth = 1

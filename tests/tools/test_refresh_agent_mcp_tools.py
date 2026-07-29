@@ -44,6 +44,33 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_refresh_preserves_exact_tool_name_allowlist(monkeypatch):
+    """A registry/MCP refresh must not reintroduce tools denied at build time."""
+    agent = _agent(["read_file"])
+    agent.allowed_tool_names = {"read_file", "web_search"}
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [
+            _tool("read_file"),
+            _tool("web_search"),
+            _tool("terminal"),
+            _tool("mcp_remote_write"),
+        ],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == {"web_search"}
+    assert agent.valid_tool_names == {"read_file", "web_search"}
+    assert {t["function"]["name"] for t in agent.tools} == {
+        "read_file",
+        "web_search",
+    }
+
+
 def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch):
     """No new tools → empty set, and the snapshot object is not swapped."""
     agent = _agent(["read_file", "terminal"])
