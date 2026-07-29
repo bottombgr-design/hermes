@@ -12423,12 +12423,37 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         commit_count = int(result.stdout.strip())
 
+        # A fork can match origin and still be behind upstream, in which case
+        # the sync below advances HEAD. Decide that BEFORE the "no updates"
+        # branch: taking the early return after pulling upstream code skips
+        # the dependency sync and the gateway restart, so running gateways
+        # keep serving the modules they imported at startup while lazily
+        # importing newly-pulled ones — a mixed runtime that fails later in
+        # an unrelated-looking place.
+        if commit_count == 0 and is_fork and branch == "main":
+            _invalidate_update_cache()
+            pre_sync_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
+            _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+            post_sync_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
+            if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
+                synced = subprocess.run(
+                    git_cmd + ["rev-list", f"{pre_sync_sha}..HEAD", "--count"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                try:
+                    # HEAD moved, so this is an update regardless of what the
+                    # count query reports — never let it fall back to zero and
+                    # re-take the early return.
+                    commit_count = max(1, int(synced.stdout.strip()))
+                except ValueError:
+                    commit_count = 1
+                # The pull below is a no-op now (origin was synced too); the
+                # point is to reach the post-update path rather than return.
+
         if commit_count == 0:
             _invalidate_update_cache()
-
-            # Even if origin is up to date, the fork may be behind upstream
-            if is_fork and branch == "main":
-                _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
             # Restore stash and switch back to original branch if we moved
             if auto_stash_ref is not None:

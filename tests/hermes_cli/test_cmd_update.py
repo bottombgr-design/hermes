@@ -482,6 +482,47 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_fork_upstream_sync_that_moves_head_is_treated_as_an_update(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        """A fork sync that pulls code must not take the "no updates" exit.
+
+        origin/main can match HEAD while the fork is behind upstream. The sync
+        then advances HEAD, but returning early afterwards skips the dependency
+        sync and the gateway restart, leaving running gateways on the modules
+        they imported at startup while they lazily import newly-pulled ones.
+        """
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="0"
+        )
+
+        # HEAD moves across the sync: pre != post, then 365 commits arrived.
+        shas = iter(["aaaaaaa", "bbbbbbb"])
+
+        def _sync(*_args, **_kwargs):
+            return None
+
+        with patch.object(
+            hm,
+            "_get_origin_url",
+            return_value="https://github.com/example/hermes-agent.git",
+        ), patch.object(
+            hm, "_capture_head_sha", side_effect=lambda *_a, **_k: next(shas, "bbbbbbb")
+        ), patch.object(
+            hm, "_sync_with_upstream_if_needed", side_effect=_sync
+        ):
+            cmd_update(mock_args)
+
+        captured = capsys.readouterr()
+        assert "Already up to date!" not in captured.out, (
+            "a fork sync that pulled code reported no update, so the "
+            "post-update restart is skipped"
+        )
+
     @patch("shutil.which")
     @patch("subprocess.run")
     def test_update_refreshes_repo_and_tui_node_dependencies(
