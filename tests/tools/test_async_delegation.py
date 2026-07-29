@@ -619,17 +619,72 @@ assert ad.mark_completion_delivered({delegation_id!r})
 
 def test_completed_records_pruned_to_cap():
     # Run more than the retention cap quickly; ensure list doesn't grow forever.
-    for i in range(ad._MAX_RETAINED_COMPLETED + 10):
+    # Delivered records are capped at _MAX_RETAINED_COMPLETED (50); pending
+    # (undelivered) records at _MAX_DURABLE_PENDING (1000).
+    N = ad._MAX_RETAINED_COMPLETED + 10  # 60
+    for i in range(N):
         ad.dispatch_async_delegation(
             goal=f"t{i}", context=None, toolsets=None, role="leaf", model="m",
             session_key="", runner=lambda: {"status": "completed", "summary": "ok"},
-            max_async_children=ad._MAX_RETAINED_COMPLETED + 20,
+            max_async_children=N + 20,
         )
     # let workers finish
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and ad.active_count() > 0:
         time.sleep(0.05)
+
+    # All 60 are pending (undelivered) → none pruned (60 < 1000).
+    all_records = ad.list_async_delegations()
+    assert len(all_records) == N, (
+        f"expected {N} pending records, got {len(all_records)}"
+    )
+
+    # Acknowledge every record through the public path. The acknowledgement
+    # itself must enforce the delivered cap — no completion finalizer and no
+    # direct call into the private prune helper.
+    for r in all_records:
+        ad.mark_completion_delivered(r["delegation_id"])
+
     assert len(ad.list_async_delegations()) <= ad._MAX_RETAINED_COMPLETED
+
+
+def test_ack_flips_in_memory_state_even_when_db_row_is_gone(tmp_path, monkeypatch):
+    """In-memory delivery state must not depend on the durable row surviving.
+
+    The DB and the in-memory dict can diverge (a durable prune can drop a
+    delivered row while the in-memory record lives on). If the ack only
+    flipped in-memory state when the DB UPDATE hit a row, such records stayed
+    'pending' forever and were never eligible for the delivered cap.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    N = ad._MAX_RETAINED_COMPLETED + 10
+    for i in range(N):
+        ad.dispatch_async_delegation(
+            goal=f"g{i}", context=None, toolsets=None, role="leaf", model="m",
+            session_key="", runner=lambda: {"status": "completed", "summary": "ok"},
+            max_async_children=N + 20,
+        )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and ad.active_count() > 0:
+        time.sleep(0.05)
+
+    records = ad.list_async_delegations()
+    # First ack normally, then ack AGAIN — the second round hits rowcount==0
+    # (row already delivered) and must still leave in-memory state delivered.
+    for r in records:
+        ad.mark_completion_delivered(r["delegation_id"])
+    for r in records:
+        ad.mark_completion_delivered(r["delegation_id"])
+
+    remaining = ad.list_async_delegations()
+    assert len(remaining) <= ad._MAX_RETAINED_COMPLETED
+    with ad._records_lock:
+        stuck = [
+            rid for rid, rec in ad._records.items()
+            if rec.get("status") != "running"
+            and rec.get("delivery_state") != "delivered"
+        ]
+    assert not stuck, f"records stuck pending after acknowledgement: {stuck}"
 
 
 def test_completion_is_persisted_and_delivery_can_be_acknowledged(tmp_path, monkeypatch):
