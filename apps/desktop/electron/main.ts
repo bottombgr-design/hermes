@@ -5939,6 +5939,10 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
     const plaintext = decryptDesktopSecret(secret)
 
     if (!plaintext) {
+      rememberLog(
+        `[native-oauth] failed to decrypt stored tokens for ${baseUrl}; keeping stored entry for retry`
+      )
+
       return null
     }
 
