@@ -105,21 +105,68 @@ def test_permissions_run_sanitizes_env(monkeypatch):
     _assert_sanitized(captured)
 
 
-def test_doctor_sanitized_env_helper(monkeypatch):
-    """_drive_health_report spawns via Popen; assert the env helper it uses
-    strips secrets (mocking the whole JSON-RPC handshake is not worth it)."""
+def test_doctor_health_report_passes_resolved_binary_and_sanitized_env(monkeypatch):
+    """Doctor must build the child env for its resolved binary and hand it to Popen."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     monkeypatch.delenv("HERMES_CUA_TELEMETRY", raising=False)
 
     from tools.computer_use import doctor
-    import inspect
 
-    env = doctor._sanitized_cua_env()
-    assert "ANTHROPIC_API_KEY" not in env
-    assert env.get("PATH") == "/usr/bin:/bin"
-    assert env.get("CUA_DRIVER_RS_TELEMETRY_ENABLED") == "0"
+    captured = {}
+    expected_env = {
+        "PATH": "/usr/bin:/bin",
+        "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0",
+    }
 
-    # The Popen spawn site must actually use the sanitized helper.
-    src = inspect.getsource(doctor._drive_health_report)
-    assert "_sanitized_cua_env()" in src
+    def fake_env(binary):
+        captured["env_binary"] = binary
+        return expected_env
+
+    class FakeStream:
+        def __init__(self, lines=()):
+            self._lines = iter(lines)
+            self.writes = []
+
+        def write(self, value):
+            self.writes.append(value)
+
+        def flush(self):
+            pass
+
+        def readline(self):
+            return next(self._lines, "")
+
+        def read(self):
+            return ""
+
+        def close(self):
+            pass
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["popen_env"] = kwargs.get("env")
+            self.stdin = FakeStream()
+            self.stdout = FakeStream([
+                '{"jsonrpc":"2.0","id":1,"result":{}}\n',
+                '{"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"schema_version":"1","overall":"ok"}}}\n',
+            ])
+            self.stderr = FakeStream()
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(doctor, "_sanitized_cua_env", fake_env)
+    monkeypatch.setattr(doctor.subprocess, "Popen", FakePopen)
+
+    assert doctor._drive_health_report("/resolved/cua-driver") == {"schema_version": "1", "overall": "ok"}
+    assert captured["env_binary"] == "/resolved/cua-driver"
+    assert captured["cmd"] == ["/resolved/cua-driver", "mcp"]
+    assert captured["popen_env"] is expected_env
+    assert "ANTHROPIC_API_KEY" not in captured["popen_env"]
+    assert captured["popen_env"]["PATH"] == "/usr/bin:/bin"
+    assert captured["popen_env"]["CUA_DRIVER_RS_TELEMETRY_ENABLED"] == "0"
