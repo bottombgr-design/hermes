@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 from hermes_cli import web_server
 
@@ -95,7 +96,12 @@ class _FakeSessionDB:
 def test_desktop_session_search_merges_id_matches_before_content_matches(monkeypatch):
     monkeypatch.setattr("hermes_state.SessionDB", _FakeSessionDB)
 
-    response = asyncio.run(web_server.search_sessions(q="20260603", limit=2))
+    # token_principal=None is the desktop dashboard's own request shape (no
+    # Mini App token seam involved) -- _require_dashboard_admin treats it as
+    # the unrestricted operator, same as every other admin-gated handler test
+    # in tests/hermes_cli/test_web_server.py.
+    fake_request = SimpleNamespace(state=SimpleNamespace(token_principal=None))
+    response = asyncio.run(web_server.search_sessions(fake_request, q="20260603", limit=2))
 
     # ID match surfaces first; the content hit on the SAME session is deduped
     # by lineage root (not double-listed); the unrelated content hit follows.
