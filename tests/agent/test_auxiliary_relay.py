@@ -443,3 +443,40 @@ def test_auxiliary_attempt_uses_real_relay_request_intercepts(relay_turn):
     assert result.choices[0].message.content == "ok"
     assert captured_requests[0]["temperature"] == 0.25
     assert turn.logical_llm_calls == {}
+
+
+def test_auxiliary_stream_unwraps_completed_response(relay_turn):
+    """MoA aggregator on an Anthropic-protocol provider: the client returns a
+    completed response for ``stream=True`` (the adapter ignores the flag), so
+    ``_relay_sync_stream`` must surface it raw for the consumer's
+    ``hasattr(stream, "choices")`` handling — regression of #11732/#55933 via
+    the Relay integration (SimpleNamespace is not iterable)."""
+    _relay, _turn = relay_turn
+    completed = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="aggregated"),
+                finish_reason="stop",
+            )
+        ],
+        model="kimi-k3",
+    )
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: completed)
+        )
+    )
+
+    @auxiliary_client._relay_auxiliary_call
+    def run(task):
+        auxiliary_client._set_relay_auxiliary_route(
+            "kimi-coding",
+            "kimi-k3",
+            "chat_completions",
+        )
+        return auxiliary_client._relay_sync_stream(
+            client,
+            {"model": "kimi-k3", "messages": [], "stream": True},
+        )
+
+    assert run("moa_aggregator") is completed
