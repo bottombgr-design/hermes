@@ -404,6 +404,7 @@ class TestCmdUpdateBranchFallback:
 
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
+        assert "Update complete!" in captured.out
         update_observer = mock_uv_update.call_args.kwargs["repair_observer"]
         ensure_observer = mock_uv_ensure.call_args.kwargs["repair_observer"]
         assert update_observer.__self__ is ensure_observer.__self__
@@ -452,6 +453,7 @@ class TestCmdUpdateBranchFallback:
         assert "Restart required to finish the managed Python runtime repair" in captured.out
         assert "long-lived processes still use the previous runtime" in captured.out
         assert str(backup) in captured.out
+        assert "Update complete!" not in captured.out
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
