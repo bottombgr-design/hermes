@@ -1511,10 +1511,17 @@ class _AnthropicCompletionsAdapter:
             prompt_tokens = getattr(response.usage, "input_tokens", 0) or 0
             completion_tokens = getattr(response.usage, "output_tokens", 0) or 0
             total_tokens = getattr(response.usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
+            # Anthropic reports prompt-cache accounting separately from
+            # ``input_tokens``; preserve them so downstream accounting/billing
+            # (issue #71242) can attribute cache reads/creations correctly.
+            cache_read_input_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            cache_creation_input_tokens = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
             usage = SimpleNamespace(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
             )
 
         choice = SimpleNamespace(
