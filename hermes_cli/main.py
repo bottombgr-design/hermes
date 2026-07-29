@@ -10353,7 +10353,22 @@ def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
         )
 
 
-_AGENT_COMMANDS = {None, "chat", "acp", "rl"}
+# Commands that can run an agent turn, and therefore need plugins + shell
+# hooks registered before they start.
+#
+# `serve` / `dashboard` are on this list because they are the backend the
+# Electron desktop app spawns (see cmd_dashboard + web_server.py); they run
+# full agent turns over JSON-RPC. Omitting them meant a user's config.yaml
+# shell hooks silently never fired on the desktop surface, while
+# `hermes hooks doctor` -- a separate short-lived process that re-reads the
+# config -- reported them healthy. Same class of gap as the cron scheduler,
+# which already needs an explicit ticker inside the dashboard backend
+# (web_server.py::_start_desktop_cron_ticker) for exactly this reason.
+#
+# Introspection/management commands (hooks list, gateway status, mcp add, ...)
+# stay off the list on purpose: they must not pay discovery cost, and must
+# never trigger a consent prompt for a hook the user is only inspecting.
+_AGENT_COMMANDS = {None, "chat", "acp", "rl", "serve", "dashboard"}
 _AGENT_SUBCOMMANDS = {
     "cron": ("cron_command", {"run", "tick"}),
     "gateway": ("gateway_command", {"run"}),
