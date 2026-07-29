@@ -2208,6 +2208,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _new_gateway_session_ipc_event,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -8729,7 +8730,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Empty-text internal event — the _is_resume_pending branch in
             # _handle_message_with_agent prepends the proper reason-aware
             # system note before the turn runs.
-            event = MessageEvent(
+            event = _new_gateway_session_ipc_event(
                 text="",
                 message_type=MessageType.TEXT,
                 source=source,
