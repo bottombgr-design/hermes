@@ -6507,6 +6507,34 @@ class TestApplyWalProbe:
             hermes_state, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: False
         )
 
+    def test_read_only_close_does_not_checkpoint(self, tmp_path, monkeypatch):
+        """Read-only dashboard probes must not trigger WAL checkpoints on close."""
+
+        class _FakeConn:
+            def __init__(self):
+                self.executed = []
+                self.closed = False
+                self.row_factory = None
+
+            def execute(self, sql, params=()):
+                self.executed.append(sql)
+                return self
+
+            def fetchone(self):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        conn = _FakeConn()
+        monkeypatch.setattr(hermes_state.sqlite3, "connect", lambda *a, **kw: conn)
+
+        session_db = SessionDB(db_path=tmp_path / "state.db", read_only=True)
+        session_db.close()
+
+        assert conn.closed is True
+        assert not any("wal_checkpoint" in sql for sql in conn.executed)
+
     def test_skips_set_pragma_when_already_wal(self, tmp_path):
         """Already-WAL connection must not trigger the set-pragma."""
         import sqlite3
