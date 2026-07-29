@@ -1,9 +1,11 @@
 """Tests for the provider-agnostic streaming TTS backend (tools.tts_streaming)
 and its dispatch through tools.tts_tool.stream_tts_to_speaker.
 
-No live audio or network: the ElevenLabs/OpenAI SDKs, sounddevice, and the sync
-synth path are all mocked. Covers the registry/resolver, provider availability,
-the chunked-streamer playback path, and the universal per-sentence sync fallback.
+No live audio or external network: the ElevenLabs/OpenAI SDKs, sounddevice, and
+the sync synth path are all mocked, and the xAI wire protocol runs against a
+loopback fake WebSocket server. Covers the registry/resolver, provider
+availability, the chunked-streamer playback path, and the universal per-sentence
+sync fallback.
 """
 
 import queue
@@ -478,12 +480,127 @@ def test_gemini_streamer_decodes_sse_pcm_chunks(monkeypatch):
 # ── xAI WebSocket bridge ─────────────────────────────────────────────────
 
 
-def test_xai_streamer_yields_collected_frames(monkeypatch):
-    frames = [b"\x01\x00" * 30, b"\x02\x00" * 30]
-    streamer = ts.XAIStreamer.__new__(ts.XAIStreamer)
-    streamer.tts_config, streamer.section = {}, {}
-    monkeypatch.setattr(streamer, "_collect_async", lambda text: list(frames))
-    assert list(streamer.stream("A sentence.")) == frames
+def _fake_xai_server(handler):
+    """Serve ``handler`` on a loopback WS server; return (url, server)."""
+    from websockets.sync.server import serve
+
+    server = serve(handler, "127.0.0.1", 0)
+    port = server.socket.getsockname()[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"ws://127.0.0.1:{port}/tts", server
+
+
+def _patch_xai_creds(monkeypatch):
+    import tools.xai_http
+
+    monkeypatch.setattr(
+        tools.xai_http,
+        "resolve_xai_http_credentials",
+        lambda *a, **k: {"api_key": "test-xai-key"},
+    )
+
+
+def test_xai_streamer_speaks_the_real_wire_protocol(monkeypatch):
+    """Pin the exact wire format verified against the live xAI API: audio
+    params in the URL query string, bearer auth header, text.delta +
+    text.done out, base64 audio.delta in, audio.done terminates."""
+    import base64
+    import json
+
+    pcm1, pcm2 = b"\x01\x00" * 30, b"\x02\x00" * 30
+    seen = {}
+
+    def handler(ws):
+        seen["path"] = ws.request.path
+        seen["auth"] = ws.request.headers.get("Authorization")
+        seen["messages"] = []
+        for raw in ws:
+            msg = json.loads(raw)
+            seen["messages"].append(msg)
+            if msg.get("type") == "text.done":
+                break
+        for chunk in (pcm1, pcm2):
+            ws.send(json.dumps({
+                "type": "audio.delta",
+                "delta": base64.b64encode(chunk).decode(),
+            }))
+        ws.send(json.dumps({"type": "audio.done"}))
+
+    url, server = _fake_xai_server(handler)
+    try:
+        _patch_xai_creds(monkeypatch)
+        streamer = ts.XAIStreamer({}, {"streaming_url": url})
+        assert list(streamer.stream("A sentence.")) == [pcm1, pcm2]
+    finally:
+        server.shutdown()
+
+    assert "voice=eve" in seen["path"]
+    assert "language=en" in seen["path"]
+    assert "codec=pcm" in seen["path"]
+    assert "sample_rate=24000" in seen["path"]
+    assert seen["auth"] == "Bearer test-xai-key"
+    assert [m["type"] for m in seen["messages"]] == ["text.delta", "text.done"]
+    assert seen["messages"][0]["delta"] == "A sentence."
+
+
+def test_xai_streamer_yields_before_the_sentence_finishes(monkeypatch):
+    """The first chunk must reach the caller while the server still holds
+    the rest. The old shape drained the whole WS response into a list
+    before yielding anything; against that shape this test never sees the
+    second chunk."""
+    import base64
+    import json
+
+    pcm1, pcm2 = b"\x01\x00" * 30, b"\x02\x00" * 30
+    first_delivered = threading.Event()
+
+    def handler(ws):
+        for raw in ws:
+            if json.loads(raw).get("type") == "text.done":
+                break
+        ws.send(json.dumps({
+            "type": "audio.delta",
+            "delta": base64.b64encode(pcm1).decode(),
+        }))
+        if not first_delivered.wait(timeout=10):
+            return  # consumer never saw chunk one before the stream ended
+        ws.send(json.dumps({
+            "type": "audio.delta",
+            "delta": base64.b64encode(pcm2).decode(),
+        }))
+        ws.send(json.dumps({"type": "audio.done"}))
+
+    url, server = _fake_xai_server(handler)
+    try:
+        _patch_xai_creds(monkeypatch)
+        streamer = ts.XAIStreamer({}, {"streaming_url": url})
+        gen = streamer.stream("A sentence.")
+        assert next(gen) == pcm1
+        first_delivered.set()
+        assert list(gen) == [pcm2]
+    finally:
+        server.shutdown()
+
+
+def test_xai_streamer_raises_on_error_envelope(monkeypatch):
+    """Mid-stream failures raise (the ABC contract: raise, caller logs),
+    instead of playing a truncated sentence as if it were complete."""
+    import json
+
+    def handler(ws):
+        for raw in ws:
+            if json.loads(raw).get("type") == "text.done":
+                break
+        ws.send(json.dumps({"type": "error", "message": "boom"}))
+
+    url, server = _fake_xai_server(handler)
+    try:
+        _patch_xai_creds(monkeypatch)
+        streamer = ts.XAIStreamer({}, {"streaming_url": url})
+        with pytest.raises(RuntimeError, match="boom"):
+            list(streamer.stream("A sentence."))
+    finally:
+        server.shutdown()
 
 
 # ── 16 MiB per-sentence stream cap ───────────────────────────────────────
