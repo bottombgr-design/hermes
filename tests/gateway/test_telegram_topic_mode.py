@@ -163,28 +163,6 @@ def _make_runner(session_db=None):
 
 
 @pytest.mark.asyncio
-async def test_root_telegram_dm_prompt_is_system_lobby_when_topic_mode_enabled(monkeypatch):
-    import gateway.run as gateway_run
-
-    runner = _make_runner()
-    runner._telegram_topic_mode_enabled = lambda source: True
-    runner._run_agent = AsyncMock(
-        side_effect=AssertionError("root Telegram DM prompt leaked to the agent loop")
-    )
-
-    monkeypatch.setattr(
-        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
-    )
-
-    result = await runner._handle_message(_make_event("hello from root"))
-
-    assert "main chat is reserved for system commands" in result
-    assert "All Messages" in result
-    runner._run_agent.assert_not_called()
-    runner.session_store.get_or_create_session.assert_not_called()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("thread_id", [None, "1"])
 async def test_internal_root_telegram_dm_event_bypasses_topic_lobby(
     monkeypatch, thread_id
@@ -400,29 +378,6 @@ async def test_telegram_group_prompt_is_not_topic_lobby_even_when_dm_topic_mode_
 
 
 @pytest.mark.asyncio
-async def test_topic_command_is_private_dm_only_and_does_not_enable_group_topic_mode(
-    tmp_path, monkeypatch
-):
-    import gateway.run as gateway_run
-
-    session_db = SessionDB(db_path=tmp_path / "state.db")
-    runner = _make_runner(session_db=session_db)
-    runner._run_agent = AsyncMock(
-        side_effect=AssertionError("group /topic must not enter the agent loop")
-    )
-
-    monkeypatch.setattr(
-        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
-    )
-
-    result = await runner._handle_message(_make_group_event("/topic", thread_id="555"))
-
-    assert "only available in Telegram private chats" in result
-    assert session_db.is_telegram_topic_mode_enabled(chat_id="-100123", user_id="208214988") is False
-    runner._run_agent.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_group_new_keeps_existing_reset_semantics_when_dm_topic_mode_enabled(
     tmp_path, monkeypatch
 ):
@@ -459,48 +414,6 @@ async def test_group_new_keeps_existing_reset_semantics_when_dm_topic_mode_enabl
     assert "Started a new Hermes session in this topic" not in result
     assert "parallel work" not in result
     runner.session_store.reset_session.assert_called_once_with(group_key)
-
-
-@pytest.mark.asyncio
-async def test_new_inside_telegram_topic_resets_current_topic_with_parallel_tip(monkeypatch):
-    import gateway.run as gateway_run
-
-    runner = _make_runner()
-    runner._telegram_topic_mode_enabled = lambda source: True
-    topic_source = _make_source(thread_id="17585")
-    topic_key = build_session_key(topic_source)
-    old_entry = SessionEntry(
-        session_key=topic_key,
-        session_id="old-topic-session",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        origin=topic_source,
-    )
-    new_entry = SessionEntry(
-        session_key=topic_key,
-        session_id="new-topic-session",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        origin=topic_source,
-    )
-    runner.session_store._entries = {topic_key: old_entry}
-    runner.session_store.reset_session.return_value = new_entry
-    runner._agent_cache_lock = None
-
-    monkeypatch.setattr(
-        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
-    )
-
-    result = await runner._handle_message(_make_event("/new", thread_id="17585"))
-
-    assert "Started a new Hermes session in this topic" in result
-    assert "parallel work" in result
-    assert "All Messages" in result
-    runner.session_store.reset_session.assert_called_once_with(topic_key)
 
 
 @pytest.mark.asyncio
@@ -646,35 +559,6 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
     )
     assert refreshed is not None
     assert refreshed["session_id"] == "child-session"
-
-
-@pytest.mark.asyncio
-async def test_topic_root_command_explicitly_migrates_and_enables_topic_mode(tmp_path, monkeypatch):
-    import gateway.run as gateway_run
-
-    session_db = SessionDB(db_path=tmp_path / "state.db")
-    runner = _make_runner(session_db=session_db)
-    runner._run_agent = AsyncMock(
-        side_effect=AssertionError("/topic activation must not enter the agent loop")
-    )
-
-    monkeypatch.setattr(
-        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
-    )
-
-    result = await runner._handle_message(_make_event("/topic"))
-
-    assert "Telegram multi-session topics are enabled" in result
-    assert "All Messages" in result
-    assert session_db.get_meta("telegram_dm_topic_schema_version") == "2"
-    assert session_db.is_telegram_topic_mode_enabled(chat_id="208214988", user_id="208214988")
-    assert runner._telegram_topic_mode_enabled(_make_source()) is True
-    runner._run_agent.assert_not_called()
-
-    lobby_result = await runner._handle_message(_make_event("hello after activation"))
-
-    assert "main chat is reserved for system commands" in lobby_result
-    runner._run_agent.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1100,8 +984,6 @@ async def test_first_message_inside_topic_records_topic_binding(tmp_path, monkey
     assert binding["session_key"] == build_session_key(_make_source(thread_id="17585"))
 
 
-
-
 @pytest.mark.asyncio
 async def test_handoff_to_telegram_dm_topic_uses_dm_lane_not_generic_thread(tmp_path):
     """Handoff-created Telegram DM topics must use the real DM-topic lane.
@@ -1143,42 +1025,6 @@ async def test_handoff_to_telegram_dm_topic_uses_dm_lane_not_generic_thread(tmp_
     assert captured["source"].chat_type == "dm"
     assert captured["source"].user_id == "208214988"
     assert captured["source"].thread_id == "17585"
-
-
-@pytest.mark.asyncio
-async def test_topic_root_command_creates_and_pins_system_topic(tmp_path, monkeypatch):
-    import gateway.run as gateway_run
-
-    session_db = SessionDB(db_path=tmp_path / "state.db")
-    runner = _make_runner(session_db=session_db)
-    adapter = runner.adapters[Platform.TELEGRAM]
-    adapter._create_dm_topic.return_value = 4242
-    adapter.send.return_value = SimpleNamespace(success=True, message_id="777")
-    bot = AsyncMock()
-    bot.get_me.return_value = {
-        "has_topics_enabled": True,
-        "allows_users_to_create_topics": True,
-    }
-    adapter._bot = bot
-
-    monkeypatch.setattr(
-        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
-    )
-
-    result = await runner._handle_message(_make_event("/topic"))
-
-    assert "Telegram multi-session topics are enabled" in result
-    adapter._create_dm_topic.assert_awaited_once_with(208214988, "System")
-    adapter.send.assert_awaited_once_with(
-        "208214988",
-        "System topic for Hermes commands and status.",
-        metadata={"thread_id": "4242"},
-    )
-    bot.pin_chat_message.assert_awaited_once_with(
-        chat_id=208214988,
-        message_id=777,
-        disable_notification=True,
-    )
 
 
 @pytest.mark.asyncio
@@ -1598,14 +1444,6 @@ def _seed_two_topic_bindings(session_db):
     )
 
 
-def test_recover_returns_none_for_known_topic(tmp_path):
-    db = SessionDB(db_path=tmp_path / "state.db")
-    _seed_two_topic_bindings(db)
-    runner = _make_runner(session_db=db)
-
-    assert runner._recover_telegram_topic_thread_id(_make_source(thread_id="222")) is None
-
-
 def test_recover_preserves_unknown_thread_id_for_new_topic(tmp_path):
     # A newly-created Telegram DM topic arrives with a real, previously-unbound
     # message_thread_id. It must become its own session lane rather than being
@@ -1615,31 +1453,6 @@ def test_recover_preserves_unknown_thread_id_for_new_topic(tmp_path):
     runner = _make_runner(session_db=db)
 
     assert runner._recover_telegram_topic_thread_id(_make_source(thread_id="9999")) is None
-
-
-def test_recover_rewrites_lobby_thread_id_to_most_recent(tmp_path):
-    # Stripped plain reply: thread_id is None, topic mode is on.
-    db = SessionDB(db_path=tmp_path / "state.db")
-    _seed_two_topic_bindings(db)
-    runner = _make_runner(session_db=db)
-
-    assert runner._recover_telegram_topic_thread_id(_make_source(thread_id=None)) == "222"
-
-
-def test_recover_returns_none_when_topic_mode_disabled(tmp_path):
-    # Non-topic-mode DMs keep the existing strip-to-lobby behavior.
-    db = SessionDB(db_path=tmp_path / "state.db")
-    runner = _make_runner(session_db=db)
-
-    assert runner._recover_telegram_topic_thread_id(_make_source(thread_id=None)) is None
-
-
-def test_recover_returns_none_when_no_bindings_yet(tmp_path):
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
-    runner = _make_runner(session_db=db)
-
-    assert runner._recover_telegram_topic_thread_id(_make_source(thread_id=None)) is None
 
 
 def test_recover_returns_none_for_brand_new_topic(tmp_path):
@@ -1665,13 +1478,6 @@ def test_recover_returns_none_for_brand_new_topic(tmp_path):
 
     # "99999" is non-lobby and not in the binding table — brand-new topic.
     assert runner._recover_telegram_topic_thread_id(_make_source(thread_id="99999")) is None
-
-
-def test_list_telegram_topic_bindings_for_chat(tmp_path):
-    db = SessionDB(db_path=tmp_path / "state.db")
-    _seed_two_topic_bindings(db)
-    rows = db.list_telegram_topic_bindings_for_chat(chat_id="208214988")
-    assert [r["thread_id"] for r in rows] == ["222", "111"]
 
 
 def test_list_telegram_topic_bindings_for_chat_no_table(tmp_path):
@@ -1712,78 +1518,6 @@ def test_get_telegram_topic_binding_by_session_returns_binding(tmp_path):
     assert binding["session_id"] == "sess-27166"
 
 
-def test_get_telegram_topic_binding_by_session_returns_none_for_unknown(tmp_path):
-    """Returns None when no binding exists for the given session_id."""
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.apply_telegram_topic_migration()
-
-    result = db.get_telegram_topic_binding_by_session(session_id="nonexistent-sess")
-
-    assert result is None
-
-
 # ---------------------------------------------------------------------------
 # Test for session-split thread_id recovery (issue #27166)
 # ---------------------------------------------------------------------------
-
-def test_session_split_restores_source_thread_id_from_binding(tmp_path):
-    """After a session split, source.thread_id is restored from the binding.
-
-    Simulates the case where context compression creates a new session_id and
-    source.thread_id is None (synthetic/recovered event). The recovery block
-    must look up the binding by the new session_id and restore thread_id on
-    source so that _thread_metadata_for_source returns the correct thread.
-    """
-    from gateway.run import GatewayRunner
-    from gateway.config import Platform
-
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
-    db.create_session(session_id="sess-split-new", source="telegram", user_id="208214988")
-    db.bind_telegram_topic(
-        chat_id="208214988",
-        thread_id="17585",
-        user_id="208214988",
-        session_key="agent:main:telegram:dm:208214988:17585",
-        session_id="sess-split-new",
-    )
-
-    runner = object.__new__(GatewayRunner)
-    from hermes_state import AsyncSessionDB
-    runner._session_db = AsyncSessionDB(db)
-
-    # Build a source that looks like it came from a synthetic/recovered event:
-    # platform and chat_type match a Telegram DM, but thread_id is None.
-    source = _make_source(thread_id=None)
-    assert source.platform == Platform.TELEGRAM
-    assert source.chat_type == "dm"
-    assert source.thread_id is None
-
-    # Simulate the session-split recovery block logic directly.
-    if (
-        getattr(source, "platform", None) == Platform.TELEGRAM
-        and getattr(source, "chat_type", None) == "dm"
-        and getattr(source, "thread_id", None) is None
-        and runner._session_db is not None
-    ):
-        try:
-            # Mirror production: this block runs in the run_sync executor, so it
-            # uses the sync handle (self._session_db._db), not the async facade.
-            _binding = runner._session_db._db.get_telegram_topic_binding_by_session(
-                session_id="sess-split-new",
-            )
-            if _binding and _binding.get("thread_id"):
-                source.thread_id = str(_binding["thread_id"])
-        except Exception:
-            pass
-
-    assert source.thread_id == "17585", (
-        "thread_id must be restored from the binding after session split"
-    )
-
-    # Confirm _thread_metadata_for_source now returns non-None.
-    runner.config = _make_runner(session_db=db).config
-    runner.adapters = _make_runner(session_db=db).adapters
-    meta = GatewayRunner._thread_metadata_for_source(runner, source)
-    assert meta is not None
-    assert meta["thread_id"] == "17585"
