@@ -173,3 +173,91 @@ class TestProcFallback:
         # PermissionError swallowed — empty result, no crash
         assert 12345 not in pids
         mock_ps.assert_not_called()  # /proc dir existed, so ps not called
+
+
+# ---------------------------------------------------------------------------
+# BSD/macOS ps-flag compatibility (#73626)
+# ---------------------------------------------------------------------------
+
+class TestPsFallbackBsdCompat:
+    """The ps fallback must not use flags that are illegal on BSD/macOS ps.
+
+    macOS/BSD ``ps`` rejects ``-A eww`` with "illegal argument: eww" (rc 1),
+    so the scan silently returned ``[]`` on every macOS machine.  The matcher
+    only needs argv — environment variables (the ``e`` flag) are unnecessary.
+    """
+
+    def test_ps_fallback_finds_gateway_without_bsd_illegal_e_flag(self):
+        """Simulate a BSD ps that rejects 'e'/'eww' but accepts '-Aww'.
+
+        On the broken code the function sends ``-A eww`` → BSD ps rejects →
+        returns ``[]``.  After the fix it sends ``-Aww`` → succeeds.
+        """
+        captured = []
+
+        def _fake_run(cmd, **kwargs):
+            captured.append(list(cmd))
+            if cmd[:3] == ["ps", "-o", "ppid="]:
+                m = MagicMock()
+                m.returncode = 1
+                m.stdout = ""
+                m.stderr = ""
+                return m
+            ps_args = set(cmd)
+            # BSD ps: standalone 'e' or 'eww' is illegal
+            if "eww" in ps_args or (len(ps_args) == 2 and "e" in ps_args):
+                m = MagicMock()
+                m.returncode = 1
+                m.stdout = ""
+                m.stderr = "ps: illegal argument: eww"
+                return m
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = f"12345 {_GATEWAY_CMD}\n"
+            m.stderr = ""
+            return m
+
+        with (
+            patch("hermes_cli.gateway.is_windows", return_value=False),
+            patch("os.path.isdir", return_value=False),  # no /proc
+            patch("hermes_cli.gateway._get_ancestor_pids", return_value=set()),
+            patch("subprocess.run", side_effect=_fake_run),
+        ):
+            pids = gateway_mod._scan_gateway_pids(set(), all_profiles=True)
+
+        # The pid-scan ps call must not include the BSD-illegal 'e' flag
+        ps_scan_cmds = [c for c in captured if "pid=,command=" in c]
+        assert ps_scan_cmds, "ps pid-scan was never invoked"
+        assert "eww" not in ps_scan_cmds[0], (
+            f"ps used BSD-illegal 'eww' flag: {ps_scan_cmds[0]}"
+        )
+        assert "-Aww" in ps_scan_cmds[0], (
+            f"ps should use '-Aww' for BSD compatibility: {ps_scan_cmds[0]}"
+        )
+        # And the scan must actually find the gateway
+        assert 12345 in pids, (
+            f"scan returned {pids} — BSD-compatible ps should find PID 12345"
+        )
+
+    def test_ps_fallback_does_not_request_environment(self):
+        """The ps command must not include the 'e' (show-env) flag at all."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = f"12345 {_GATEWAY_CMD}\n"
+        mock_result.stderr = ""
+
+        with (
+            patch("hermes_cli.gateway.is_windows", return_value=False),
+            patch("os.path.isdir", return_value=False),
+            patch("hermes_cli.gateway._get_ancestor_pids", return_value=set()),
+            patch("subprocess.run", return_value=mock_result) as mock_ps,
+        ):
+            gateway_mod._scan_gateway_pids(set(), all_profiles=True)
+
+        mock_ps.assert_called_once()
+        ps_cmd = mock_ps.call_args[0][0]
+        # No standalone 'e' flag, no 'eww'
+        assert "e" not in ps_cmd, (
+            f"ps command must not request env vars (BSD-illegal): {ps_cmd}"
+        )
+        assert "eww" not in ps_cmd, f"ps used BSD-illegal 'eww': {ps_cmd}"
