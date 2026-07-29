@@ -32,6 +32,7 @@ import {
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
@@ -776,7 +777,10 @@ export function usePromptActions({
         return
       }
 
-      const plan = planReload($messages.get(), parentId)
+      const plan = planReload(
+        (sessionId ? $sessionStates.get()[sessionId]?.messages : null) ?? $messages.get(),
+        parentId
+      )
 
       if (!plan) {
         return
@@ -832,7 +836,8 @@ export function usePromptActions({
         throw new Error('No active session to restore.')
       }
 
-      const messages = $messages.get()
+      const messages =
+        (sessionId ? $sessionStates.get()[sessionId]?.messages : null) ?? $messages.get()
       const plan = planRestore(messages, messageId, target)
 
       // The turns we're discarding may have spawned todos and background
@@ -875,7 +880,8 @@ export function usePromptActions({
       // Ref, not the closure-captured prop — an edit rewinds and resubmits, so
       // a stale target rewrites the wrong session's history.
       const sessionId = activeSessionIdRef.current
-      const messages = $messages.get()
+      const messages =
+        (sessionId ? $sessionStates.get()[sessionId]?.messages : null) ?? $messages.get()
       const plan = sessionId ? planEdit(messages, edited) : null
 
       if (!sessionId || !plan) {
