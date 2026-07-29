@@ -2508,3 +2508,184 @@ class TestReaderLoopOrphanedPipe:
         for i in range(1, 6):
             assert f"line-{i}" in s.output_buffer
         assert "tail-after-sleep" in s.output_buffer
+
+
+class TestHandleProcessTransformHook:
+    """`_handle_process` must invoke the ``transform_terminal_output`` plugin
+    hook on background-process output — issue #70760.
+
+    Without this, plugins that register ``transform_terminal_output`` (output-
+    canonicalization / token-saving proxies) only fire on the foreground
+    terminal path and silently miss every ``process(action="poll"/"wait"/
+    "log")`` result, which is the default path for persistent-shell users.
+    The hook must be fail-open (first valid string return wins; exceptions
+    swallowed) and must run on both ``output`` and ``output_preview`` fields.
+    """
+
+    def _setup(self, monkeypatch, command, output):
+        from tools import process_registry as pr
+        reg = ProcessRegistry()
+        sess = _make_session(sid="proc_transform1", command=command)
+        sess.output_buffer = output
+        sess.exited = True
+        sess.exit_code = 0
+        reg._running.clear()
+        reg._finished[sess.id] = sess
+        reg._running[sess.id] = sess
+        monkeypatch.setattr(pr, "process_registry", reg)
+        return pr, sess
+
+    def test_poll_output_is_transformed_by_hook(self, monkeypatch):
+        """poll() output_preview must pass through transform_terminal_output."""
+        pr, sess = self._setup(monkeypatch, "git log --oneline", "abc123 commit msg")
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kw: ["TRANSFORMED:" + kw["output"]]
+            if hook_name == "transform_terminal_output" else [],
+        )
+        out = json.loads(pr._handle_process({"action": "poll", "session_id": sess.id}))
+        assert out["output_preview"].startswith("TRANSFORMED:")
+
+    def test_wait_output_is_transformed_by_hook(self, monkeypatch):
+        """wait() output must pass through transform_terminal_output."""
+        pr, sess = self._setup(monkeypatch, "npm test", "all tests passed")
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kw: ["TRANSFORMED:" + kw["output"]]
+            if hook_name == "transform_terminal_output" else [],
+        )
+        out = json.loads(pr._handle_process({"action": "wait", "session_id": sess.id}))
+        assert out["output"].startswith("TRANSFORMED:")
+
+    def test_log_output_is_transformed_by_hook(self, monkeypatch):
+        """log() output must pass through transform_terminal_output."""
+        pr, sess = self._setup(monkeypatch, "echo hello", "hello")
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kw: ["TRANSFORMED:" + kw["output"]]
+            if hook_name == "transform_terminal_output" else [],
+        )
+        out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
+        assert out["output"].startswith("TRANSFORMED:")
+
+    def test_kill_output_is_transformed_by_hook(self, monkeypatch):
+        """kill() returns output through the same seam, so it must transform
+        too — otherwise the one action that reports why a process was stopped
+        would be the only background result a plugin never sees."""
+        pr, sess = self._setup(monkeypatch, "sleep 100", "partial output")
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kw: ["TRANSFORMED:" + kw["output"]]
+            if hook_name == "transform_terminal_output" else [],
+        )
+        out = json.loads(pr._handle_process({"action": "kill", "session_id": sess.id}))
+        assert out["output"].startswith("TRANSFORMED:")
+
+    def test_returncode_is_none_while_the_process_has_not_exited(self, monkeypatch):
+        """`exit_code` is absent until a process exits, so the hook must be told
+        None rather than a fabricated 0 — a plugin reading 0 would treat a
+        still-running command as having succeeded."""
+        pr, sess = self._setup(monkeypatch, "tail -f log", "streaming...")
+        sess.exited = False
+        sess.exit_code = None
+        seen = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kw: (seen.append(kw["returncode"]), [])[1]
+            if hook_name == "transform_terminal_output" else [],
+        )
+        pr._handle_process({"action": "poll", "session_id": sess.id})
+        assert seen == [None]
+
+    def test_returncode_is_reported_once_the_process_exited(self, monkeypatch):
+        """A finished process must hand the real exit code to the plugin."""
+        pr, sess = self._setup(monkeypatch, "false", "boom")
+        sess.exited = True
+        sess.exit_code = 1
+        seen = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kw: (seen.append(kw["returncode"]), [])[1]
+            if hook_name == "transform_terminal_output" else [],
+        )
+        pr._handle_process({"action": "wait", "session_id": sess.id})
+        assert seen == [1]
+
+    def test_first_valid_string_return_wins(self, monkeypatch):
+        """When multiple hook results are returned, the first valid string
+        wins — mirroring the foreground terminal path."""
+        pr, sess = self._setup(monkeypatch, "ls -la", "file1 file2")
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kw: [None, {"bad": True}, "FIRST", "SECOND"]
+            if hook_name == "transform_terminal_output" else [],
+        )
+        out = json.loads(pr._handle_process({"action": "wait", "session_id": sess.id}))
+        assert out["output"] == "FIRST"
+
+    def test_output_unchanged_when_hook_returns_none(self, monkeypatch):
+        """When the hook returns no valid string, output must be unchanged."""
+        pr, sess = self._setup(monkeypatch, "echo hi", "original output")
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kw: [None] if hook_name == "transform_terminal_output" else [],
+        )
+        out = json.loads(pr._handle_process({"action": "wait", "session_id": sess.id}))
+        assert out["output"] == "original output"
+
+    def test_output_unchanged_when_no_hook_registered(self, monkeypatch):
+        """When no plugin registers the hook, output must be unchanged."""
+        pr, sess = self._setup(monkeypatch, "echo hi", "plain output")
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kw: [],
+        )
+        out = json.loads(pr._handle_process({"action": "wait", "session_id": sess.id}))
+        assert out["output"] == "plain output"
+
+    def test_hook_exception_falls_back_to_original(self, monkeypatch):
+        """If the hook raises, output must fall back to the redacted original."""
+        pr, sess = self._setup(monkeypatch, "echo hi", "safe output")
+
+        def _raise(*a, **kw):
+            raise RuntimeError("plugin crashed")
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _raise)
+        out = json.loads(pr._handle_process({"action": "wait", "session_id": sess.id}))
+        assert out["output"] == "safe output"
+
+    def test_hook_receives_command_and_returncode(self, monkeypatch):
+        """The hook must receive the command string and exit code so plugins
+        can make context-aware transformation decisions."""
+        pr, sess = self._setup(monkeypatch, "pytest -v", "test output")
+        sess.exit_code = 42
+        captured = {}
+
+        def _capture(hook_name, **kw):
+            if hook_name == "transform_terminal_output":
+                captured.update(kw)
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _capture)
+        pr._handle_process({"action": "wait", "session_id": sess.id})
+        assert captured.get("command") == "pytest -v"
+        assert captured.get("returncode") == 42
+
+    def test_hook_runs_after_redaction(self, monkeypatch):
+        """The transform hook must run AFTER redaction so the plugin never
+        sees raw secrets — mirrors the foreground path ordering."""
+        import agent.redact as _r
+        monkeypatch.setattr(_r, "_REDACT_ENABLED", True)
+        pr, sess = self._setup(
+            monkeypatch, "printenv",
+            "OPENAI_API_KEY=sk-proj-abc123def456ghi789jkl012mno345",
+        )
+        hook_inputs = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kw: hook_inputs.append(kw["output"]) or [],
+        )
+        pr._handle_process({"action": "wait", "session_id": sess.id})
+        # The hook must have seen the redacted output, not the raw secret
+        assert len(hook_inputs) == 1
+        assert "abc123def456ghi789" not in hook_inputs[0]
