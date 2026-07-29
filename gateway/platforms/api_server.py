@@ -5302,7 +5302,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
 
-            kwargs = {
+            kwargs: dict[str, Any] = {
                 "prompt": prompt,
                 "schedule": schedule,
                 "name": name,
