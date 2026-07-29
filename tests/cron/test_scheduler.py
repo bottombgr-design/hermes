@@ -2051,6 +2051,43 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
         fake_db.close.assert_called_once()
 
+    def test_run_job_passes_job_id_as_task_id(self, tmp_path, monkeypatch):
+        """#64889: run_job() must pass task_id=str(job["id"]) into
+        agent.run_conversation(), so a job's Docker terminal environment is
+        deterministically identifiable by its own job id rather than an
+        unrelated random UUID — see _send_media_via_adapter, which now reads
+        job["id"] back as that same task_id."""
+        job = {"id": "task-id-job-1", "name": "task-id-check", "prompt": "hello"}
+        fake_db = MagicMock()
+        seen = {}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                seen["task_id"] = kwargs.get("task_id")
+                return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert seen == {"task_id": "task-id-job-1"}
+
     @pytest.mark.parametrize("timeout_value", ["600", "0"])
     def test_run_job_heartbeats_oneshot_claim_in_both_wait_modes(
         self, tmp_path, monkeypatch, timeout_value
@@ -2780,7 +2817,7 @@ class TestRunJobSkillBacked:
             register_env_passthrough(["NOTION_API_KEY"])
             return json.dumps({"success": True, "content": "# notion\nUse Notion."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, **kwargs):
             from tools.env_passthrough import get_all_passthrough
 
             assert "NOTION_API_KEY" in get_all_passthrough()
@@ -2838,7 +2875,7 @@ class TestRunJobSkillBacked:
             register_credential_file("credentials/google_token.json")
             return json.dumps({"success": True, "content": "# google-workspace\nUse Google."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, **kwargs):
             from tools.credential_files import _get_registered
 
             registered = _get_registered()
@@ -3554,6 +3591,57 @@ class TestSendMediaViaAdapter:
         self._run_with_loop(adapter, "123", media_files, None, {"id": "j3"})
         adapter.send_voice.assert_called_once()
         adapter.send_image_file.assert_called_once()
+
+    def test_job_id_is_forwarded_as_task_id_to_docker_translation(self, tmp_path, monkeypatch):
+        """#64889: run_job() now passes task_id=str(job_id) into
+        agent.run_conversation(), so job["id"] IS the run's real terminal
+        task_id — _send_media_via_adapter should use it to resolve that run's
+        own Docker environment directly."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter = MagicMock()
+        adapter.send_video = AsyncMock()
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "clip.mp4")
+        media_files = [(str(media_path), False)]
+
+        seen_task_ids = []
+        real_translate = BasePlatformAdapter.translate_docker_media_paths
+
+        def spy_translate(files, task_id=None):
+            seen_task_ids.append(task_id)
+            return real_translate(files, task_id=task_id)
+
+        monkeypatch.setattr(
+            BasePlatformAdapter, "translate_docker_media_paths", staticmethod(spy_translate)
+        )
+
+        self._run_with_loop(adapter, "123", media_files, None, {"id": "job-77"})
+        assert seen_task_ids == ["job-77"]
+
+    def test_missing_job_id_falls_back_to_none_task_id(self, tmp_path, monkeypatch):
+        """A job dict with no usable id degrades gracefully to task_id=None
+        (existing mount-table-only behavior) instead of passing an empty
+        string that would never match anything in _active_environments."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter = MagicMock()
+        adapter.send_video = AsyncMock()
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "clip.mp4")
+        media_files = [(str(media_path), False)]
+
+        seen_task_ids = []
+        real_translate = BasePlatformAdapter.translate_docker_media_paths
+
+        def spy_translate(files, task_id=None):
+            seen_task_ids.append(task_id)
+            return real_translate(files, task_id=task_id)
+
+        monkeypatch.setattr(
+            BasePlatformAdapter, "translate_docker_media_paths", staticmethod(spy_translate)
+        )
+
+        self._run_with_loop(adapter, "123", media_files, None, {"id": ""})
+        assert seen_task_ids == [None]
 
 
 class TestParallelTick:

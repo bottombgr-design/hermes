@@ -15020,6 +15020,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                             history_media_paths=_collect_history_media_paths(history),
+                            task_id=agent_result.get("task_id"),
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -16121,6 +16122,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event: MessageEvent,
         adapter,
         history_media_paths: Optional[set] = None,
+        task_id: Optional[str] = None,
     ) -> None:
         """Extract explicit MEDIA: tags from a response and deliver them.
 
@@ -16137,6 +16139,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         such paths into uploads after the fact sent files the model never
         asked to deliver (#20834). Only ``MEDIA:`` directives — the explicit
         attachment contract — trigger post-stream uploads.
+
+        ``task_id`` — the turn's own ``effective_task_id`` (#64889), when the
+        caller has it — lets Docker container→host path translation resolve
+        that turn's *own* environment via ``_active_environments[task_id]``
+        instead of degrading to mount-table-only, single-active-environment
+        translation. Callers that can't identify the producing task pass
+        ``None``, unchanged from before.
         """
         from pathlib import Path
         from urllib.parse import quote as _quote
@@ -16153,11 +16162,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             media_files, cleaned = adapter.extract_media(response)
             # Docker terminal backend writes inside the container; remap container
             # paths to host equivalents before the host-side path filter runs.
-            # No task_id reaches this path (it's called after streaming, from
-            # the raw response text) — translation degrades to mount-table-only
-            # and single-Docker-environment-only; see translate_docker_media_paths's
-            # docstring and NousResearch/hermes-agent#64889.
-            media_files = BasePlatformAdapter.translate_docker_media_paths(media_files)
+            # With a real task_id (#64889), this resolves the turn's own
+            # environment directly; without one (task_id=None — a caller that
+            # can't identify the producing task), it degrades to
+            # mount-table-only, single-Docker-environment-only translation —
+            # see translate_docker_media_paths's own docstring.
+            media_files = BasePlatformAdapter.translate_docker_media_paths(media_files, task_id=task_id)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
             # Deduplicate against media already delivered in prior turns —
             # the model may echo a previous turn's MEDIA: tag in a later

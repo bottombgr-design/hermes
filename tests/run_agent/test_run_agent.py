@@ -4480,6 +4480,60 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_run_conversation_surfaces_explicit_task_id(self, agent):
+        """An explicit task_id is surfaced in the returned dict verbatim.
+
+        #64889: task-id-less media delivery paths (gateway/run.py's
+        post-stream MEDIA: rescan, cron's job-media sender) read
+        ``result["task_id"]`` to resolve the turn's own Docker terminal
+        environment instead of degrading to mount-table-only,
+        single-environment translation.
+        """
+        self._setup_agent(agent)
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", task_id="explicit-task-99")
+        assert result["task_id"] == "explicit-task-99"
+
+    def test_run_conversation_surfaces_auto_generated_task_id(self, agent):
+        """No task_id given: the auto-generated one is still surfaced.
+
+        Same value that goes into ``_active_environments`` for this turn's
+        own terminal tool calls (agent/turn_context.py's ``effective_task_id``
+        / run_agent.py's own copy of the same fallback) — a caller reading
+        ``result["task_id"]`` back always gets the id actually used, not a
+        placeholder.
+        """
+        self._setup_agent(agent)
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.uuid.uuid4", return_value=uuid.UUID(int=42)),
+        ):
+            result = agent.run_conversation("hello")
+        assert result["task_id"] == str(uuid.UUID(int=42))
+
+    def test_run_conversation_non_dict_result_does_not_crash_task_id_surfacing(
+        self, agent
+    ):
+        """A non-dict return (error/edge-case path) must not raise on the
+        ``isinstance`` guard around task_id injection."""
+        self._setup_agent(agent)
+        with (
+            patch("agent.conversation_loop.run_conversation", return_value=None),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", task_id="task-1")
+        assert result is None
+
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)
         agent._cached_system_prompt = "stable instructions\n\nsession context"

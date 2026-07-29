@@ -1335,11 +1335,13 @@ def _send_media_via_adapter(
 
     # Docker terminal backend writes inside the container; remap container
     # paths to host equivalents before the host-side filter runs. ``job["id"]``
-    # is not the job's actual terminal task_id (cron's agent.run_conversation()
-    # call doesn't pass task_id, so each run gets an unrelated random one — see
-    # NousResearch/hermes-agent#64889), so translation here degrades to
-    # mount-table-only / single-Docker-environment-only.
-    media_files = BasePlatformAdapter.translate_docker_media_paths(media_files)
+    # is the same task_id run_job() now passes into agent.run_conversation()
+    # (#64889), so this resolves the run's own Docker environment directly
+    # instead of degrading to mount-table-only / single-Docker-environment-only
+    # translation.
+    media_files = BasePlatformAdapter.translate_docker_media_paths(
+        media_files, task_id=str(job.get("id") or "") or None
+    )
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     for media_path, _is_voice in media_files:
@@ -3580,7 +3582,13 @@ def run_job(
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        # A deterministic task_id (the job's own id, not a random one) lets
+        # this run's own Docker terminal environment be looked up directly by
+        # _send_media_via_adapter below instead of degrading to
+        # mount-table-only, single-environment translation (#64889).
+        _cron_future = _cron_pool.submit(
+            _cron_context.run, agent.run_conversation, prompt, task_id=str(job_id)
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:

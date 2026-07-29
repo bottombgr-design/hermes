@@ -144,3 +144,62 @@ async def test_explicit_media_document_still_delivers_post_stream(tmp_path, monk
         file_path=str(media_file),
         metadata={},
     )
+
+
+@pytest.mark.asyncio
+async def test_task_id_is_forwarded_to_docker_path_translation(tmp_path, monkeypatch):
+    """#64889: a task_id given to _deliver_media_from_response reaches
+    translate_docker_media_paths, so it can resolve this turn's own Docker
+    terminal environment instead of degrading to mount-table-only,
+    single-active-environment translation."""
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "chart.png")
+    adapter = _adapter()
+
+    seen_task_ids = []
+    real_translate = BasePlatformAdapter.translate_docker_media_paths
+
+    def spy_translate(media_files, task_id=None):
+        seen_task_ids.append(task_id)
+        return real_translate(media_files, task_id=task_id)
+
+    monkeypatch.setattr(
+        BasePlatformAdapter, "translate_docker_media_paths", staticmethod(spy_translate)
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"Here is the chart.\nMEDIA:{media_file}",
+        _event(),
+        adapter,
+        task_id="turn-task-42",
+    )
+
+    assert seen_task_ids == ["turn-task-42"]
+
+
+@pytest.mark.asyncio
+async def test_omitted_task_id_still_defaults_to_none(tmp_path, monkeypatch):
+    """No task_id given (existing callers, unchanged) — degraded-mode
+    translation still runs, not a hard failure."""
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "chart.png")
+    adapter = _adapter()
+
+    seen_task_ids = []
+    real_translate = BasePlatformAdapter.translate_docker_media_paths
+
+    def spy_translate(media_files, task_id=None):
+        seen_task_ids.append(task_id)
+        return real_translate(media_files, task_id=task_id)
+
+    monkeypatch.setattr(
+        BasePlatformAdapter, "translate_docker_media_paths", staticmethod(spy_translate)
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"Here is the chart.\nMEDIA:{media_file}",
+        _event(),
+        adapter,
+    )
+
+    assert seen_task_ids == [None]
