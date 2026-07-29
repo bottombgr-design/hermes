@@ -346,6 +346,41 @@ async function readFileDataUrlForIpc(
   return `data:${options.mimeType};base64,${data.toString('base64')}`
 }
 
+/**
+ * Validate a path that will be deleted (trash) or renamed. Unlike the read
+ * helpers this does NOT enforce isFile/isDirectory — `shell.trashItem` and
+ * `fs.rename` both work on files and directories. It DOES enforce:
+ * syntax/device-path rejection, existence, and the sensitive-file block on
+ * both the lexical path and the resolved realpath (symlink trap).
+ */
+async function resolveExistingPathForIpc(
+  filePath,
+  options: {
+    purpose?: string
+    baseDir?: fs.PathOrFileDescriptor
+    fs?: typeof fs
+    blockSensitive?: boolean
+  } = {}
+) {
+  const purpose = String(options.purpose || 'File delete')
+  const fsImpl = options.fs || fs
+  const resolvedPath = resolveRequestedPathForIpc(filePath, { baseDir: options.baseDir, purpose })
+
+  if (options.blockSensitive !== false) {
+    rejectSensitiveFilePath(resolvedPath, purpose)
+  }
+
+  const stat = await statForIpc(fsImpl, resolvedPath, purpose, 'file or directory')
+
+  const realPath = await realpathForIpc(fsImpl, resolvedPath, purpose)
+
+  if (options.blockSensitive !== false) {
+    rejectSensitiveFilePath(realPath, purpose)
+  }
+
+  return { realPath, resolvedPath, stat }
+}
+
 export {
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
   clampDataUrlReadMaxMb,
@@ -356,8 +391,10 @@ export {
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret,
   readFileDataUrlForIpc,
+  rejectSensitiveFilePath,
   rejectUnsafePathSyntax,
   resolveDirectoryForIpc,
+  resolveExistingPathForIpc,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
