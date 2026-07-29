@@ -93,6 +93,35 @@ class TestResolvePluginKey:
         assert _resolve_plugin_key("openai") is None
         assert _resolve_plugin_key("image_gen/openai") == "image_gen/openai"
 
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_ambiguous_manifest_name_requires_canonical_key(
+        self,
+        mock_user,
+        mock_bundled,
+        tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import _resolve_plugin_key
+
+        _make_category_plugin(
+            tmp_path,
+            "image_gen",
+            "fal",
+            {"name": "fal", "kind": "backend"},
+        )
+        _make_category_plugin(
+            tmp_path,
+            "video_gen",
+            "fal",
+            {"name": "fal", "kind": "backend"},
+        )
+        mock_user.return_value = tmp_path
+        mock_bundled.return_value = tmp_path / "nonexistent"
+
+        assert _resolve_plugin_key("fal") is None
+        assert _resolve_plugin_key("image_gen/fal") == "image_gen/fal"
+        assert _resolve_plugin_key("video_gen/fal") == "video_gen/fal"
+
 
 # ---------------------------------------------------------------------------
 # cmd_enable / cmd_disable — write the canonical key
@@ -229,6 +258,90 @@ class TestEnableDisableNested:
         cmd_enable("disk-cleanup", allow_tool_override=False)
         saved = mock_save_en.call_args[0][0]
         assert "disk-cleanup" in saved
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set())
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set())
+    def test_enable_default_bundled_backend_is_noop(
+        self,
+        mock_en,
+        mock_dis,
+        mock_save_en,
+        mock_save_dis,
+        mock_user,
+        mock_bundled,
+        tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import cmd_enable
+
+        bundled_dir = tmp_path / "bundled"
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        _make_category_plugin(
+            bundled_dir,
+            "web",
+            "firecrawl",
+            {
+                "name": "web-firecrawl",
+                "kind": "backend",
+                "version": "1.0.0",
+            },
+        )
+        mock_user.return_value = user_dir
+        mock_bundled.return_value = bundled_dir
+
+        cmd_enable("web/firecrawl")
+
+        mock_save_en.assert_not_called()
+        mock_save_dis.assert_not_called()
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch(
+        "hermes_cli.plugins_cmd._get_disabled_set",
+        return_value={"web-firecrawl", "firecrawl"},
+    )
+    @patch(
+        "hermes_cli.plugins_cmd._get_enabled_set",
+        return_value={"web-firecrawl"},
+    )
+    def test_reenable_default_bundled_backend_clears_aliases_without_allowlist(
+        self,
+        mock_en,
+        mock_dis,
+        mock_save_en,
+        mock_save_dis,
+        mock_user,
+        mock_bundled,
+        tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import cmd_enable
+
+        bundled_dir = tmp_path / "bundled"
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        _make_category_plugin(
+            bundled_dir,
+            "web",
+            "firecrawl",
+            {
+                "name": "web-firecrawl",
+                "kind": "backend",
+                "version": "1.0.0",
+            },
+        )
+        mock_user.return_value = user_dir
+        mock_bundled.return_value = bundled_dir
+
+        cmd_enable("web/firecrawl")
+
+        mock_save_en.assert_called_once_with(set())
+        mock_save_dis.assert_called_once_with({"firecrawl"})
 
 
 # ---------------------------------------------------------------------------
@@ -388,51 +501,116 @@ class TestCompositeMenuWritesCanonicalKey:
 
     @patch("hermes_cli.plugins_cmd._save_disabled_set")
     @patch("hermes_cli.plugins_cmd._save_enabled_set")
-    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set())
-    def test_fallback_unchecked_plugin_disables_by_key_not_name(
-        self, mock_en, mock_save_en, mock_save_dis,
+    def test_fallback_default_plugin_toggle_off_disables_by_key_not_name(
+        self, mock_save_en, mock_save_dis,
     ):
         from hermes_cli.plugins_cmd import _run_composite_fallback
         from rich.console import Console
 
         # key differs from the manifest name, mirroring web/firecrawl.
+        entries = [
+            (
+                "web-firecrawl",
+                "1.0.0",
+                "firecrawl",
+                "bundled",
+                None,
+                "web/firecrawl",
+                "backend",
+            )
+        ]
         plugin_keys = ["web/firecrawl"]
         plugin_labels = ["web-firecrawl — firecrawl [bundled]"]
-        plugin_selected = set()  # unchecked → should be disabled
+        plugin_selected = {0}
 
-        # First input() toggles nothing (blank Enter confirms immediately),
-        # second (category prompt) is skipped with blank Enter.
-        with patch("builtins.input", return_value=""):
+        with patch("builtins.input", side_effect=["1", ""]):
             _run_composite_fallback(
-                plugin_keys, plugin_labels, plugin_selected,
-                set(), [], Console(),
+                entries,
+                plugin_keys,
+                plugin_labels,
+                plugin_selected,
+                set(),
+                set(),
+                [],
+                Console(),
             )
 
         saved_dis = mock_save_dis.call_args[0][0]
         assert "web/firecrawl" in saved_dis      # canonical key persisted
         assert "web-firecrawl" not in saved_dis   # never the bare name
+        mock_save_en.assert_called_once_with(set())
 
     @patch("hermes_cli.plugins_cmd._save_disabled_set")
     @patch("hermes_cli.plugins_cmd._save_enabled_set")
-    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set())
-    def test_fallback_checked_plugin_enables_by_key_and_clears_aliases(
-        self, mock_en, mock_save_en, mock_save_dis,
+    def test_fallback_default_plugin_toggle_on_clears_aliases_without_allowlist(
+        self, mock_save_en, mock_save_dis,
     ):
         from hermes_cli.plugins_cmd import _run_composite_fallback
         from rich.console import Console
 
+        entries = [
+            (
+                "web-firecrawl",
+                "1.0.0",
+                "firecrawl",
+                "bundled",
+                None,
+                "web/firecrawl",
+                "backend",
+            )
+        ]
         plugin_keys = ["web/firecrawl"]
         plugin_labels = ["web-firecrawl — firecrawl [bundled]"]
-        plugin_selected = {0}  # checked → enabled
+        plugin_selected = set()
 
-        # Pre-existing stale bare-leaf disable should be cleared on enable.
-        with patch("builtins.input", return_value=""):
+        with patch("builtins.input", side_effect=["1", ""]):
             _run_composite_fallback(
-                plugin_keys, plugin_labels, plugin_selected,
-                {"firecrawl"}, [], Console(),
+                entries,
+                plugin_keys,
+                plugin_labels,
+                plugin_selected,
+                set(),
+                {"web/firecrawl", "web-firecrawl", "firecrawl"},
+                [],
+                Console(),
             )
 
         saved_en = mock_save_en.call_args[0][0]
         saved_dis = mock_save_dis.call_args[0][0]
-        assert "web/firecrawl" in saved_en
-        assert "firecrawl" not in saved_dis  # stale bare-leaf alias cleared
+        assert saved_en == set()
+        assert saved_dis == {"firecrawl"}
+
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    def test_fallback_noop_preserves_default_plugin_config(
+        self, mock_save_en, mock_save_dis,
+    ):
+        from hermes_cli.plugins_cmd import _run_composite_fallback
+        from rich.console import Console
+
+        entries = [
+            (
+                "web-firecrawl",
+                "1.0.0",
+                "firecrawl",
+                "bundled",
+                None,
+                "web/firecrawl",
+                "backend",
+            )
+        ]
+
+        with patch("builtins.input", return_value=""):
+            _run_composite_fallback(
+                entries,
+                ["web/firecrawl"],
+                ["web-firecrawl — firecrawl [bundled]"],
+                {0},
+                set(),
+                set(),
+                [],
+                Console(),
+            )
+
+        mock_save_en.assert_not_called()
+        mock_save_dis.assert_not_called()

@@ -3,3 +3,6 @@ kind: model-provider
 version: 1.0.0
 description: OpenCode (Zen + Go)
 author: Nous Research
+provider_ids:
+  - opencode-zen
+  - opencode-go

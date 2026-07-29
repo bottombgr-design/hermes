@@ -57,6 +57,17 @@ bundled plugins of the same name — last-writer-wins in
    author: Your Name
    ```
 
+   The directory name is the default runtime provider ID. If one plugin
+   registers multiple `ProviderProfile` objects, declare every runtime ID so
+   activation checks can identify all profiles without importing a disabled
+   plugin:
+
+   ```yaml
+   provider_ids:
+     - your-provider
+     - your-provider-regional
+   ```
+
 Nothing else needs to change. `auth.py`, `config.py`, `models.py`,
 `doctor.py`, `model_metadata.py`, `runtime_provider.py`, and the
 chat_completions transport all auto-wire from the registry.

@@ -26,8 +26,69 @@ from hermes_cli import web_server
 def _reset_plugin_cache():
     """Bust the plugin cache before and after each test."""
     web_server._dashboard_plugins_cache = None
+    web_server._dashboard_plugin_entries_cache = None
+    web_server._dashboard_plugin_entries_loader = None
     yield
     web_server._dashboard_plugins_cache = None
+    web_server._dashboard_plugin_entries_cache = None
+    web_server._dashboard_plugin_entries_loader = None
+
+
+def test_dashboard_runtime_entry_index_is_cached_until_rescan(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import plugins_cmd
+
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    entry = (
+        "example",
+        "1.0.0",
+        "",
+        "bundled",
+        plugin_dir,
+        "tools/example",
+        "standalone",
+    )
+    discovery_calls = []
+
+    def _discover():
+        discovery_calls.append(True)
+        return [entry]
+
+    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", _discover)
+    monkeypatch.setattr(web_server, "_discover_dashboard_plugins", lambda: [])
+
+    first = web_server._dashboard_plugin_entries_by_path()
+    second = web_server._dashboard_plugin_entries_by_path()
+
+    assert first == second
+    assert discovery_calls == [True]
+
+    web_server._get_dashboard_plugins(force_rescan=True)
+    refreshed = web_server._dashboard_plugin_entries_by_path()
+
+    assert refreshed == first
+    assert discovery_calls == [True, True]
+
+
+def test_dashboard_runtime_entry_index_falls_back_when_discovery_fails(
+    monkeypatch,
+):
+    from hermes_cli import plugins_cmd
+
+    discovery_calls = []
+
+    def _discover():
+        discovery_calls.append(True)
+        raise RuntimeError("broken manifest")
+
+    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", _discover)
+
+    assert web_server._dashboard_plugin_entries_by_path() == {}
+    assert web_server._dashboard_plugin_entries_by_path() == {}
+    assert discovery_calls == [True]
 
 
 @pytest.fixture
@@ -83,6 +144,80 @@ def _make_bundled_plugin(tmp_path, name="bundledx"):
     return dashboard_dir
 
 
+def test_truthy_safe_mode_skips_user_plugin_api_import(monkeypatch, tmp_path):
+    plugin_dir = tmp_path / "plugin"
+    dashboard_dir = plugin_dir / "dashboard"
+    dashboard_dir.mkdir(parents=True)
+    (dashboard_dir / "plugin_api.py").write_text(
+        "raise AssertionError('must not import')\n",
+        encoding="utf-8",
+    )
+    plugin = {
+        "name": "unsafe",
+        "source": "user",
+        "_plugin_dir": str(plugin_dir),
+        "_dir": str(dashboard_dir),
+        "_api_file": "plugin_api.py",
+    }
+    entry = (
+        "unsafe",
+        "1.0.0",
+        "",
+        "user",
+        plugin_dir,
+        "tools/unsafe",
+        "standalone",
+    )
+    monkeypatch.setenv("HERMES_SAFE_MODE", "true")
+
+    with patch.object(web_server, "_get_dashboard_plugins", return_value=[plugin]), \
+         patch.object(
+             web_server,
+             "_dashboard_plugin_entries_by_path",
+             return_value={str(plugin_dir.resolve()): entry},
+         ), \
+         patch(
+             "hermes_cli.plugins_cmd._get_enabled_set",
+             return_value={"tools/unsafe"},
+         ), \
+         patch(
+             "hermes_cli.plugins_cmd._get_disabled_set",
+             return_value=set(),
+         ), \
+         patch.object(
+             web_server.importlib.util,
+             "spec_from_file_location",
+         ) as import_spec:
+        web_server._mount_plugin_api_routes()
+
+    import_spec.assert_not_called()
+
+
+def test_dashboard_only_fallback_honors_runtime_policy(monkeypatch):
+    from hermes_cli import plugin_config_state
+
+    plugin = {
+        "name": "allowlisted-dashboard",
+        "source": "user",
+    }
+
+    monkeypatch.setenv("HERMES_SAFE_MODE", "true")
+    assert web_server._dashboard_plugin_runtime_status(
+        plugin,
+        {"allowlisted-dashboard"},
+        set(),
+        {},
+    ) == "not enabled"
+
+    monkeypatch.delenv("HERMES_SAFE_MODE")
+    assert web_server._dashboard_plugin_runtime_status(
+        plugin,
+        {"allowlisted-dashboard"},
+        {plugin_config_state._POLICY_FAIL_CLOSED_SENTINEL},
+        {},
+    ) == "not enabled"
+
+
 # ---------------------------------------------------------------------------
 # Test 1: Runtime-disabled user plugin API routes return 404
 # ---------------------------------------------------------------------------
@@ -125,6 +260,60 @@ class TestPluginApiRuntimeGate:
 
         assert response.status_code == 404
         call_next.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_middleware_uses_canonical_plugin_key(self, tmp_path):
+        """An enabled canonical key keeps a differently named API route live."""
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        plugin_dir = tmp_path / "runtime-plugin"
+        fake_plugin = {
+            "name": "dashboard-label",
+            "source": "user",
+            "_plugin_dir": str(plugin_dir),
+        }
+        runtime_entry = (
+            "runtime-name",
+            "1.0.0",
+            "",
+            "user",
+            plugin_dir,
+            "tools/runtime-key",
+            "standalone",
+        )
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/plugins/dashboard-label/probe",
+            "query_string": b"",
+            "headers": [],
+            "state": {"token_authenticated": True},
+        }
+        request = Request(scope)
+        call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+        with patch.object(
+            web_server,
+            "_get_dashboard_plugins",
+            return_value=[fake_plugin],
+        ), patch(
+            "hermes_cli.plugins_cmd._discover_all_plugins",
+            return_value=[runtime_entry],
+        ), patch(
+            "hermes_cli.plugins_cmd._get_enabled_set",
+            return_value={"tools/runtime-key"},
+        ), patch(
+            "hermes_cli.plugins_cmd._get_disabled_set",
+            return_value=set(),
+        ):
+            response = await web_server._plugin_api_runtime_gate(
+                request,
+                call_next,
+            )
+
+        assert response.status_code == 200
+        call_next.assert_awaited_once_with(request)
 
     @pytest.mark.asyncio
     async def test_middleware_blocks_unenabled_user_plugin(self):
@@ -399,3 +588,48 @@ class TestBundledPluginAssetGate:
             ):
                 resp = test_client.get("/dashboard-plugins/userplugin/dist/index.js")
                 assert resp.status_code == 200
+
+    def test_user_asset_uses_canonical_plugin_key(
+        self,
+        test_client,
+        tmp_path,
+    ):
+        """Dashboard display names must not replace runtime plugin keys."""
+        dashboard_dir = _make_user_plugin(tmp_path, "dashboard-label")
+        fake_plugin = {
+            "name": "dashboard-label",
+            "label": "Dashboard Label",
+            "source": "user",
+            "entry": "dist/index.js",
+            "_plugin_dir": str(dashboard_dir.parent),
+            "_dir": str(dashboard_dir),
+        }
+        runtime_entry = (
+            "runtime-name",
+            "1.0.0",
+            "",
+            "user",
+            dashboard_dir.parent,
+            "tools/runtime-key",
+            "standalone",
+        )
+
+        with patch.object(
+            web_server,
+            "_get_dashboard_plugins",
+            return_value=[fake_plugin],
+        ), patch(
+            "hermes_cli.plugins_cmd._discover_all_plugins",
+            return_value=[runtime_entry],
+        ), patch(
+            "hermes_cli.plugins_cmd._get_enabled_set",
+            return_value={"tools/runtime-key"},
+        ), patch(
+            "hermes_cli.plugins_cmd._get_disabled_set",
+            return_value=set(),
+        ):
+            resp = test_client.get(
+                "/dashboard-plugins/dashboard-label/dist/index.js"
+            )
+
+        assert resp.status_code == 200

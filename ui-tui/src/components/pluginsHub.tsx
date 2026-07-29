@@ -14,6 +14,7 @@ const MAX_WIDTH = 96
 
 interface PluginRow {
   description?: string
+  key: string
   name: string
   source?: string
   status?: string
@@ -90,10 +91,10 @@ export function PluginsHub({ gw, maxWidth, onClose, t }: PluginsHubProps) {
     setBusy(true)
     setErr('')
 
-    gw.request<PluginsToggleResponse>('plugins.manage', { action: 'toggle', enable, name: row.name })
+    gw.request<PluginsToggleResponse>('plugins.manage', { action: 'toggle', enable, name: row.key })
       .then(r => {
         if (r?.plugin) {
-          setRows(prev => prev.map(p => (p.name === r.plugin!.name ? r.plugin! : p)))
+          setRows(prev => prev.map(p => (p.key === r.plugin!.key ? r.plugin! : p)))
         } else {
           load()
         }
@@ -178,14 +179,21 @@ export function PluginsHub({ gw, maxWidth, onClose, t }: PluginsHubProps) {
     )
   }
 
+  const nameCounts = effectiveRows.reduce<Map<string, number>>((counts, row) => {
+    counts.set(row.name, (counts.get(row.name) ?? 0) + 1)
+
+    return counts
+  }, new Map())
+
   const labels = effectiveRows.map(r => {
     const status = r.status ?? 'not enabled'
     const glyph = GLYPH[status] ?? '○'
     const ver = r.version ? ` v${r.version}` : ''
     const src = effectiveScope === 'all' && r.source === 'bundled' ? ' [bundled]' : ''
     const state = status === 'enabled' ? '' : ` (${status})`
+    const identity = (nameCounts.get(r.name) ?? 0) > 1 ? `${r.name} [${r.key}]` : r.name
 
-    return `${glyph} ${r.name}${ver}${src}${state}`
+    return `${glyph} ${identity}${ver}${src}${state}`
   })
 
   const { items, offset } = windowItems(labels, clampedIdx, VISIBLE)
@@ -212,7 +220,7 @@ export function PluginsHub({ gw, maxWidth, onClose, t }: PluginsHubProps) {
           <Text
             color={t.color.muted}
             {...chipRowProps(t, active)}
-            key={effectiveRows[lineIdx]?.name ?? row}
+            key={effectiveRows[lineIdx]?.key ?? row}
             wrap="truncate-end"
           >
             {active ? '▸ ' : '  '}

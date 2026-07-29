@@ -115,3 +115,29 @@ class TestProviderPrecedence:
 
         monkeypatch.setattr("agent.credential_pool.load_pool", lambda name: _Pool())
         assert resolve_provider("auto") == "openrouter"
+
+    def test_disabled_openrouter_does_not_block_openai_api_auto_fallback(
+        self,
+        monkeypatch,
+    ):
+        """OpenRouter's shared env probe must not abort unrelated auto routes."""
+        import hermes_cli.auth as auth
+
+        _clear_provider_env(monkeypatch)
+        _no_aws(monkeypatch)
+        _config(monkeypatch, {})
+        monkeypatch.setattr(auth, "_load_auth_store", lambda: {})
+        for provider in auth.PROVIDER_REGISTRY.values():
+            for env_var in provider.api_key_env_vars:
+                monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+        monkeypatch.setattr(
+            "providers.is_plugin_managed_provider_id",
+            lambda provider_id: provider_id == "openrouter",
+        )
+        monkeypatch.setattr(
+            "providers.is_provider_plugin_active",
+            lambda provider_id: provider_id != "openrouter",
+        )
+
+        assert resolve_provider("auto") == "openai-api"

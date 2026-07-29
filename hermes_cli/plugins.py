@@ -48,8 +48,11 @@ from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
-from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.plugin_config_state import (
+    plugin_config_aliases,
+    plugin_policy_failed_closed,
+)
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -231,13 +234,9 @@ def _get_disabled_plugins() -> set:
     name in this set will never load, even if it appears in
     ``plugins.enabled``.
     """
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        disabled = cfg_get(config, "plugins", "disabled", default=[])
-        return set(disabled) if isinstance(disabled, list) else set()
-    except Exception:
-        return set()
+    from hermes_cli.plugin_config_state import get_disabled_plugins
+
+    return get_disabled_plugins()
 
 
 def _get_enabled_plugins() -> Optional[set]:
@@ -254,20 +253,9 @@ def _get_enabled_plugins() -> Optional[set]:
     * ``set()`` — an empty list was explicitly set; nothing loads.
     * ``set(...)`` — the concrete allow-list.
     """
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        plugins_cfg = config.get("plugins")
-        if not isinstance(plugins_cfg, dict):
-            return None
-        if "enabled" not in plugins_cfg:
-            return None
-        enabled = plugins_cfg.get("enabled")
-        if not isinstance(enabled, list):
-            return None
-        return set(enabled)
-    except Exception:
-        return None
+    from hermes_cli.plugin_config_state import get_enabled_plugins
+
+    return get_enabled_plugins()
 
 
 # ---------------------------------------------------------------------------
@@ -1397,16 +1385,26 @@ class PluginManager:
         # ``disk-cleanup``) so ``tts/openai`` and ``image_gen/openai``
         # don't collide even when both manifests say ``name: openai``.
         disabled = _get_disabled_plugins()
+        policy_failed_closed = plugin_policy_failed_closed(disabled)
         enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
+            config_aliases = plugin_config_aliases(manifest.name, lookup_key)
 
-            # Explicit disable always wins (matches on key or on legacy
-            # bare name for back-compat with existing user configs).
-            if lookup_key in disabled or manifest.name in disabled:
+            if policy_failed_closed and manifest.source != "bundled":
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = "plugin policy unreadable; non-bundled plugins fail closed"
+                self._plugins[lookup_key] = loaded
+                logger.debug("Skipping non-bundled plugin '%s' after policy read failure", lookup_key)
+                continue
+
+            # Explicit disable always wins. Persisted config matches the
+            # canonical key or manifest name; short directory leaves are only
+            # accepted as unambiguous CLI input and are normalized before save.
+            if config_aliases & disabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = "disabled via config"
                 self._plugins[lookup_key] = loaded
@@ -1468,11 +1466,11 @@ class PluginManager:
 
             # Everything else (standalone, user-installed backends,
             # entry-point plugins) is opt-in via plugins.enabled.
-            # Accept both the path-derived key and the legacy bare name
-            # so existing configs keep working.
+            # Accept the path-derived key and manifest name so existing
+            # configs keep working.
             is_enabled = (
                 enabled is not None
-                and (lookup_key in enabled or manifest.name in enabled)
+                and bool(config_aliases & enabled)
             )
             if not is_enabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)

@@ -173,6 +173,55 @@ class ProviderConfig:
     base_url_env_var: str = ""
 
 
+class _AtomicProviderRegistry(dict[str, ProviderConfig]):
+    """Dict-compatible provider index with snapshot iteration and replacement."""
+
+    def __init__(self, initial: Dict[str, ProviderConfig]):
+        super().__init__(initial)
+        self._lock = threading.RLock()
+
+    def replace(self, replacement: Dict[str, ProviderConfig]) -> None:
+        with self._lock:
+            super().clear()
+            super().update(replacement)
+
+    def __getitem__(self, key: str) -> ProviderConfig:
+        with self._lock:
+            return super().__getitem__(key)
+
+    def __setitem__(self, key: str, value: ProviderConfig) -> None:
+        with self._lock:
+            super().__setitem__(key, value)
+
+    def __contains__(self, key: object) -> bool:
+        with self._lock:
+            return super().__contains__(key)
+
+    def __iter__(self):
+        with self._lock:
+            return iter(tuple(super().keys()))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return super().__len__()
+
+    def get(self, key: str, default=None):
+        with self._lock:
+            return super().get(key, default)
+
+    def keys(self):
+        with self._lock:
+            return tuple(super().keys())
+
+    def values(self):
+        with self._lock:
+            return tuple(super().values())
+
+    def items(self):
+        with self._lock:
+            return tuple(super().items())
+
+
 PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     "nous": ProviderConfig(
         id="nous",
@@ -454,38 +503,99 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         base_url_env_var="AZURE_FOUNDRY_BASE_URL",
     ),
 }
+PROVIDER_REGISTRY = _AtomicProviderRegistry(PROVIDER_REGISTRY)
 
 # Auto-extend PROVIDER_REGISTRY with any api-key provider registered in
-# providers/ that is not already declared above.  New providers only need a
+# providers/ that is not already declared above. New providers only need a
 # plugins/model-providers/<name>/ plugin — no edits to this file required.
-try:
-    from providers import list_providers as _list_providers_for_registry
-    for _pp in _list_providers_for_registry():
-        if _pp.name in PROVIDER_REGISTRY:
-            continue
-        if _pp.auth_type != "api_key" or not _pp.env_vars:
-            continue
-        # Skip providers that need custom token resolution or are special-cased
-        # in resolve_provider() (copilot/kimi/zai have bespoke token refresh;
-        # openrouter/custom are aggregator/user-supplied and handled outside
-        # the registry — adding them here breaks runtime_provider resolution
-        # that relies on `openrouter not in PROVIDER_REGISTRY`).
-        if _pp.name in {"copilot", "kimi-coding", "kimi-coding-cn", "zai", "openrouter", "custom"}:
-            continue
-        _api_key_vars = tuple(v for v in _pp.env_vars if not v.endswith("_BASE_URL") and not v.endswith("_URL"))
-        _base_url_var = next((v for v in _pp.env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")), None)
-        PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
-            id=_pp.name,
-            name=_pp.display_name or _pp.name,
-            auth_type="api_key",
-            inference_base_url=_pp.base_url,
-            api_key_env_vars=_api_key_vars or _pp.env_vars,
-            base_url_env_var=_base_url_var or "",
+_STATIC_PROVIDER_REGISTRY = dict(PROVIDER_REGISTRY)
+_DYNAMIC_PROVIDER_REGISTRY_KEYS: set[str] = set()
+
+
+def _refresh_provider_registry_from_plugins() -> None:
+    """Rebuild plugin-derived auth entries after provider activation changes."""
+    try:
+        from providers import (
+            is_plugin_managed_provider_id,
+            list_providers,
         )
-        # Also register aliases so resolve_provider() resolves them
-        for _alias in _pp.aliases:
-            if _alias not in PROVIDER_REGISTRY:
-                PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
+        profiles = list_providers()
+    except Exception:
+        PROVIDER_REGISTRY.replace(dict(_STATIC_PROVIDER_REGISTRY))
+        _DYNAMIC_PROVIDER_REGISTRY_KEYS.clear()
+        return
+
+    active_provider_ids = {profile.name for profile in profiles}
+    replacement = {
+        provider_id: config
+        for provider_id, config in _STATIC_PROVIDER_REGISTRY.items()
+        if (
+            not is_plugin_managed_provider_id(provider_id)
+            or provider_id in active_provider_ids
+        )
+    }
+    dynamic_keys: set[str] = set()
+
+    try:
+        for profile in profiles:
+            if profile.name in replacement:
+                continue
+            if profile.auth_type != "api_key" or not profile.env_vars:
+                continue
+            # These providers need custom token resolution or are handled
+            # outside this registry.
+            if profile.name in {
+                "copilot",
+                "kimi-coding",
+                "kimi-coding-cn",
+                "zai",
+                "openrouter",
+                "custom",
+            }:
+                continue
+            api_key_vars = tuple(
+                value
+                for value in profile.env_vars
+                if not value.endswith(("_BASE_URL", "_URL"))
+            )
+            base_url_var = next(
+                (
+                    value
+                    for value in profile.env_vars
+                    if value.endswith(("_BASE_URL", "_URL"))
+                ),
+                None,
+            )
+            replacement[profile.name] = ProviderConfig(
+                id=profile.name,
+                name=profile.display_name or profile.name,
+                auth_type="api_key",
+                inference_base_url=profile.base_url,
+                api_key_env_vars=api_key_vars or profile.env_vars,
+                base_url_env_var=base_url_var or "",
+            )
+            dynamic_keys.add(profile.name)
+            for alias in profile.aliases:
+                if alias not in replacement:
+                    replacement[alias] = replacement[profile.name]
+                    dynamic_keys.add(alias)
+    except Exception:
+        pass
+    PROVIDER_REGISTRY.replace(replacement)
+    _DYNAMIC_PROVIDER_REGISTRY_KEYS.clear()
+    _DYNAMIC_PROVIDER_REGISTRY_KEYS.update(dynamic_keys)
+
+
+def get_nous_service_config() -> ProviderConfig:
+    """Return Nous Portal auth metadata independent of model-plugin state."""
+    return _STATIC_PROVIDER_REGISTRY["nous"]
+
+
+_refresh_provider_registry_from_plugins()
+try:
+    from providers import register_provider_refresh_hook
+
+    register_provider_refresh_hook(_refresh_provider_registry_from_plugins)
 except Exception:
     pass
 
@@ -507,7 +617,7 @@ def get_anthropic_key() -> str:
     """
     from hermes_cli.config import get_env_value_prefer_dotenv
 
-    for var in PROVIDER_REGISTRY["anthropic"].api_key_env_vars:
+    for var in _STATIC_PROVIDER_REGISTRY["anthropic"].api_key_env_vars:
         value = get_env_value_prefer_dotenv(var) or ""
         if value:
             return value
@@ -1400,10 +1510,17 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     normalized = (provider_id or "").strip().lower()
     if not normalized:
         return False
-    if normalized in {"auto", "openrouter", "custom", "moa"}:
+    if normalized in {"auto", "moa"}:
         return True
     if normalized.startswith("custom:"):
-        return True
+        normalized = "custom"
+    if normalized in {"openrouter", "custom"}:
+        try:
+            from providers import is_provider_plugin_active
+
+            return is_provider_plugin_active(normalized)
+        except Exception:
+            return False
     try:
         resolve_provider(normalized)
     except AuthError:
@@ -1925,10 +2042,26 @@ def resolve_provider(
         pass
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
 
-    if normalized == "openrouter":
-        return "openrouter"
-    if normalized == "custom":
-        return "custom"
+    try:
+        from providers import (
+            is_plugin_managed_provider_id,
+            is_provider_plugin_active,
+        )
+
+        plugin_managed = is_plugin_managed_provider_id(normalized)
+        plugin_active = is_provider_plugin_active(normalized)
+    except Exception as exc:
+        logger.debug("Could not verify provider plugin state for %s: %s", normalized, exc)
+        plugin_managed = False
+        plugin_active = True
+    if plugin_managed and not plugin_active:
+        raise AuthError(
+            f"Provider '{normalized}' is disabled by plugin configuration.",
+            code="invalid_provider",
+        )
+
+    if normalized in {"openrouter", "custom"}:
+        return normalized
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
@@ -1943,7 +2076,7 @@ def resolve_provider(
 
     # Explicit one-off CLI creds always mean openrouter/custom
     if explicit_api_key or explicit_base_url:
-        return "openrouter"
+        return resolve_provider("openrouter")
 
     # Provider precedence for the auto-path (#29285): explicit user intent must
     # win over a stale logged-in OAuth `active_provider`. Order matches the
@@ -1966,8 +2099,19 @@ def resolve_provider(
     except Exception as e:
         logger.debug("Could not read config.yaml model.provider for auto-resolution: %s", e)
 
-    if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
-        return "openrouter"
+    try:
+        from providers import is_provider_plugin_active as _provider_plugin_active
+
+        _openrouter_plugin_active = _provider_plugin_active("openrouter")
+    except Exception as e:
+        logger.debug("Could not verify OpenRouter plugin state during auto-resolution: %s", e)
+        _openrouter_plugin_active = True
+
+    if _openrouter_plugin_active and (
+        has_usable_secret(os.getenv("OPENAI_API_KEY"))
+        or has_usable_secret(os.getenv("OPENROUTER_API_KEY"))
+    ):
+        return resolve_provider("openrouter")
 
     # Auto-detect an OpenRouter credential added via `hermes auth add openrouter`
     # (manual pool entry, no env var). Without this, a key that only lives in
@@ -1979,8 +2123,11 @@ def resolve_provider(
     try:
         from agent.credential_pool import load_pool as _load_pool
 
-        if _load_pool("openrouter").has_credentials():
-            return "openrouter"
+        if (
+            _openrouter_plugin_active
+            and _load_pool("openrouter").has_credentials()
+        ):
+            return resolve_provider("openrouter")
     except Exception as e:
         logger.debug("Could not check OpenRouter credential pool: %s", e)
 
@@ -8498,7 +8645,7 @@ def _nous_device_code_login(
     on_verification: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
     """Run the Nous device-code flow and return full OAuth state without persisting."""
-    pconfig = PROVIDER_REGISTRY["nous"]
+    pconfig = get_nous_service_config()
     portal_base_url = (
         portal_base_url
         or os.getenv("HERMES_PORTAL_BASE_URL")
@@ -8667,7 +8814,7 @@ def step_up_nous_billing_scope(
     Returns True iff the new token carries ``billing:manage``.
     """
     prior = get_provider_auth_state("nous") or {}
-    pconfig = PROVIDER_REGISTRY["nous"]
+    pconfig = get_nous_service_config()
 
     # Build the step-up scope: existing scopes (if any) + billing:manage, deduped,
     # order-stable. Fall back to the standard inference+tool+billing set.

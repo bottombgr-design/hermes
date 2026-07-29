@@ -49,11 +49,12 @@ class TestReadManifestInfo:
         })
         result = _read_manifest_info(d, "")
         assert result is not None
-        name, version, description, key = result
+        name, version, description, key, kind = result
         assert name == "my-plugin"
         assert version == "1.0.0"
         assert description == "test"
         assert key == "my-plugin"  # flat: key == name
+        assert kind == "standalone"
 
     def test_category_plugin(self, tmp_path):
         from hermes_cli.plugins_cmd import _read_manifest_info
@@ -63,9 +64,10 @@ class TestReadManifestInfo:
         })
         result = _read_manifest_info(d, "web")
         assert result is not None
-        name, version, description, key = result
+        name, version, description, key, kind = result
         assert name == "web-tavily"  # manifest name
         assert key == "web/tavily"  # path-derived key
+        assert kind == "standalone"
 
     def test_no_manifest(self, tmp_path):
         from hermes_cli.plugins_cmd import _read_manifest_info
@@ -80,10 +82,43 @@ class TestReadManifestInfo:
         d = tmp_path / "my-plugin"
         d.mkdir()
         import yaml
-        (d / "plugin.yml").write_text(yaml.dump({"name": "my-plugin"}), encoding="utf-8")
+        (d / "plugin.yml").write_text(
+            yaml.dump({"name": "my-plugin", "kind": " Backend "}),
+            encoding="utf-8",
+        )
         result = _read_manifest_info(d, "")
         assert result is not None
         assert result[0] == "my-plugin"
+        assert result[4] == "backend"
+
+    def test_unknown_kind_falls_back_to_standalone(self, tmp_path):
+        from hermes_cli.plugins_cmd import _read_manifest_info
+
+        d = _make_plugin_dir(
+            tmp_path,
+            "my-plugin",
+            {"name": "my-plugin", "kind": "not-a-kind"},
+        )
+
+        result = _read_manifest_info(d, "")
+
+        assert result is not None
+        assert result[4] == "standalone"
+
+    def test_model_provider_kind_uses_runtime_heuristic(self, tmp_path):
+        from hermes_cli.plugins_cmd import _read_manifest_info
+
+        d = _make_plugin_dir(tmp_path, "custom-provider", {"name": "custom-provider"})
+        (d / "__init__.py").write_text(
+            "from providers import ProviderProfile, register_provider\n"
+            "register_provider(ProviderProfile())\n",
+            encoding="utf-8",
+        )
+
+        result = _read_manifest_info(d, "")
+
+        assert result is not None
+        assert result[4] == "model-provider"
 
 
 # ---------------------------------------------------------------------------
@@ -177,11 +212,14 @@ class TestDiscoverAllPlugins:
 
     @patch("hermes_cli.plugins.get_bundled_plugins_dir")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
-    def test_tuple_has_six_elements(self, mock_user_dir, mock_bundled_dir, tmp_path):
+    def test_tuple_includes_normalized_kind(self, mock_user_dir, mock_bundled_dir, tmp_path):
         from hermes_cli.plugins_cmd import _discover_all_plugins
 
         _make_category_plugin(tmp_path, "web", "tavily", {
-            "name": "web-tavily", "version": "1.0.0", "description": "search"
+            "name": "web-tavily",
+            "version": "1.0.0",
+            "description": "search",
+            "kind": "backend",
         })
         mock_user_dir.return_value = tmp_path
         mock_bundled_dir.return_value = tmp_path / "nonexistent"
@@ -189,11 +227,12 @@ class TestDiscoverAllPlugins:
         entries = _discover_all_plugins()
         assert len(entries) == 1
         entry = entries[0]
-        assert len(entry) == 6
-        name, version, description, source, dir_path, key = entry
+        assert len(entry) == 7
+        name, version, description, source, dir_path, key, kind = entry
         assert name == "web-tavily"
         assert key == "web/tavily"
         assert source == "user"
+        assert kind == "backend"
 
     @patch("hermes_cli.plugins.get_bundled_plugins_dir")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
@@ -220,6 +259,82 @@ class TestDiscoverAllPlugins:
         # User version should win
         entry = [e for e in entries if e[5] == "my-plugin"][0]
         assert entry[1] == "2.0.0"
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_bundled_platform_and_model_provider_use_runtime_keys(
+        self,
+        mock_user_dir,
+        mock_bundled_dir,
+        tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import _discover_all_plugins
+
+        bundled_dir = tmp_path / "bundled"
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        _make_category_plugin(
+            bundled_dir,
+            "platforms",
+            "telegram",
+            {
+                "name": "telegram-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+            },
+        )
+        _make_category_plugin(
+            bundled_dir,
+            "model-providers",
+            "custom",
+            {
+                "name": "custom-provider",
+                "kind": "model-provider",
+                "version": "1.0.0",
+            },
+        )
+        mock_user_dir.return_value = user_dir
+        mock_bundled_dir.return_value = bundled_dir
+
+        entries = _discover_all_plugins()
+        by_name = {entry[0]: entry for entry in entries}
+
+        assert by_name["telegram-platform"][5] == "telegram-platform"
+        assert by_name["custom-provider"][5] == "model-providers/custom"
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_project_plugins_match_runtime_opt_in(
+        self,
+        mock_user_dir,
+        mock_bundled_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hermes_cli.plugins_cmd import _discover_all_plugins
+
+        bundled_dir = tmp_path / "bundled"
+        user_dir = tmp_path / "user"
+        bundled_dir.mkdir()
+        user_dir.mkdir()
+        _make_plugin_dir(
+            tmp_path / ".hermes" / "plugins",
+            "project-tool",
+            {"name": "project-tool", "version": "1.0.0"},
+        )
+        mock_user_dir.return_value = user_dir
+        mock_bundled_dir.return_value = bundled_dir
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+
+        entries = _discover_all_plugins()
+
+        assert any(
+            entry[0] == "project-tool"
+            and entry[3] == "project"
+            and entry[5] == "project-tool"
+            for entry in entries
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +371,43 @@ class TestPluginStatus:
         from hermes_cli.plugins_cmd import _plugin_status
         assert _plugin_status("web-tavily", {"web/tavily"}, {"web/tavily"}, key="web/tavily") == "disabled"
 
+    def test_project_model_provider_is_available_by_default(self):
+        from hermes_cli.plugins_cmd import _plugin_status_for_entry
+
+        entry = (
+            "custom-provider",
+            "1.0.0",
+            "custom",
+            "project",
+            Path("/tmp"),
+            "model-providers/custom",
+            "model-provider",
+        )
+
+        assert _plugin_status_for_entry(entry, set(), set()) == "enabled"
+
+    def test_model_provider_canonical_key_can_disable_status(self):
+        from hermes_cli.plugins_cmd import _plugin_status_for_entry
+
+        entry = (
+            "custom-provider-display",
+            "1.0.0",
+            "custom",
+            "bundled",
+            Path("/tmp"),
+            "model-providers/custom",
+            "model-provider",
+        )
+
+        assert (
+            _plugin_status_for_entry(
+                entry,
+                set(),
+                {"model-providers/custom"},
+            )
+            == "disabled"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Integration: _filter_plugin_entries with category plugins
@@ -267,8 +419,24 @@ class TestFilterPluginEntries:
         from hermes_cli.plugins_cmd import _filter_plugin_entries
 
         entries = [
-            ("web-tavily", "1.0.0", "search", "user", Path("/tmp"), "web/tavily"),
-            ("disk-cleanup", "1.0.0", "cleanup", "bundled", Path("/tmp"), "disk-cleanup"),
+            (
+                "web-tavily",
+                "1.0.0",
+                "search",
+                "user",
+                Path("/tmp"),
+                "web/tavily",
+                "standalone",
+            ),
+            (
+                "disk-cleanup",
+                "1.0.0",
+                "cleanup",
+                "bundled",
+                Path("/tmp"),
+                "disk-cleanup",
+                "standalone",
+            ),
         ]
         args = MagicMock()
         args.no_bundled = False
@@ -283,7 +451,15 @@ class TestFilterPluginEntries:
         from hermes_cli.plugins_cmd import _filter_plugin_entries
 
         entries = [
-            ("disk-cleanup", "1.0.0", "cleanup", "bundled", Path("/tmp"), "disk-cleanup"),
+            (
+                "disk-cleanup",
+                "1.0.0",
+                "cleanup",
+                "bundled",
+                Path("/tmp"),
+                "disk-cleanup",
+                "standalone",
+            ),
         ]
         args = MagicMock()
         args.no_bundled = False
@@ -327,6 +503,7 @@ class TestCmdListJson:
         names = [p["name"] for p in payload]
         assert "web-tavily" in names
         assert "disk-cleanup" in names
+        assert {p["key"] for p in payload} == {"web/tavily", "disk-cleanup"}
 
     @patch("hermes_cli.plugins.get_bundled_plugins_dir")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
@@ -352,4 +529,5 @@ class TestCmdListJson:
             captured = capsys.readouterr()
             payload = json.loads(captured.out)
             assert len(payload) == 1
+            assert payload[0]["key"] == "web/tavily"
             assert payload[0]["status"] == "enabled"

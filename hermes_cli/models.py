@@ -1113,29 +1113,114 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("azure-foundry",  "Azure Foundry",            "Azure Foundry (OpenAI-style or Anthropic-style endpoint, your Azure AI deployment)"),
     ProviderEntry("qwen-oauth",     "Qwen OAuth (Portal)",      "Qwen OAuth (Reuses local Qwen CLI login)"),
 ]
+_STATIC_CANONICAL_PROVIDERS = tuple(CANONICAL_PROVIDERS)
 
 # Auto-extend CANONICAL_PROVIDERS with any provider registered in providers/
 # that is not already in the list above.  Adding plugins/model-providers/<name>/
 # is sufficient to expose a new provider in the model picker, /model, and all
 # downstream consumers — no edits to this file needed.
 _canonical_slugs = {p.slug for p in CANONICAL_PROVIDERS}
-try:
-    from providers import list_providers as _list_providers_for_canonical
-    for _pp in _list_providers_for_canonical():
-        if _pp.name in _canonical_slugs:
-            continue
-        if _pp.auth_type in {"oauth_device_code", "oauth_external", "external_process", "aws_sdk", "copilot", "vertex"}:
-            continue  # non-api-key flows need bespoke picker UX; skip auto-inject
-        _label = _pp.display_name or _pp.name
-        _desc = _pp.description or f"{_label} (direct API)"
-        CANONICAL_PROVIDERS.append(ProviderEntry(_pp.name, _label, _desc))
-        _canonical_slugs.add(_pp.name)
-except Exception:
-    pass
+_dynamic_canonical_provider_slugs: set[str] = set()
+
+
+def _refresh_canonical_providers_from_plugins() -> None:
+    """Rebuild plugin-derived model-picker entries in place."""
+    try:
+        from providers import (
+            is_plugin_managed_provider_id,
+            list_providers,
+        )
+        profiles = list_providers()
+    except Exception:
+        CANONICAL_PROVIDERS[:] = list(_STATIC_CANONICAL_PROVIDERS)
+        _dynamic_canonical_provider_slugs.clear()
+        _canonical_slugs.clear()
+        _canonical_slugs.update(entry.slug for entry in CANONICAL_PROVIDERS)
+        _refresh_derived_provider_indexes()
+        return
+
+    active_provider_ids = {profile.name for profile in profiles}
+    CANONICAL_PROVIDERS[:] = [
+        entry
+        for entry in _STATIC_CANONICAL_PROVIDERS
+        if (
+            not is_plugin_managed_provider_id(entry.slug)
+            or entry.slug in active_provider_ids
+        )
+    ]
+    _dynamic_canonical_provider_slugs.clear()
+    _canonical_slugs.clear()
+    _canonical_slugs.update(entry.slug for entry in CANONICAL_PROVIDERS)
+
+    try:
+        for profile in profiles:
+            if profile.name in _canonical_slugs:
+                continue
+            if profile.auth_type in {
+                "oauth_device_code",
+                "oauth_external",
+                "external_process",
+                "aws_sdk",
+                "copilot",
+                "vertex",
+            }:
+                continue
+            label = profile.display_name or profile.name
+            description = profile.description or f"{label} (direct API)"
+            CANONICAL_PROVIDERS.append(
+                ProviderEntry(profile.name, label, description)
+            )
+            _canonical_slugs.add(profile.name)
+            _dynamic_canonical_provider_slugs.add(profile.name)
+    except Exception:
+        pass
+
+    _refresh_derived_provider_indexes()
+
+
+def _refresh_derived_provider_indexes() -> None:
+    """Refresh indexes that mirror ``CANONICAL_PROVIDERS`` in place."""
+    try:
+        from providers import is_provider_plugin_active
+
+        custom_active = is_provider_plugin_active("custom")
+    except Exception:
+        custom_active = False
+
+    provider_labels = globals().get("_PROVIDER_LABELS")
+    if isinstance(provider_labels, dict):
+        provider_labels.clear()
+        provider_labels.update(
+            (entry.slug, entry.label) for entry in CANONICAL_PROVIDERS
+        )
+        if custom_active:
+            provider_labels["custom"] = "Custom endpoint"
+
+    known_names = globals().get("_KNOWN_PROVIDER_NAMES")
+    if isinstance(known_names, set):
+        known_names.clear()
+        known_names.update(_canonical_slugs)
+        known_names.update(
+            alias
+            for alias, canonical in _PROVIDER_ALIASES.items()
+            if canonical in _canonical_slugs
+        )
+        if custom_active:
+            known_names.add("custom")
+
+
+_refresh_canonical_providers_from_plugins()
 
 # Derived dicts — used throughout the codebase
 _PROVIDER_LABELS = {p.slug: p.label for p in CANONICAL_PROVIDERS}
-_PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named provider
+try:
+    from providers import is_provider_plugin_active
+
+    _custom_provider_active = is_provider_plugin_active("custom")
+except Exception:
+    _custom_provider_active = False
+if _custom_provider_active:
+    _PROVIDER_LABELS["custom"] = "Custom endpoint"
 
 
 # ---------------------------------------------------------------------------
@@ -1930,11 +2015,14 @@ def _fetch_novita_pricing(
 
 
 # All provider IDs and aliases that are valid for the provider:model syntax.
-_KNOWN_PROVIDER_NAMES: set[str] = (
-    set(_PROVIDER_LABELS.keys())
-    | set(_PROVIDER_ALIASES.keys())
-    | {"openrouter", "custom"}
-)
+_KNOWN_PROVIDER_NAMES: set[str] = set()
+_refresh_derived_provider_indexes()
+try:
+    from providers import register_provider_refresh_hook
+
+    register_provider_refresh_hook(_refresh_canonical_providers_from_plugins)
+except Exception:
+    pass
 
 
 def list_available_providers() -> list[dict[str, str]]:
@@ -1946,8 +2034,9 @@ def list_available_providers() -> list[dict[str, str]]:
     Derives the provider list from :data:`CANONICAL_PROVIDERS` (single
     source of truth shared with ``hermes model``, ``/model``, etc.).
     """
-    # Derive display order from canonical list + custom
-    provider_order = [p.slug for p in CANONICAL_PROVIDERS] + ["custom"]
+    provider_order = [p.slug for p in CANONICAL_PROVIDERS]
+    if "custom" in _PROVIDER_LABELS and "custom" not in provider_order:
+        provider_order.append("custom")
 
     # Build reverse alias map
     aliases_for: dict[str, list[str]] = {}

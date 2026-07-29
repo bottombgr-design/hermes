@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from utils import atomic_replace, fast_safe_load
+from utils import atomic_replace, env_var_enabled, fast_safe_load
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -48,6 +48,12 @@ _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
 # in-process cache prevents redundant network calls, but the print, the
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
+
+_ISOLATION_FLAGS = (
+    "HERMES_SAFE_MODE",
+    "HERMES_IGNORE_USER_CONFIG",
+    "HERMES_IGNORE_RULES",
+)
 
 
 def get_secret_source(env_var: str) -> str | None:
@@ -185,6 +191,18 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     _sanitize_loaded_credentials()
 
 
+def _sanitize_env_lines(lines: list[str]) -> list[str]:
+    """Normalize .env formatting without interpreting assignment values."""
+    sanitized: list[str] = []
+    for line in lines:
+        raw = line.rstrip("\r\n")
+        stripped = raw.strip()
+        sanitized.append(
+            (raw if not stripped or stripped.startswith("#") else stripped) + "\n"
+        )
+    return sanitized
+
+
 def _sanitize_env_file_if_needed(path: Path) -> None:
     """Pre-sanitize a .env file before python-dotenv reads it.
 
@@ -198,16 +216,11 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
     to the errors=replace corruption path. Order of BOM checks matters:
     UTF-32-LE's BOM starts with UTF-16-LE's FF FE.
 
-    ``hermes_cli.config._sanitize_env_lines`` normalizes line endings while
-    treating content after the first ``=`` as opaque for boundary discovery.
+    ``_sanitize_env_lines`` normalizes line endings while treating content
+    after the first ``=`` as opaque for boundary discovery.
     """
     if not path.exists():
         return
-    try:
-        from hermes_cli.config import _sanitize_env_lines
-    except ImportError:
-        return  # early bootstrap — config module not available yet
-
     try:
         raw = path.read_bytes()
     except Exception:
@@ -306,6 +319,15 @@ def load_hermes_dotenv(
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
     loaded: list[Path] = []
+    protected_isolation = {
+        name: os.environ.get(name, "1")
+        for name in _ISOLATION_FLAGS
+        if env_var_enabled(name)
+    }
+
+    def restore_isolation() -> None:
+        # Explicit process isolation must outrank user/project/managed dotenv.
+        os.environ.update(protected_isolation)
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
@@ -319,6 +341,7 @@ def load_hermes_dotenv(
 
     if user_env.exists():
         _load_dotenv_with_fallback(user_env, override=True)
+        restore_isolation()
         loaded.append(user_env)
 
     # Load .op.env AFTER .env so that .env values win, but the bootstrap
@@ -334,13 +357,17 @@ def load_hermes_dotenv(
     op_env = home_path / ".op.env"
     if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
         _load_dotenv_with_fallback(op_env, override=False)
+        restore_isolation()
 
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
+        restore_isolation()
         loaded.append(project_env_path)
 
     _apply_external_secret_sources(home_path)
+    restore_isolation()
     _apply_managed_env()
+    restore_isolation()
 
     return loaded
 
