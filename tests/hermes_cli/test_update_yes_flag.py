@@ -12,6 +12,9 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from hermes_cli import main as hermes_main
 from hermes_cli.main import cmd_update
 
 
@@ -45,6 +48,40 @@ def _make_run_side_effect(
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     return side_effect
+
+
+@pytest.fixture(autouse=True)
+def _patch_pinned_git_update_helpers(monkeypatch):
+    old_sha = "a" * 40
+    target_sha = "b" * 40
+    empty_sync = {"copied": [], "updated": [], "user_modified": [], "cleaned": []}
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda *a, **kw: empty_sync)
+    monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda: [])
+    monkeypatch.setattr(
+        hermes_main,
+        "_capture_update_checkout_identity",
+        lambda *a: {"ref": "refs/heads/main", "head": old_sha, "error": None},
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_git_update_commit_sha",
+        lambda _g, _r, ref: target_sha
+        if ref.startswith("refs/remotes/origin/")
+        else old_sha,
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_ensure_update_merge_base",
+        lambda *a, **kw: {"merge_base": old_sha, "error": None, "fetch_steps": []},
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_apply_pinned_default_update",
+        lambda *a, **kw: {"success": True, "safe_to_restore_stash": True, "error": None},
+    )
+    monkeypatch.setattr(
+        hermes_main, "_rollback_pinned_default_update", lambda *a, **kw: True
+    )
 
 
 class TestUpdateYesConfigMigration:
