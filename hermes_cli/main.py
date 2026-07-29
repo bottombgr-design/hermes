@@ -7338,7 +7338,7 @@ def _update_marker_path() -> Path:
 
 
 def _lazy_refresh_marker_path() -> Path:
-    return PROJECT_ROOT / ".lazy-refresh-incomplete"
+    return PROJECT_ROOT / _early_recovery_mod.LAZY_REFRESH_MARKER_NAME
 
 
 def _clear_marker_file(path: Path, *, label: str) -> None:

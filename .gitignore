@@ -146,11 +146,14 @@ docs/superpowers/*
 # Persistent dev sandbox dir (scripts/dev-sandbox.sh --persistent)
 .hermes-sandbox/
 
-# Interrupted-update breadcrumb + recovery lock written next to the shared venv
-# by `hermes update` / launch-time self-heal. Runtime state, never a code change
-# — ignore so `git status` stays clean and update's autostash skips them.
+# Interrupted-update breadcrumbs + recovery lock written next to the shared venv
+# by `hermes update` / lazy dependency refresh / launch-time self-heal. Runtime
+# state, never a code change — ignore so `git status` stays clean and update's
+# autostash skips them. The `.runtime` suffix keeps the live lazy-refresh marker
+# distinct from the legacy tracked breadcrumb shipped before the migration.
 .update-incomplete
 .update-incomplete.lock
+.lazy-refresh-incomplete.runtime
 
 # Checkout fingerprint the __pycache__ tree was last validated against
 # (launch-time stale-bytecode sweep). Runtime state, never a code change.
