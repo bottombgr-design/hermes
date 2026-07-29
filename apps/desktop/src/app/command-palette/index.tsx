@@ -23,6 +23,7 @@ import {
   Cpu,
   Download,
   Egg,
+  FolderOpen,
   GitBranch,
   Globe,
   type IconComponent,
@@ -59,6 +60,7 @@ import {
 } from '@/store/command-palette'
 import { $bindings } from '@/store/keybinds'
 import { openPetGenerate } from '@/store/pet-generate'
+import { openProjectSwitcher } from '@/store/project-switcher'
 import { requestStartWorkSession } from '@/store/projects'
 import { $connection } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
@@ -521,6 +523,13 @@ export function CommandPalette() {
             keywords: ['chat', 'create'],
             label: cc.nav.newChat.title,
             run: go(NEW_CHAT_ROUTE)
+          },
+          {
+            icon: FolderOpen,
+            id: 'nav-switch-project',
+            keywords: ['project', 'workspace', 'folder', 'recent', 'switch', 'cwd'],
+            label: t.projectSwitcher.openLabel,
+            run: openProjectSwitcher
           },
           ...(canOpenNewWindow()
             ? [
