@@ -10700,14 +10700,44 @@ def _(rid, params: dict) -> dict:
         return err
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
+        # Host pipe/respawn failure can leave `running` stuck when no turn.end
+        # will arrive. Mirror in-process dead-thread recovery, but only when
+        # this sid has no pending host completion AND the inflight snapshot is
+        # still the same object observed before interrupt() — a replaced
+        # inflight means a successor submit already claimed the session.
+        host_unreachable = False
+        inflight_at_interrupt = None
         if session.get("running"):
+            with session["history_lock"]:
+                inflight_at_interrupt = session.get("inflight_turn")
             try:
                 _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
             except Exception as exc:
-                return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
+                host_unreachable = True
+                print(
+                    f"[tui_gateway] compute-host interrupt failed for {sid}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
         with session["history_lock"]:
             session["_turn_cancel_requested"] = True
             session["queued_prompt"] = None
+            if host_unreachable and session.get("running"):
+                # Recheck under the session lock. Pending may already have been
+                # popped by _fail_pending_turns; a successor drain/submit may
+                # own running with a replaced inflight dict.
+                try:
+                    pending_for_sid = _get_compute_host_supervisor().has_pending_turn(sid)
+                except Exception:
+                    pending_for_sid = True  # fail closed: prefer waiter teardown
+                inflight_now = session.get("inflight_turn")
+                if (
+                    not pending_for_sid
+                    and inflight_now is not None
+                    and inflight_now is inflight_at_interrupt
+                ):
+                    session["running"] = False
+                    _clear_inflight_turn(session)
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
