@@ -2819,6 +2819,37 @@ class AIAgent:
         tags).  The truncation guard ("don't overwrite a larger log with
         fewer messages") is preserved so resume + branch don't clobber a
         fuller existing snapshot.
+
+        Scope: one snapshot per physical session_id, not one per logical
+        conversation, and the relationship between the two depends on how
+        that session_id came to exist:
+
+        - Context compression defaults to ``compression.in_place: true``
+          (``agent/conversation_compression.py``), which rewrites the
+          existing session_id's own history in place -- the snapshot file
+          keeps accumulating the same conversation under the same session_id
+          across compressions in the default configuration. Only the
+          opt-out "rotation" mode (``compression.in_place: false``) forks a
+          NEW child session_id via ``parent_session_id``, at which point a
+          fresh, separate snapshot file starts.
+        - ``/branch`` (``gateway/slash_commands.py::_handle_branch_command``)
+          always creates a new child session_id, but COPIES the parent's
+          existing history into it before the branch continues -- the new
+          snapshot is not "empty, then new messages only"; it starts as a
+          full copy and grows from there.
+
+        Because of this, don't assume a shorter-looking snapshot always
+        means a rotation-mode split happened, or that a given snapshot's
+        message count reflects only "new" activity. And don't treat this
+        snapshot (or any single session_id's own row) as authoritative for
+        cross-session lineage: the legacy JSONL fallback was removed in spec
+        002 (``gateway/session.py::load_transcript()``) -- state.db is
+        canonical, but a plain per-session read only returns that one
+        session_id's own messages. Full-conversation views that need to
+        follow a rotation-mode compression or branch chain must use the
+        lineage-aware state.db readers (``SessionDB.get_compression_lineage``,
+        ``SessionDB.export_session_lineage``), not this snapshot file or a
+        single-session_id DB read (issue #2229).
         """
         if not getattr(self, "_session_json_enabled", False):
             return
