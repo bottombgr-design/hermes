@@ -278,7 +278,17 @@ def test_subprocess_killall_hermes_blocked():
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
-def test_systemctl_status_passes_through():
+@pytest.fixture
+def harmless_systemctl(tmp_path, monkeypatch):
+    """Provide a no-op systemctl for non-systemd development hosts."""
+    executable = tmp_path / "systemctl"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    return "systemctl"
+
+
+def test_systemctl_status_passes_through(harmless_systemctl):
     """Read-only systemctl probes (status/show/list-units) are fine."""
     # Run with check=False so we don't fail on the gateway's exit code.
     r = subprocess.run(
@@ -290,7 +300,7 @@ def test_systemctl_status_passes_through():
     assert r is not None  # Did not raise — the guard let it through.
 
 
-def test_systemctl_show_passes_through():
+def test_systemctl_show_passes_through(harmless_systemctl):
     r = subprocess.run(
         ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
         capture_output=True,
@@ -300,7 +310,7 @@ def test_systemctl_show_passes_through():
     assert r is not None
 
 
-def test_systemctl_list_units_passes_through():
+def test_systemctl_list_units_passes_through(harmless_systemctl):
     r = subprocess.run(
         ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
         capture_output=True,
@@ -310,7 +320,7 @@ def test_systemctl_list_units_passes_through():
     assert r is not None
 
 
-def test_systemctl_unrelated_unit_passes_through():
+def test_systemctl_unrelated_unit_passes_through(harmless_systemctl):
     """systemctl restart of a non-hermes unit is allowed (we only protect hermes)."""
     # Use --dry-run so we don't actually try to restart anything; just
     # verify the guard doesn't block the call. systemctl supports
