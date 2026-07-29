@@ -247,18 +247,36 @@ def _computer_use_max_image_dimension() -> Optional[int]:
     return dim if dim > 0 else None
 
 
-def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """Return the environment dict for spawning cua-driver.
+def cua_driver_child_env(
+    base_env: Optional[Dict[str, str]] = None,
+    *,
+    driver_cmd: Optional[str] = None,
+) -> Dict[str, str]:
+    """Return the safe, policy-complete environment for cua-driver.
 
-    Starts from ``base_env`` (defaults to ``os.environ``) and, when telemetry
-    is disabled (the default), injects ``CUA_DRIVER_RS_TELEMETRY_ENABLED=0``.
-    When the user has opted in, the var is left untouched so cua-driver uses
-    its own default. Used by every cua-driver spawn site (MCP backend, status,
-    doctor, install) so the policy is applied consistently.
+    Native Wayland is enabled here — the one process-spawn choke point — rather
+    than relying on a user finding an upstream environment flag. The Linux
+    policy is intentionally conservative: ``auto`` requires a verified
+    graphical Wayland session and a driver that passes Hermes' capability gate;
+    ``disabled`` overrides even an inherited upstream flag. No portal consent
+    is requested by this helper.
     """
     env = dict(base_env if base_env is not None else os.environ)
     if _cua_telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
+    if sys.platform == "linux":
+        try:
+            from tools.computer_use.linux_wayland import native_wayland_child_env
+            env = native_wayland_child_env(
+                driver_cmd,
+                _computer_use_cfg(),
+                env,
+            )
+        except Exception as exc:
+            # Never make an existing X11 session unusable because an optional
+            # diagnostic helper failed. The helper's absence simply leaves the
+            # upstream Wayland opt-in untouched.
+            logger.debug("native Wayland environment policy unavailable: %s", exc)
     return env
 
 
@@ -384,7 +402,7 @@ def _resolve_mcp_invocation(
             # cua-driver is a third-party binary — never hand it provider
             # API keys via inherited env (same policy as the MCP and CLI
             # fallback spawns below; #53503/#55709/#58889 lineage).
-            env=_sanitize_subprocess_env(cua_driver_child_env()),
+            env=_sanitize_subprocess_env(cua_driver_child_env(driver_cmd=driver_cmd)),
         )
     except Exception:
         return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
@@ -447,7 +465,7 @@ def _cua_driver_supports_no_overlay(driver_cmd: str) -> bool:
             [driver_cmd, "--help"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3.0,
             stdin=subprocess.DEVNULL,
-            env=_sanitize_subprocess_env(cua_driver_child_env()),
+            env=_sanitize_subprocess_env(cua_driver_child_env(driver_cmd=driver_cmd)),
         )
         help_text = (proc.stdout or "") + (proc.stderr or "")
         return "--no-overlay" in help_text
@@ -591,7 +609,7 @@ def cua_driver_update_check(*, timeout: Optional[float] = None) -> Optional[Dict
             stdin=subprocess.DEVNULL,
             # Sanitized like every other cua-driver spawn: third-party
             # binary, no inherited provider keys (#53503/#55709/#58889).
-            env=_sanitize_subprocess_env(cua_driver_child_env()),
+            env=_sanitize_subprocess_env(cua_driver_child_env(driver_cmd=driver_cmd)),
         )
     except Exception:
         return None
@@ -956,7 +974,7 @@ class _CuaDriverSession:
                 args=args,
                 # Apply the telemetry policy first (default: disabled), then
                 # sanitize Hermes-managed secrets out of the child env.
-                env=_sanitize_subprocess_env(cua_driver_child_env()),
+                env=_sanitize_subprocess_env(cua_driver_child_env(driver_cmd=driver_cmd)),
             )
 
             async with stdio_client(params) as (read, write):
@@ -1330,7 +1348,7 @@ class _CuaDriverSession:
                 try:
                     proc = _subprocess.run(
                         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(15.0, timeout),
-                        env=_sanitize_subprocess_env(cua_driver_child_env()),
+                        env=_sanitize_subprocess_env(cua_driver_child_env(driver_cmd=driver_cmd)),
                     )
                 except Exception as e:  # pragma: no cover - subprocess spawn failure
                     raise RuntimeError(f"cua-driver CLI fallback for {name} failed to spawn: {e}") from e

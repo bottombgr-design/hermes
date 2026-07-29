@@ -151,6 +151,22 @@ NOT conclude "cua-driver can't drive this app" — climb the ladder. If
 `delivery_mode="foreground"` returns `code:"foreground_unsupported"`, the
 driver is too old; tell the user to update cua-driver.
 
+### Linux native Wayland safety
+
+On a native Wayland session, a raw pointer or keyboard event normally goes to
+whichever surface the compositor currently focuses. That is **not** safe
+background targeting. Hermes therefore relies on cua-driver to verify an exact
+activation adapter first; if it cannot, the result must be a structured refusal
+(`background_unavailable`, `wrong_target_prevented`, or
+`foreground_unsupported`) rather than a guessed click.
+
+Run `hermes computer-use doctor` from the graphical login session. It reports
+whether the driver sees native Wayland, AT-SPI, the desktop portal, PipeWire,
+and a compositor-appropriate portal backend. On Arch, install only the matching
+portal backend (`-gnome`, `-kde`, `-hyprland`, or `-wlr`) rather than piling all
+of them together. The first portal operation may ask the user for consent; never
+accept it on their behalf.
+
 ### Key shortcuts vary per platform
 
 Use the host's idiomatic modifier:
