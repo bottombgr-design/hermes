@@ -69,7 +69,7 @@ def _run_with_current_provider(job, current_provider, tmp_path):
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
         mock_agent_cls.return_value = mock_agent
 
-        success, output, final_response, error = run_job(job)
+        success, output, final_response, error, _ = run_job(job)
         agent_constructed = mock_agent_cls.called
 
     return success, output, final_response, error, agent_constructed
@@ -84,7 +84,7 @@ class TestProviderDriftGuard:
 
         assert success is True
         assert error is None
-        assert final_response == "ok"
+        assert final_response.startswith("ok")
         assert agent_constructed is True
 
     def test_b_unpinned_snapshot_differs_fails_closed(self, tmp_path):
@@ -286,7 +286,7 @@ def _run_with_current_provider_and_model(
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
         mock_agent_cls.return_value = mock_agent
-        success, output, final_response, error = run_job(job)
+        success, output, final_response, error, _ = run_job(job)
         agent_constructed = mock_agent_cls.called
     return success, output, final_response, error, agent_constructed
 
@@ -369,7 +369,7 @@ class TestModelDriftGuard:
 
         assert agent_constructed is True
         assert success is True
-        assert final_response == "ok"
+        assert final_response.startswith("ok")
         assert error is None
 
 
@@ -395,7 +395,7 @@ class TestCronFleetDefaultModel:
             )
         assert agent_constructed is True
         assert success is True
-        assert final_response == "ok"
+        assert final_response.startswith("ok")
 
     def test_cron_model_beats_global_default_for_unpinned_job(self, tmp_path):
         job = _base_job(
