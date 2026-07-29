@@ -227,6 +227,7 @@ def test_normalize_observation_scopes_keywords_pass_through():
     assert _normalize_observation_scopes("per_tag") == "per_tag"
     assert _normalize_observation_scopes("combined") == "combined"
     assert _normalize_observation_scopes(" all_combinations ") == "all_combinations"
+    assert _normalize_observation_scopes("shared") == "shared"
 
 
 def test_normalize_observation_scopes_unknown_keyword_is_none():
@@ -336,9 +337,10 @@ class TestConfig:
         p = provider_with_config(recall_types=[])
         assert p._recall_types == ["observation"]
 
-    def test_observation_scopes_keyword_config(self, provider_with_config):
-        p = provider_with_config(observation_scopes="per_tag")
-        assert p._observation_scopes == "per_tag"
+    @pytest.mark.parametrize("scope", ["per_tag", "shared"])
+    def test_observation_scopes_keyword_config(self, provider_with_config, scope):
+        p = provider_with_config(observation_scopes=scope)
+        assert p._observation_scopes == scope
 
     def test_observation_scopes_custom_list_config(self, provider_with_config):
         p = provider_with_config(
@@ -673,11 +675,12 @@ class TestToolHandlers:
         item = provider._client.aretain_batch.call_args.kwargs["items"][0]
         assert "tags" not in item
 
-    def test_retain_passes_observation_scopes(self, provider_with_config):
-        p = provider_with_config(observation_scopes="per_tag")
+    @pytest.mark.parametrize("scope", ["per_tag", "shared"])
+    def test_retain_passes_observation_scopes(self, provider_with_config, scope):
+        p = provider_with_config(observation_scopes=scope)
         p.handle_tool_call("hindsight_retain", {"content": "likes dark mode"})
         item = p._client.aretain_batch.call_args.kwargs["items"][0]
-        assert item["observation_scopes"] == "per_tag"
+        assert item["observation_scopes"] == scope
 
     def test_retain_omits_observation_scopes_by_default(self, provider):
         provider.handle_tool_call("hindsight_retain", {"content": "hello"})
