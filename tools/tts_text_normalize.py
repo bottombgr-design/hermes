@@ -258,7 +258,71 @@ def flatten_newlines_for_payload(text: str) -> str:
     return text.strip()
 
 
-def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
+def get_pronunciation_substitutions(tts_config: object) -> dict[str, str]:
+    """Return a validated pronunciation map from a TTS config object.
+
+    A malformed map is rejected as a whole rather than partially applied, so a
+    typo in user configuration cannot produce surprising partial substitutions.
+    Empty source strings are ignored because they cannot identify a term.
+    """
+    if not isinstance(tts_config, dict):
+        return {}
+    pronunciation = tts_config.get("pronunciation")
+    if not isinstance(pronunciation, dict):
+        return {}
+    substitutions = pronunciation.get("substitutions")
+    return _validate_pronunciation_substitutions(substitutions)
+
+
+def _validate_pronunciation_substitutions(substitutions: object) -> dict[str, str]:
+    if not isinstance(substitutions, dict):
+        return {}
+    if not all(isinstance(source, str) and isinstance(replacement, str)
+               for source, replacement in substitutions.items()):
+        return {}
+    return {
+        source: replacement
+        for source, replacement in substitutions.items()
+        if isinstance(source, str) and isinstance(replacement, str) and source
+    }
+
+
+def apply_pronunciation_substitutions(text: str, substitutions: object) -> str:
+    """Apply a validated pronunciation map in one case-insensitive pass.
+
+    Source terms are treated as literals and must not touch an adjacent word
+    character.  This supports punctuation-bearing terms such as ``C++`` and
+    ``.NET`` where ``\\b`` boundaries do not work.  A callback inserts the
+    configured replacement literally, including backslashes.  One alternation
+    handles all terms so replacement output is never matched again.
+    """
+    validated = _validate_pronunciation_substitutions(substitutions)
+    if not text or not validated:
+        return text
+
+    # Longest terms win when one literal is a prefix of another.  The remaining
+    # sort keys make ambiguous case-insensitive duplicates deterministic and
+    # independent of mapping insertion order.
+    sources = sorted(validated, key=lambda source: (-len(source), source.casefold(), source))
+    replacements: dict[str, str] = {}
+    alternatives: list[str] = []
+    for index, source in enumerate(sources):
+        group_name = f"term_{index}"
+        alternatives.append(f"(?P<{group_name}>{re.escape(source)})")
+        replacements[group_name] = validated[source]
+
+    pattern = re.compile(
+        rf"(?<!\w)(?:{'|'.join(alternatives)})(?!\w)",
+        flags=re.IGNORECASE,
+    )
+    return pattern.sub(lambda match: replacements[match.lastgroup or ""], text)
+
+
+def prepare_spoken_text(
+    text: str,
+    max_chars: int | None = 4000,
+    pronunciation_substitutions: object = None,
+) -> str:
     """Return a TTS-friendly script from assistant text.
 
     Deterministic cleanup, not a semantic rewrite: it removes ``<think>``
@@ -267,8 +331,16 @@ def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
     turns visual line formatting into speakable sentence pauses, and flattens
     the result to a single line so newline-sensitive providers (Kokoro) speak
     the whole script.
+
+    When *pronunciation_substitutions* is a valid non-empty ``dict[str, str]``,
+    protected non-spoken blocks are removed first. Each source→replacement pair
+    is then applied case-insensitively without matching adjacent word characters,
+    before Markdown stripping.
     """
     spoken = strip_nonspoken_blocks(text)
+    spoken = apply_pronunciation_substitutions(
+        spoken, pronunciation_substitutions
+    )
     spoken = strip_markdown_for_tts(spoken)
     spoken = normalize_symbols_for_tts(spoken)
     spoken = smooth_whitespace_for_tts(spoken)

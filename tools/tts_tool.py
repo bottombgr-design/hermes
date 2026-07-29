@@ -2818,15 +2818,21 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
+    tts_config = _load_tts_config()
+
+    # Extract and validate pronunciation substitutions before cleanup.  Invalid
+    # user config is a no-op rather than disabling all TTS normalization.
     try:
-        from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
+        from tools.tts_text_normalize import (
+            get_pronunciation_substitutions,
+            prepare_spoken_text,
+        )
+        substitutions = get_pronunciation_substitutions(tts_config)
+        text = prepare_spoken_text(text, max_chars=None, pronunciation_substitutions=substitutions)
     except Exception:
         text = text.strip()
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
-
-    tts_config = _load_tts_config()
 
     # When the model supplies a speed parameter, inject it into the config
     # so all downstream provider functions pick it up uniformly.
@@ -3376,6 +3382,12 @@ def stream_tts_to_speaker(
     try:
         output_stream = None
         tts_config = _load_tts_config()
+        from tools.tts_text_normalize import (
+            apply_pronunciation_substitutions,
+            get_pronunciation_substitutions,
+        )
+
+        streaming_pronunciation = get_pronunciation_substitutions(tts_config)
 
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
         # per-sentence sync synthesis (universal — edge + every non-streamer).
@@ -3438,6 +3450,13 @@ def stream_tts_to_speaker(
             if streamer is None:
                 _speak_via_sync(cleaned)
                 return
+            # Apply the same literal pronunciation map used by synchronous and
+            # gateway streaming TTS. The sync fallback below re-enters
+            # text_to_speech_tool(), so only apply it on this direct streamer path.
+            if streaming_pronunciation:
+                cleaned = apply_pronunciation_substitutions(
+                    cleaned, streaming_pronunciation
+                )
             # Truncate very long sentences to the provider's per-request cap.
             if stream_max_len and len(cleaned) > stream_max_len:
                 cleaned = cleaned[:stream_max_len]
