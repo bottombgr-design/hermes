@@ -2387,6 +2387,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "provider": runtime.get("provider"),
         "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"),
+        "responses_transport": runtime.get("responses_transport", "sse"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
@@ -2410,6 +2411,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "provider": runtime.get("provider"),
         "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"),
+        "responses_transport": runtime.get("responses_transport", "sse"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
@@ -2470,6 +2472,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "provider": runtime.get("provider"),
                     "requested_provider": runtime.get("requested_provider"),
                     "api_mode": runtime.get("api_mode"),
+                    "responses_transport": runtime.get("responses_transport", "sse"),
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
@@ -4614,6 +4617,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "provider": runtime_kwargs.get("provider"),
             "requested_provider": runtime_kwargs.get("requested_provider"),
             "api_mode": runtime_kwargs.get("api_mode"),
+            "responses_transport": runtime_kwargs.get("responses_transport", "sse"),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
@@ -4628,6 +4632,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime["requested_provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
+                runtime["responses_transport"],
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
@@ -19268,6 +19273,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime.get("provider", ""),
                 runtime.get("requested_provider", ""),
                 runtime.get("api_mode", ""),
+                runtime.get("responses_transport", "sse"),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.
@@ -19286,7 +19292,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         ``_session_model_overrides`` is in-memory only, so before persistence
         a restart silently reverted every session to the global default model.
-        The non-secret parts (model/provider/base_url) are written through to
+        The non-secret parts (model/provider/base_url/responses_transport) are written through to
         the session store when /model runs (and cleared on /new); here we read
         them back on first use and re-resolve credentials via the normal
         runtime provider resolution — api_key is never persisted to disk.
@@ -19313,6 +19319,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "model": persisted.get("model"),
             "provider": persisted.get("provider"),
             "base_url": persisted.get("base_url"),
+            "responses_transport": persisted.get("responses_transport"),
         }
         provider = persisted.get("provider")
         if provider:
@@ -19325,6 +19332,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 override["api_key"] = runtime.get("api_key")
                 override["api_mode"] = runtime.get("api_mode")
                 override["credential_pool"] = runtime.get("credential_pool")
+                if not override.get("responses_transport"):
+                    override["responses_transport"] = runtime.get(
+                        "responses_transport", "sse"
+                    )
                 if not override.get("base_url"):
                     override["base_url"] = runtime.get("base_url")
             except Exception:
@@ -19354,7 +19365,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
+        for key in (
+            "provider",
+            "api_key",
+            "base_url",
+            "api_mode",
+            "responses_transport",
+            "credential_pool",
+        ):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val

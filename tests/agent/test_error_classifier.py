@@ -1015,6 +1015,23 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.timeout
         assert result.retryable is True
 
+    def test_websocket_post_send_failure_is_not_replayable(self):
+        from agent.codex_websocket_transport import WebSocketStartedError
+
+        error = WebSocketStartedError(
+            "connection closed after response.create",
+            retryable=True,
+        )
+        result = classify_api_error(
+            error,
+            provider="openai-codex",
+            model="gpt-5-codex",
+        )
+
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is False
+        assert result.should_fallback is False
+
     def test_connect_error(self):
         e = ConnectError("Connection refused")
         result = classify_api_error(e)
@@ -2325,5 +2342,4 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="ollama", model="m")
         assert result.reason == FailoverReason.context_overflow
-
 
