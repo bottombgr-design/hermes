@@ -618,6 +618,7 @@ def install_distribution(
     first if you want to preview + prompt the user before calling this.
     """
     from hermes_cli.profiles import (
+        _maybe_register_gateway_service,
         check_alias_collision,
         create_wrapper_script,
     )
@@ -645,6 +646,11 @@ def install_distribution(
             collision = check_alias_collision(plan.manifest.name)
             if collision is None:
                 create_wrapper_script(plan.manifest.name)
+
+        # Register the s6 gateway slot so `hermes -p <name> gateway start`
+        # works immediately after install.  Mirrors create_profile()'s
+        # Phase 4 call.  No-op on host (systemd/launchd/windows).
+        _maybe_register_gateway_service(plan.manifest.name)
 
         return plan
 
