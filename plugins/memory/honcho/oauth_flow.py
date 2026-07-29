@@ -42,16 +42,21 @@ def _display_config_path(path: object) -> str:
     """Home-relative display string for the consent screen.
 
     The absolute path (username + home layout) never leaves the machine — it's
-    only shown to the user. Collapse ``$HOME`` to ``~``; for a path outside
-    home, send the bare filename rather than leak an arbitrary absolute path.
+    only shown to the user. Collapse ``$HOME`` to ``~`` using forward-slash
+    separators (matches what the user typed in their shell, regardless of
+    the host OS); for a path outside home, send the bare filename rather
+    than leak an arbitrary absolute path.
     """
     from pathlib import Path as _Path
 
     p = _Path(str(path))
     try:
-        return "~/" + str(p.relative_to(_Path.home()))
+        rel = p.relative_to(_Path.home())
     except ValueError:
         return p.name
+    # Always use forward-slash separators so the displayed path matches
+    # what the user would type in a shell, regardless of platform.
+    return "~/" + rel.as_posix()
 
 
 @dataclass(frozen=True)
