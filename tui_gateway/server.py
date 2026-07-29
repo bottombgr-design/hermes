@@ -6965,8 +6965,14 @@ def _handle_busy_submit(
     # dashboard's interrupt/steer preference unless its connection also holds
     # conversation.control.
     if not allow_control:
-        _enqueue_prompt(session, text, transport)
-        session["last_active"] = time.time()
+        with session["history_lock"]:
+            # The live turn can finish after prompt.submit's first busy check.
+            # Re-check under the same lock used by the queue drain so we never
+            # enqueue just after teardown has already looked for pending work.
+            if not session.get("running"):
+                return None
+            _enqueue_prompt(session, text, transport)
+            session["last_active"] = time.time()
         return _ok(rid, {"status": "queued"})
 
     mode = "queue" if queued else _load_busy_input_mode()
