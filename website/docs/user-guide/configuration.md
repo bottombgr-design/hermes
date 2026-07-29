@@ -1642,13 +1642,15 @@ Focus view is **display-only**. It never edits conversation history, the system 
 
 ### Runtime-metadata footer (gateway only)
 
-When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. The current footer can show the model, context-window percentage, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
+When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. The footer can show the model, session-configured reasoning-effort level, Priority Processing state, context-window percentage, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance. The `reasoning_effort` field follows session-scoped `/reasoning` overrides as well as the global setting; `reasoning` is accepted as a shorter alias. The optional `fast` field decorates the model with `⚡️` only while Priority Processing is effective for that session (or renders standalone when the model field is hidden). Provider-specific clamping may still adjust the value sent to a model.
 
 ```yaml
 display:
   runtime_footer:
     enabled: true
-    fields: ["model", "context_pct", "cwd"]   # supported fields: model, context_pct, cwd
+    fields: ["model", "reasoning_effort", "fast", "context_pct", "dir"]
+    separator: " • "
+    # supported: model, reasoning_effort (or reasoning), fast, context_pct, cwd, dir
 ```
 
 The `/footer` slash command toggles this at runtime in any session.
@@ -1656,7 +1658,7 @@ The `/footer` slash command toggles this at runtime in any session.
 Example footer appended to a Telegram/Discord/Slack reply:
 
 ```
-— claude-opus-4.7 · 12 tool calls · 2m 14s · $0.042
+gpt-5.6-sol ⚡️ • 🧠 med • 42% • hermes
 ```
 
 Only the **final** message of a turn gets the footer; interim updates stay clean.
