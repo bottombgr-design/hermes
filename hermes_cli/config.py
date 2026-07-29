@@ -117,9 +117,10 @@ def _warn_config_parse_failure(
     ``hermes config set``.
 
     ``fallback`` selects the message wording: ``"defaults"`` (fresh process,
-    nothing else to serve) or ``"last-known-good"`` (in-process retention of
+    nothing else to serve), ``"last-known-good"`` (in-process retention of
     the previously loaded config — see the codex#31188 port in
-    ``_load_config_impl``).
+    ``_load_config_impl``), or ``"refuse-write"`` (a mutation path refused to
+    overwrite the broken file).
     """
     try:
         st = config_path.stat()
@@ -137,6 +138,11 @@ def _warn_config_parse_failure(
             f"Failed to parse {config_path}: {exc}. "
             f"Keeping the previously loaded config for this process — "
             f"edits to config.yaml are being IGNORED until the YAML is fixed."
+        )
+    elif fallback == "refuse-write":
+        msg = (
+            f"Failed to parse {config_path}: {exc}. "
+            f"Refusing to overwrite config.yaml until the YAML is fixed."
         )
     else:
         msg = (
@@ -7530,14 +7536,33 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
-def require_readable_config_before_write(config_path: Optional[Path] = None) -> None:
-    """Refuse to replace an existing config.yaml that cannot be read."""
+def require_readable_config_before_write(
+    config_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Refuse to replace an existing config.yaml that cannot be read or parsed.
+
+    Guards two collapse-to-empty failure modes that would otherwise let a
+    read-then-write caller silently wipe user overrides:
+
+    1. **Unreadable** (permissions / broken mount) — byte open fails.
+    2. **Unparseable or non-mapping** — YAML load raises, or the root is a
+       list/scalar. ``read_raw_config()`` / bare ``except`` loaders treat both
+       as ``{}``, so a subsequent write would replace the recoverable file
+       with only the caller's partial dict.
+
+    Returns the loaded mapping (or ``{}`` for a missing / empty / null
+    document) so mutation callers can skip a second parse. A valid empty
+    mapping (``{}``) is allowed through so first-time installs and
+    intentional empty configs still work. On parse failure this also
+    snapshots a ``.corrupt.*.bak`` via :func:`_warn_config_parse_failure`
+    before raising.
+    """
     if config_path is None:
         config_path = get_config_path()
     try:
         config_path.stat()
     except FileNotFoundError:
-        return
+        return {}
     except OSError as exc:
         raise RuntimeError(
             f"Refusing to overwrite {config_path}: existing config.yaml cannot be accessed "
@@ -7553,6 +7578,46 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
             f"({exc}). Fix the file permissions or move it aside first."
         ) from exc
 
+    return _load_user_config_for_mutation(config_path)
+
+
+def _load_user_config_for_mutation(config_path: Path) -> Dict[str, Any]:
+    """Load raw user config for a fail-closed mutation path.
+
+    Fail closed on parse / non-mapping (no bare-except → ``{}`` collapse).
+    Used by :func:`require_readable_config_before_write` and any caller that
+    must re-validate after other work.
+    """
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            loaded = fast_safe_load(f)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Refusing to overwrite {config_path}: existing config.yaml cannot be read "
+            f"({exc}). Fix the file permissions or move it aside first."
+        ) from exc
+    except Exception as exc:
+        _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
+        raise RuntimeError(
+            f"Refusing to overwrite {config_path}: existing config.yaml is not valid YAML "
+            f"({exc}). Fix the file or restore from a .corrupt.*.bak backup first."
+        ) from exc
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        exc = TypeError(
+            f"top-level YAML must be a mapping, got {type(loaded).__name__}"
+        )
+        _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
+        raise RuntimeError(
+            f"Refusing to overwrite {config_path}: top-level YAML must be a mapping, "
+            f"got {type(loaded).__name__}. Fix the file or restore from a "
+            f".corrupt.*.bak backup first."
+        ) from exc
+    return loaded
+
 
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """Fail-closed atomic write for ``config.yaml``.
@@ -7562,14 +7627,16 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     :func:`require_readable_config_before_write` first, so a full-file
     replacement can never silently clobber an existing ``config.yaml`` that
     degraded to an empty dict on read (permission error, broken mount,
-    transient I/O). New-file creation still works when the path is absent.
+    transient I/O, unparseable YAML, or a non-mapping root). New-file
+    creation still works when the path is absent.
 
-    Root cause this guards: ``read_raw_config()`` returns ``{}`` for BOTH an
-    absent file and an unreadable-but-present file. Callers that read then
-    overwrite can't tell the two apart, so an unreadable config would be
-    replaced with only defaults or the single edited section. Routing every
-    write through this helper enforces the invariant in one place rather than
-    relying on each of ~15 independent write sites to remember the guard.
+    Root cause this guards: ``read_raw_config()`` returns ``{}`` for an
+    absent file, an unreadable-but-present file, AND an unparseable file.
+    Callers that read then overwrite can't tell these apart, so a broken
+    config would be replaced with only defaults or the single edited
+    section. Routing every write through this helper enforces the
+    invariant in one place rather than relying on each of ~15 independent
+    write sites to remember the guard.
 
     ``kwargs`` are forwarded verbatim to ``atomic_yaml_write``
     (``sort_keys``, ``default_flow_style``, ``extra_content``, ...).
@@ -9298,17 +9365,10 @@ def set_config_value(key: str, value: str, force: bool = False):
 
     # Otherwise it goes to config.yaml
     # Read the raw user config (not merged with defaults) to avoid
-    # dumping all default values back to the file
+    # dumping all default values back to the file.
     config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
-    
+    user_config = require_readable_config_before_write(config_path)
+
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
     # _set_nested which preserves list-typed nodes; before #17876 the
@@ -9441,14 +9501,7 @@ def unset_config_value(key: str):
         return
 
     config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
+    user_config = require_readable_config_before_write(config_path)
 
     removed = _unset_nested(user_config, key)
 
