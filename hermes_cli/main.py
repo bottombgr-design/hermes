@@ -13785,7 +13785,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Kill any remaining gateway processes not managed by a service.
             # Exclude PIDs that belong to just-restarted services so we don't
             # immediately kill the process that systemd/launchd just spawned.
-            service_pids = _get_service_pids()
+            # Enumerate ALL profiles' service PIDs so sibling-profile launchd
+            # gateways aren't misclassified as manual (#73626).
+            service_pids = _get_service_pids(all_profiles=True)
             manual_pids = find_gateway_pids(
                 exclude_pids=service_pids, all_profiles=True
             )
@@ -13903,7 +13905,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # manager can relaunch with fresh code.
             try:
                 _time.sleep(3.0)
-                _service_pids_after = _get_service_pids()
+                _service_pids_after = _get_service_pids(all_profiles=True)
                 _surviving = find_gateway_pids(
                     exclude_pids=_service_pids_after,
                     all_profiles=True,

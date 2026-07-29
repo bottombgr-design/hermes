@@ -1029,7 +1029,7 @@ def test_gateway_install_noninteractive_skips_legacy_unit_prompt(monkeypatch, tm
 
 
 def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkeypatch):
-    monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda *a, **k: set())
     monkeypatch.setattr(gateway, "is_windows", lambda: False)
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
 
@@ -1043,7 +1043,7 @@ def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkey
     monkeypatch.setattr(gateway.os, "listdir", _no_proc_listdir)
 
     def fake_run(cmd, **kwargs):
-        if cmd[:4] == ["ps", "-A", "eww", "-o"]:
+        if cmd[:3] == ["ps", "-Aww", "-o"]:
             return SimpleNamespace(returncode=1, stdout="", stderr="ps failed")
         if cmd[:3] == ["ps", "-o", "ppid="]:
             # _get_ancestor_pids() walks up the tree; return "no parent" so
@@ -1059,7 +1059,7 @@ def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkey
 def test_find_gateway_pids_includes_restart_managers_without_systemd(monkeypatch):
     calls = []
 
-    monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda *a, **k: set())
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
 
@@ -1140,6 +1140,136 @@ def test_scan_gateway_pids_detects_windows_hermes_exe_case_variants(monkeypatch)
     monkeypatch.setattr(gateway.subprocess, "run", fake_run)
 
     assert gateway._scan_gateway_pids(set(), all_profiles=True) == [2468]
+
+
+# ---------------------------------------------------------------------------
+# _get_service_pids — all-profiles launchd enumeration (#73626)
+# ---------------------------------------------------------------------------
+
+
+class TestGetServicePidsAllProfiles:
+    """_get_service_pids(all_profiles=True) must enumerate every
+    ai.hermes.gateway* launchd agent so the update sweep doesn't
+    misclassify sibling-profile service-managed gateways as manual (#73626).
+    """
+
+    def test_all_profiles_enumerates_launchd_fleet(self, monkeypatch):
+        """launchctl list output with multiple gateway agents → all PIDs."""
+        monkeypatch.setattr(gateway, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway")
+
+        launchctl_out = (
+            "PID\tStatus\tLabel\n"
+            "1001\t0\tai.hermes.gateway\n"
+            "1002\t0\tai.hermes.gateway-coder\n"
+            "1003\t0\tai.hermes.gateway-research\n"
+            "9999\t0\tcom.apple.somethingelse\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"] and len(cmd) == 2:
+                return SimpleNamespace(returncode=0, stdout=launchctl_out, stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+        pids = gateway._get_service_pids(all_profiles=True)
+        assert 1001 in pids  # default profile
+        assert 1002 in pids  # coder profile
+        assert 1003 in pids  # research profile
+        assert 9999 not in pids  # non-gateway service excluded
+
+    def test_default_scope_still_queries_single_label(self, monkeypatch):
+        """Without all_profiles, keep the current-profile-only behaviour."""
+        monkeypatch.setattr(gateway, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway")
+
+        launchctl_single = (
+            "{\n"
+            '    "PID" = 1001;\n'
+            "}\n"
+        )
+
+        captured_cmds = []
+
+        def fake_run(cmd, **kwargs):
+            captured_cmds.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout=launchctl_single, stderr="")
+
+        monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+        pids = gateway._get_service_pids()
+        # Default scope should still find the current profile's service
+        assert 1001 in pids
+        # Should NOT have done a fleet-wide launchctl list (no-arg)
+        fleet_calls = [c for c in captured_cmds if c == ["launchctl", "list"]]
+        assert not fleet_calls, (
+            "default scope must not enumerate the whole launchd fleet"
+        )
+
+
+class TestFindGatewayPidsExcludesServiceFleet:
+    """find_gateway_pids(all_profiles=True) must exclude ALL service-managed
+    PIDs so the update sweep doesn't kill launchd-managed siblings (#73626).
+    """
+
+    def test_update_sweep_excludes_sibling_service_pids(self, monkeypatch):
+        """Simulate the update sweep: a sibling gateway is launchd-managed
+        and must NOT appear in manual_pids."""
+        monkeypatch.setattr(gateway, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+
+        launchctl_out = (
+            "PID\tStatus\tLabel\n"
+            "5001\t0\tai.hermes.gateway\n"
+            "5002\t0\tai.hermes.gateway-coder\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"] and len(cmd) == 2:
+                return SimpleNamespace(returncode=0, stdout=launchctl_out, stderr="")
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(returncode=0, stdout=launchctl_out, stderr="")
+            if cmd[:3] == ["ps", "-o", "ppid="]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            if cmd[0] == "ps":
+                # ps scan finds BOTH the default + sibling gateway
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "5001 python -m hermes_cli.main gateway run\n"
+                        "5002 python -m hermes_cli.main gateway run --profile coder\n"
+                        "7000 python -m hermes_cli.main gateway run --profile other\n"
+                    ),
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway.os.path, "isdir", lambda p: False)
+        monkeypatch.setattr(gateway, "_get_ancestor_pids", lambda: set())
+
+        # Update sweep logic: exclude service PIDs, find manual PIDs
+        service_pids = gateway._get_service_pids(all_profiles=True)
+        manual_pids = gateway.find_gateway_pids(
+            exclude_pids=service_pids, all_profiles=True
+        )
+
+        # Both service-managed PIDs must be excluded from the manual set
+        assert 5001 not in manual_pids, (
+            "launchd-managed default gateway must not appear as manual"
+        )
+        assert 5002 not in manual_pids, (
+            "launchd-managed sibling gateway must not appear as manual"
+        )
+        # But a truly manual gateway (no launchd label) should still be found
+        assert 7000 in manual_pids, (
+            f"manual gateway 7000 should be found, got manual={manual_pids}"
+        )
 
 
 # ---------------------------------------------------------------------------
