@@ -212,6 +212,7 @@ import { hiddenWindowsChildOptions } from './windows-child-options'
 import {
   buildPathExtCandidates,
   chooseUpdaterArgs,
+  getVenvRootForPython,
   getVenvSitePackagesEntries,
   resolveVenvHermesCommand
 } from './windows-hermes-path'
@@ -3763,6 +3764,7 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
   const venvRoot = path.join(root, 'venv')
   const venvPython = getVenvPython(venvRoot)
   const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
+  const runtimeVenvRoot = getVenvRootForPython(command)
 
   return {
     kind: 'python',
@@ -3771,8 +3773,8 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
     args: ['-m', 'hermes_cli.main', ...backendArgs],
     env: buildDesktopBackendEnv({
       hermesHome: HERMES_HOME,
-      pythonPathEntries: [root, ...getVenvSitePackagesEntries(venvRoot)],
-      venvRoot
+      pythonPathEntries: [root, ...getVenvSitePackagesEntries(runtimeVenvRoot)],
+      venvRoot: runtimeVenvRoot
     }),
     root,
     bootstrap: Boolean(options.bootstrap),
