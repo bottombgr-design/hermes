@@ -5265,9 +5265,27 @@ def _nixos_build_env() -> dict[str, str] | None:
             if python3_path and Path(python3_path).exists():
                 return {**os.environ, "PYTHON": python3_path}
     except Exception:
-        pass  # nix-shell not available — caller will get None
+        pass
 
     return None
+
+
+def _looks_like_install_script_failure(result: subprocess.CompletedProcess) -> bool:
+    """Return True when a failed npm install appears to be caused by
+    install-script / postinstall / native-build errors rather than a
+    fundamental network or resolution failure.
+    """
+    stderr = (result.stderr or "")
+    if "info run" in stderr:
+        return True
+    if "EAGAIN" in stderr and "spawn" in stderr:
+        return True
+    import re
+    if re.search(r"ERR!.*(?:install|postinstall|preinstall|node-gyp|sh -c)", stderr):
+        return True
+    return False
+
+
 def _run_npm_install_deterministic(
     npm: str,
     cwd: Path,
@@ -5285,29 +5303,35 @@ def _run_npm_install_deterministic(
     the working tree dirty and causes the next ``hermes update`` to stash the
     lockfile — repeatedly.
 
-    ``--include=dev`` is forced on every invocation: the callers are frontend
-    builds (web UI / TUI / desktop workspaces), and those builds need the dev
-    toolchain (``tsc``, ``vite``, ``electron-builder`` — all
-    ``devDependencies``).  If the caller's environment has
-    ``NODE_ENV=production`` (or npm config ``omit=dev``) — which leaks in from
-    a shell profile, a container image, or the bundled TUI launcher that sets
-    ``NODE_ENV=production`` on its subprocess env — npm silently omits
-    devDependencies (exit 0, no error), so the build toolchain never installs
-    and the subsequent build dies with ``tsc: command not found`` (exit 127).
-    The flag overrides both the env var and npm config, unlike scrubbing
-    ``NODE_ENV`` from the environment which only fixes the env-leak case.
-
     ``--no-save`` on the ``npm install`` fallback keeps it true to this
     function's contract: never mutate ``package-lock.json``.  Without it, an
     out-of-sync lockfile gets rewritten by the fallback, which drifts the
     committed lockfile and makes every future ``npm ci`` fail — a
     self-reinforcing cycle where web devDeps never install and a stale dist
     is served on every update (PR #65595).
+
+    If the initial install fails due to install-script errors (native module
+    compilation, postinstall scripts that don't apply to the current platform),
+    retry with ``--ignore-scripts`` so the caller's build or test can
+    proceed.  This is safe because build steps (TypeScript compilation,
+    electron-builder packaging) handle native-module rebuilding independently.
+
+    Retry policy (Teknium's review, 2026-07-14): preserve the deterministic
+    contract — when ``npm ci`` fails with an install-script error, retry
+    ``npm ci --ignore-scripts`` (NOT ``npm install --ignore-scripts``); the
+    ``npm install`` fallback is for lockfile/legacy cases only. Every
+    subprocess call uses ``env=run_env`` (the ``CI=1``-forced env) so the
+    retry path inherits the same contract the initial attempt had.
     """
     # unicode-animations' postinstall animates to /dev/tty (bypasses
     # --silent/capture_output). It no-ops when CI is set — same as the TUI
     # install path and nix/lib.nix npm ci hooks.
     run_env = {**os.environ, **(env or {}), "CI": "1"}
+
+    def _emit_output(proc: subprocess.CompletedProcess) -> None:
+        if not capture_output:
+            sys.stderr.write(proc.stderr or "")
+            sys.stdout.write(proc.stdout or "")
 
     lockfile = cwd / "package-lock.json"
     if lockfile.exists():
@@ -5323,11 +5347,35 @@ def _run_npm_install_deterministic(
             check=False,
         )
         if ci_result.returncode == 0:
+            _emit_output(ci_result)
             return ci_result
+        # Install-script failure on `npm ci`: retry `npm ci --ignore-scripts`
+        # to preserve the lockfile-respecting contract. The previous
+        # version retried `npm install --ignore-scripts`, which mutates
+        # committed lockfiles (Teknium's review, 2026-07-14).
+        if _looks_like_install_script_failure(ci_result):
+            logging.getLogger(__name__).debug(
+                "npm ci failed with install-script error; retrying with --ignore-scripts"
+            )
+            ci_retry = subprocess.run(
+                ci_cmd + ["--ignore-scripts"],
+                cwd=cwd,
+                env=run_env,
+                capture_output=capture_output,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if ci_retry.returncode == 0:
+                _emit_output(ci_retry)
+                return ci_retry
+            ci_result = ci_retry
         # Fall through to `npm install` — lockfile may be out of sync on a
         # WIP fork/branch, or `npm ci` may not be available on very old npm.
+
     install_cmd = [npm, "install", "--no-save", "--include=dev", *extra_args]
-    return subprocess.run(
+    result = subprocess.run(
         install_cmd,
         cwd=cwd,
         env=run_env,
@@ -5337,6 +5385,27 @@ def _run_npm_install_deterministic(
         errors="replace",
         check=False,
     )
+    if result.returncode != 0 and _looks_like_install_script_failure(result):
+        logging.getLogger(__name__).debug(
+            "npm install failed with install-script error; retrying with --ignore-scripts"
+        )
+        retry = subprocess.run(
+            install_cmd + ["--ignore-scripts"],
+            cwd=cwd,
+            env=run_env,
+            capture_output=capture_output,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if retry.returncode == 0:
+            _emit_output(retry)
+            return retry
+        result = retry
+
+    _emit_output(result)
+    return result
 
 
 def _npm_bin_exists(bin_dir: Path, name: str) -> bool:
