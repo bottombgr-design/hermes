@@ -55,17 +55,6 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
 
-# Prefixes that identify generated context-compaction handoff summaries.
-# These are inserted by agent/context_compressor.py as normal user/assistant
-# messages but contain machine-generated summary metadata — not user content.
-# They must be excluded from discovery bookends to avoid re-introducing huge
-# compaction payloads into fresh sessions via session_search.  (#43175)
-_COMPACTION_PREFIXES = (
-    "[CONTEXT COMPACTION",
-    "[CONTEXT SUMMARY]:",
-)
-
-
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
 
@@ -91,12 +80,19 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     return str(ts)
 
 
-def _is_compaction_summary(content: str) -> bool:
-    """Return True if *content* looks like a generated compaction handoff."""
-    if not content:
-        return False
-    stripped = content.lstrip()
-    return any(stripped.startswith(p) for p in _COMPACTION_PREFIXES)
+def _is_compaction_summary(content: Any) -> bool:
+    """Return True for a standalone compaction handoff in any supported shape."""
+    from agent.context_compressor import (
+        LEGACY_SUMMARY_PREFIX,
+        SUMMARY_PREFIX,
+        _HISTORICAL_SUMMARY_PREFIXES,
+        _content_text_for_contains,
+    )
+
+    text = _content_text_for_contains(content).lstrip()
+    return text.startswith(
+        (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES)
+    )
 
 
 def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
@@ -247,10 +243,18 @@ def _shape_message(
     is added so callers know the payload was bounded.
     """
     raw_content = m.get("content")
-    if max_content_len and raw_content and len(raw_content) > max_content_len:
-        content = raw_content[:max_content_len] + "…"
-        truncated = True
-        original_chars = len(raw_content)
+    if max_content_len is not None:
+        from agent.context_compressor import _content_text_for_contains
+
+        text_content = _content_text_for_contains(raw_content)
+        if max_content_len and len(text_content) > max_content_len:
+            content = text_content[:max_content_len] + "…"
+            truncated = True
+            original_chars = len(text_content)
+        else:
+            content = text_content
+            truncated = False
+            original_chars = None
     else:
         content = raw_content
         truncated = False
@@ -657,9 +661,20 @@ def _title_match_result(
         "matched_role": "session_title",
         "match_message_id": anchor_id,
         "snippet": f"Session title matched: {session_meta.get('title') or title_query}",
-        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or messages[:3])],
-        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or messages[:5])],
-        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-3:])],
+        "bookend_start": [
+            _shape_message(m, max_content_len=1200)
+            for m in (view.get("bookend_start") or messages[:3])
+            if not _is_compaction_summary(m.get("content", ""))
+        ],
+        "messages": [
+            _shape_message(m, anchor_id=anchor_id, max_content_len=4000)
+            for m in (view.get("window") or messages[:5])
+        ],
+        "bookend_end": [
+            _shape_message(m, max_content_len=1200)
+            for m in (view.get("bookend_end") or messages[-3:])
+            if not _is_compaction_summary(m.get("content", ""))
+        ],
         "messages_before": view.get("messages_before", 0),
         "messages_after": view.get("messages_after", max(len(messages) - 5, 0)),
         "_lineage_root": lineage_root,
