@@ -449,25 +449,52 @@ class TestSessionOps:
     def test_build_usage_update_for_zed_context_indicator(self, agent, mock_manager):
         state = mock_manager.create_session(cwd="/tmp")
         state.history = [{"role": "user", "content": "hello"}]
-        state.agent.context_compressor = MagicMock(context_length=100_000)
+        state.agent.context_compressor = MagicMock(
+            context_length=100_000,
+            last_prompt_tokens=24_000,
+            compression_count=2,
+        )
         state.agent._cached_system_prompt = "system"
         state.agent.tools = [{"type": "function", "function": {"name": "demo"}}]
 
         with patch(
             "agent.model_metadata.estimate_request_tokens_rough",
-            return_value=25_000,
+            return_value=18_000,
         ):
             update = agent._build_usage_update(state)
 
         assert isinstance(update, UsageUpdate)
         assert update.session_update == "usage_update"
         assert update.size == 100_000
-        assert update.used == 25_000
+        assert update.used == 24_000
+        assert update.field_meta == {"hermes": {"compressionCount": 2}}
+
+    def test_build_usage_update_estimates_before_real_provider_usage(
+        self, agent, mock_manager
+    ):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.context_compressor = MagicMock(
+            context_length=100_000,
+            last_prompt_tokens=0,
+            compression_count=0,
+        )
+
+        with patch(
+            "agent.model_metadata.estimate_request_tokens_rough",
+            return_value=18_000,
+        ):
+            update = agent._build_usage_update(state)
+
+        assert update.used == 18_000
 
     @pytest.mark.asyncio
     async def test_send_usage_update_to_client(self, agent, mock_manager):
         state = mock_manager.create_session(cwd="/tmp")
-        state.agent.context_compressor = MagicMock(context_length=100_000)
+        state.agent.context_compressor = MagicMock(
+            context_length=100_000,
+            last_prompt_tokens=0,
+            compression_count=0,
+        )
         mock_conn = MagicMock(spec=acp.Client)
         mock_conn.session_update = AsyncMock()
         agent._conn = mock_conn
@@ -485,6 +512,41 @@ class TestSessionOps:
         assert isinstance(update, UsageUpdate)
         assert update.size == 100_000
         assert update.used == 25_000
+        assert update.field_meta == {"hermes": {"compressionCount": 0}}
+
+    @pytest.mark.asyncio
+    async def test_prompt_schedules_live_usage_update_after_each_model_step(
+        self, agent, mock_manager
+    ):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.context_compressor = MagicMock(
+            context_length=100_000,
+            last_prompt_tokens=0,
+            compression_count=1,
+        )
+
+        def _run_conversation(*_args, **_kwargs):
+            state.agent.context_compressor.last_prompt_tokens = 31_000
+            state.agent.step_callback(1)
+            return {
+                "final_response": "done",
+                "messages": [
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+
+        state.agent.run_conversation = MagicMock(side_effect=_run_conversation)
+        agent._schedule_usage_update_from_thread = MagicMock()
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="hello")],
+            session_id=state.session_id,
+        )
+
+        assert agent._schedule_usage_update_from_thread.call_count == 1
 
     @pytest.mark.asyncio
     async def test_cancel_sets_event(self, agent):
@@ -1914,6 +1976,23 @@ class TestSlashCommands:
         result = agent._handle_slash_command("/reset", state)
         assert "cleared" in result.lower()
         assert len(state.history) == 0
+
+    def test_reset_persists_cleared_compression_count(self, agent, mock_manager):
+        state = self._make_state(mock_manager)
+        compressor = MagicMock()
+        compressor.compression_count = 2
+        state.agent.context_compressor = compressor
+
+        def reset_state():
+            compressor.compression_count = 0
+
+        state.agent.reset_session_state = MagicMock(side_effect=reset_state)
+
+        result = agent._handle_slash_command("/reset", state)
+
+        assert "cleared" in result.lower()
+        assert compressor.compression_count == 0
+        compressor._persist_compression_count.assert_called_once_with()
 
     def test_reset_resets_agent_session_state(self, agent, mock_manager):
         state = self._make_state(mock_manager)

@@ -7522,6 +7522,17 @@ def test_compression_fallback_streak_round_trips(db):
     assert db.get_compression_fallback_streak("s1") == 2
 
 
+def test_compression_count_round_trips(db):
+    db.create_session("s1", "cli")
+
+    assert db.get_compression_count("s1") == 0
+    db.set_compression_count("s1", 3)
+    assert db.get_compression_count("s1") == 3
+    db.set_compression_count("s1", -2)
+    assert db.get_compression_count("s1") == 0
+    assert db.get_compression_count("missing") == 0
+
+
 def test_compression_ineffective_count_round_trips(db):
     db.create_session("s1", "cli")
 
