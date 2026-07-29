@@ -1056,6 +1056,102 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
         _kb._pid_alive = original_alive
 
 
+def test_timeout_accounting_is_atomic_with_requeue(kanban_home, monkeypatch):
+    """A timeout breaker must not block a concurrently claimed new run."""
+    conn = kb.connect()
+    contender_started = threading.Event()
+    contender_done = threading.Event()
+    contender_result = {}
+    contender_errors = []
+    try:
+        tid = kb.create_task(
+            conn, title="atomic-timeout-accounting", assignee="worker",
+            max_runtime_seconds=1, max_retries=1,
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:old") is not None
+        kb._set_worker_pid(conn, tid, 994300)
+        old_started = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old_started, tid),
+            )
+
+        def contender():
+            other = kb.connect()
+            try:
+                assert contender_started.wait(timeout=5)
+                claimed = kb.claim_task(
+                    other, tid, claimer=f"{host}:contender",
+                )
+                contender_result["claimed"] = claimed is not None
+                if claimed is not None:
+                    kb._set_worker_pid(other, tid, 994301)
+            except BaseException as exc:  # surfaced in the main test thread
+                contender_errors.append(exc)
+            finally:
+                other.close()
+                contender_done.set()
+
+        thread = threading.Thread(target=contender, daemon=True)
+        thread.start()
+
+        original_record_failure = kb._record_task_failure
+
+        def widen_transaction_gap(*args, **kwargs):
+            assert contender_done.wait(timeout=5), (
+                "contending claim did not finish in the timeout transaction gap"
+            )
+            return original_record_failure(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "_record_task_failure", widen_transaction_gap)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        def trace(sql):
+            if "UPDATE tasks SET status = 'ready'" in sql:
+                contender_started.set()
+
+        conn.set_trace_callback(trace)
+        timed_out = kb.enforce_max_runtime(
+            conn, signal_fn=lambda _pid, _sig: None,
+        )
+        conn.set_trace_callback(None)
+        contender_started.set()
+        thread.join(timeout=5)
+
+        assert tid in timed_out
+        assert not thread.is_alive(), "contending dispatcher thread leaked"
+        assert not contender_errors, contender_errors
+        assert contender_result.get("claimed") is False, (
+            "a competing dispatcher claimed the transient timeout requeue"
+        )
+
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid, "
+            "current_run_id FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "blocked"
+        assert row["claim_lock"] is None
+        assert row["claim_expires"] is None
+        assert row["worker_pid"] is None
+        assert row["current_run_id"] is None
+        open_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NULL",
+            (tid,),
+        ).fetchone()[0]
+        assert open_runs == 0
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+    finally:
+        conn.set_trace_callback(None)
+        contender_started.set()
+        conn.close()
+
+
 def test_max_runtime_none_means_no_cap(kanban_home):
     """A task with max_runtime_seconds=None is never timed out regardless
     of how long it runs."""
@@ -4653,8 +4749,19 @@ def test_protocol_violation_respects_max_retries_precedence(kanban_home):
         gave_up = [e for e in kb.list_events(conn, strict) if e.kind == "gave_up"]
         assert len(gave_up) == 1
         payload = gave_up[0].payload or {}
-        assert payload.get("protocol_violations") == 1
-        assert payload.get("protocol_violation_limit") == 1
+        assert "protocol_violations" not in payload, (
+            "the explicit override uses the unified failure counter; a "
+            "bounded violation-streak diagnostic would be misleading"
+        )
+        assert payload.get("effective_limit") == 1, (
+            f"gave_up payload should report the task override as the "
+            f"governing cap, got {payload}"
+        )
+        assert payload.get("limit_source") == "task"
+        assert "protocol_violation_limit" not in payload, (
+            "an explicit override has no separate violation-only limit — "
+            f"effective_limit already reports it, got {payload}"
+        )
 
         lenient = kb.create_task(
             conn, title="lenient", assignee="worker", max_retries=5,
@@ -4666,6 +4773,215 @@ def test_protocol_violation_respects_max_retries_precedence(kanban_home):
             )
         _drive_protocol_violation(conn, lenient, 992104)
         assert kb.get_task(conn, lenient).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_explicit_max_retries_counts_mixed_failure_kinds(kanban_home):
+    """Issue #72174 — an explicit per-task ``max_retries`` must bound the
+    TOTAL number of failures, not just a same-kind streak.
+
+    Without an override, protocol violations are deliberately tracked on
+    their own dedicated streak (see ``_protocol_violation_streak``) so an
+    earlier crash/timeout doesn't consume the bounded violation retry
+    budget — that's the intentional, independent-budgets behavior from
+    PR #64353 and it must survive untouched (see
+    ``test_protocol_violation_budget_not_consumed_by_other_failures``).
+
+    But once a task sets an EXPLICIT ``max_retries``, that cap is a
+    contract on the task's TOTAL retry budget regardless of failure kind.
+    Reported repro: an ordinary nonzero-exit crash, then two protocol
+    violations, with ``max_retries=3`` — the third run must block even
+    though only two of the three failures were violations and neither
+    violation alone reached the default violation-only bound. Pre-fix,
+    an explicit override on the violation path was resolved only against
+    ``_protocol_violation_streak`` (which the crash reset to 0), so the
+    two violations looked like "first" and "second" occurrences under the
+    default budget of 3 and neither tripped the breaker.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="mixed-explicit-cap", assignee="worker", max_retries=3,
+        )
+
+        # Run 1: ordinary nonzero-exit crash. 1 of 3 — retries.
+        _drive_nonzero_crash(conn, tid, 994000)
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Run 2: protocol violation. 2 of 3 — still retries (this would also
+        # be within the violation-only streak's own budget, so it doesn't
+        # distinguish the bug on its own).
+        _drive_protocol_violation(conn, tid, 994001)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 2, (
+            "explicit override must count the violation into the unified "
+            f"counter, got consecutive_failures={task.consecutive_failures}"
+        )
+
+        # Run 3: second protocol violation. Under the explicit cap this is
+        # the task's 3rd total failure and must block — even though it's
+        # only the violation streak's 2nd consecutive violation (crash reset
+        # the streak), which is below the default violation bound of 3.
+        _drive_protocol_violation(conn, tid, 994002)
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            "explicit max_retries=3 must block on the 3rd total failure "
+            f"even when failure kinds are mixed, got {task.status}"
+        )
+        assert task.consecutive_failures == 3, (
+            "explicit override must count every failure kind into the "
+            f"unified counter, got consecutive_failures={task.consecutive_failures}"
+        )
+
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1, f"expected exactly one gave_up event, got {gave_up}"
+        payload = gave_up[0].payload or {}
+        assert payload.get("limit_source") == "task", (
+            f"gave_up payload should attribute the trip to the task override, got {payload}"
+        )
+        assert payload.get("effective_limit") == 3
+        assert payload.get("protocol_violation") is True, (
+            f"gave_up payload should flag the triggering run as a violation, got {payload}"
+        )
+        assert "protocol_violation_limit" not in payload, (
+            "the override branch has no violation-only limit — "
+            "effective_limit/limit_source already report the governing "
+            f"total-failure cap, got {payload}"
+        )
+
+        # A blocked task must not be claimable again.
+        assert kb.claim_task(conn, tid) is None, (
+            "a blocked task must refuse a further claim"
+        )
+    finally:
+        conn.close()
+
+
+def test_protocol_violation_accounting_is_atomic_with_requeue(
+    kanban_home, monkeypatch,
+):
+    """A competing dispatcher must not claim between requeue and give-up.
+
+    The production break this catches is splitting crash requeue/run close
+    and failure accounting across two write transactions.  The patched
+    wrapper only widens that real transaction boundary deterministically;
+    the contender still uses a second real SQLite connection and the normal
+    ``claim_task`` path.
+    """
+    conn = kb.connect()
+    contender_started = threading.Event()
+    contender_done = threading.Event()
+    contender_result = {}
+    contender_errors = []
+    try:
+        tid = kb.create_task(
+            conn, title="atomic-protocol-accounting", assignee="worker",
+            max_retries=1,
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:old") is not None
+        kb._set_worker_pid(conn, tid, 994100)
+        kb._record_worker_exit(994100, 0)
+
+        def contender():
+            other = kb.connect()
+            try:
+                assert contender_started.wait(timeout=5)
+                claimed = kb.claim_task(
+                    other, tid, claimer=f"{host}:contender",
+                )
+                contender_result["claimed"] = claimed is not None
+                if claimed is not None:
+                    kb._set_worker_pid(other, tid, 994101)
+            except BaseException as exc:  # surfaced in the main test thread
+                contender_errors.append(exc)
+            finally:
+                other.close()
+                contender_done.set()
+
+        thread = threading.Thread(target=contender, daemon=True)
+        thread.start()
+
+        original_record_failure = kb._record_task_failure
+
+        def widen_transaction_gap(*args, **kwargs):
+            assert contender_done.wait(timeout=5), (
+                "contending claim did not finish in the transaction gap"
+            )
+            return original_record_failure(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "_record_task_failure", widen_transaction_gap)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        def trace(sql):
+            if "UPDATE tasks SET status = 'ready'" in sql:
+                contender_started.set()
+
+        conn.set_trace_callback(trace)
+        kb.detect_crashed_workers(conn)
+        conn.set_trace_callback(None)
+        contender_started.set()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive(), "contending dispatcher thread leaked"
+        assert not contender_errors, contender_errors
+        assert contender_result.get("claimed") is False, (
+            "a competing dispatcher claimed the transient ready state"
+        )
+
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid, "
+            "current_run_id FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "blocked"
+        assert row["claim_lock"] is None
+        assert row["claim_expires"] is None
+        assert row["worker_pid"] is None
+        assert row["current_run_id"] is None
+        open_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NULL",
+            (tid,),
+        ).fetchone()[0]
+        assert open_runs == 0
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+    finally:
+        conn.set_trace_callback(None)
+        contender_started.set()
+        conn.close()
+
+
+def test_explicit_retry_payload_omits_capped_violation_streak(kanban_home):
+    """Unified retry events must not report a silently truncated streak."""
+    conn = kb.connect()
+    try:
+        limit = kb._PROTOCOL_VIOLATION_SCAN_LIMIT + 1
+        tid = kb.create_task(
+            conn, title="large-explicit-cap", assignee="worker",
+            max_retries=limit,
+        )
+        for index in range(limit):
+            _drive_protocol_violation(conn, tid, 994200 + index)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == limit
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload.get("failures") == limit
+        assert payload.get("effective_limit") == limit
+        assert payload.get("limit_source") == "task"
+        assert payload.get("protocol_violation") is True
+        assert "protocol_violations" not in payload, (
+            "the unified override must not expose the default policy's "
+            f"{kb._PROTOCOL_VIOLATION_SCAN_LIMIT}-row streak diagnostic: "
+            f"{payload}"
+        )
     finally:
         conn.close()
 
