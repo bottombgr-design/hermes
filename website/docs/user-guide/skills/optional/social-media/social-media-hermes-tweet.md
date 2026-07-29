@@ -16,7 +16,7 @@ Use Xquik tools for read and gated X workflows.
 |---|---|
 | Source | Optional — install with `hermes skills install official/social-media/hermes-tweet` |
 | Path | `optional-skills/social-media/hermes-tweet` |
-| Version | `0.1.6` |
+| Version | `0.1.11` |
 | Author | Burak Bayır (kriptoburak), Xquik |
 | License | MIT |
 | Tags | `x`, `twitter`, `xquik`, `social-media`, `hermes-plugin`, `trends`, `posting`, `action-gating` |
@@ -51,11 +51,11 @@ Use the bundled `xurl` skill instead when the user explicitly wants the official
 
 ## How to Run
 
-1. Install and enable the plugin from a terminal:
+1. Install and enable the plugin through the `terminal` tool:
 
    ```bash
    hermes plugins install Xquik-dev/hermes-tweet --enable
-   hermes plugins enable hermes-tweet
+   hermes plugins list
    hermes tools list
    ```
 
@@ -81,7 +81,7 @@ Use the bundled `xurl` skill instead when the user explicitly wants the official
 
    ```bash
    hermes plugins install Xquik-dev/hermes-tweet --enable
-   hermes plugins enable hermes-tweet
+   hermes plugins list
    hermes tools list
    ```
 
@@ -107,15 +107,22 @@ Use the bundled `xurl` skill instead when the user explicitly wants the official
 ## Pitfalls
 
 - `tweet_read` may be hidden when `XQUIK_API_KEY` is missing. Configure the key, then run `/reload` in an active CLI session or run `hermes gateway restart` and start a new session
-- Bare `hermes tools` opens an interactive tool UI on Hermes v0.12.0. Use `hermes tools list` for scriptable checks
+- Bare `hermes tools` opens an interactive tool UI. Use `hermes tools list` for scriptable checks
 - One-shot `hermes -z "/xstatus"` can route slash-prefixed text as a model prompt. Verify slash commands in an active CLI or gateway session
 - A plugin installed from Git or PyPI can still be disabled in `plugins.enabled`. Confirm both installation and enablement
 - `tweet_action` is intentionally disabled by default, even when read tools work
 
 ## Verification
 
-- `hermes plugins enable hermes-tweet` completes without errors
+Run one non-mutating probe through the `terminal` tool:
+
+```bash
+hermes -z "Use tweet_explore to find the X trends endpoint. Do not call tweet_read or tweet_action." --toolsets hermes-tweet
+```
+
+- `hermes plugins list` shows Hermes Tweet as enabled
 - `hermes tools list` shows the Hermes Tweet toolset
+- The probe finds a catalog-listed trends endpoint without a live API call
 - Without `XQUIK_API_KEY`, `tweet_explore` remains available and authenticated tools stay hidden or blocked
 - With `XQUIK_API_KEY`, `tweet_read` appears and read-only probes work
 - Without `HERMES_TWEET_ENABLE_ACTIONS=true`, `tweet_action` is hidden or returns an action-disabled response
@@ -126,3 +133,5 @@ Use the bundled `xurl` skill instead when the user explicitly wants the official
 - Plugin repository: https://github.com/Xquik-dev/hermes-tweet
 - Xquik guide: https://docs.xquik.com/guides/hermes-tweet
 - Python package: https://pypi.org/project/hermes-tweet/
+
+Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter" and "X" are trademarks of X Corp.
