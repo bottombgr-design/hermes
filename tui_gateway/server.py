@@ -1589,6 +1589,19 @@ def _send_compute_host_control(
     )
 
 
+def _compression_rpc_timeout() -> float:
+    """Match compute-host waits to the configured compression model budget."""
+    cfg = _load_cfg()
+    auxiliary = cfg.get("auxiliary") if isinstance(cfg, dict) else {}
+    compression = auxiliary.get("compression") if isinstance(auxiliary, dict) else {}
+    from agent.auxiliary_client import resolve_auxiliary_task_timeout
+
+    return resolve_auxiliary_task_timeout(
+        "compression",
+        task_config=compression if isinstance(compression, dict) else {},
+    )
+
+
 def _emit_approval_request(sid: str, data: dict | None) -> None:
     """Emit an ``approval.request`` event to the TUI client with the command
     redacted. The approval payload is built from the RAW command string, so a
@@ -10377,7 +10390,7 @@ def _(rid, params: dict) -> dict:
                 route_name="session.compress",
                 command=command,
                 wait=True,
-                timeout=120.0,
+                timeout=_compression_rpc_timeout(),
             )
         except Exception as exc:
             return _err(rid, 5019, f"compute-host compress failed: {exc}")
@@ -16337,6 +16350,7 @@ def _(rid, params: dict) -> dict:
                     route_name="slash.compress",
                     command=command,
                     wait=True,
+                    timeout=_compression_rpc_timeout(),
                 )
             except Exception as exc:
                 return _err(rid, 5019, f"compute-host slash.compress failed: {exc}")
@@ -17504,11 +17518,17 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     if _session_uses_compute_host(session) and name in _MUTATES_WHILE_RUNNING:
         route_name = f"slash.{name}"
         try:
+            timeout_kwargs = (
+                {"timeout": _compression_rpc_timeout()}
+                if name == "compress"
+                else {}
+            )
             ack = _send_compute_host_control(
                 sid,
                 route_name=route_name,
                 command=command,
                 wait=True,
+                **timeout_kwargs,
             )
         except Exception as exc:
             return f"compute-host {route_name} failed: {exc}"
