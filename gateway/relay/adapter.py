@@ -60,6 +60,10 @@ class RelayAdapter(BasePlatformAdapter):
         self._transport = transport
         # Capability surface read by stream_consumer (getattr(..., 4096)).
         self.MAX_MESSAGE_LENGTH = descriptor.max_message_length
+        self.SUPPORTS_MESSAGE_EDITING = descriptor.supports_edit
+        # Edit availability does not imply an explicit lifecycle-closing edit.
+        # Relay has no separately negotiated finalize capability or wire field.
+        self.REQUIRES_EDIT_FINALIZE = False
         # chat_id -> scope_id (server/workspace scope), learned from inbound
         # events. The connector's egress guard resolves the owning tenant from
         # the OUTBOUND action's metadata.scope_id; the gateway's generic delivery
@@ -280,6 +284,7 @@ class RelayAdapter(BasePlatformAdapter):
         """Adopt a (re)negotiated descriptor into the live capability surface."""
         self.descriptor = descriptor
         self.MAX_MESSAGE_LENGTH = descriptor.max_message_length
+        self.SUPPORTS_MESSAGE_EDITING = descriptor.supports_edit
         self.supports_code_blocks = descriptor.markdown_dialect not in ("", "plain")
 
     async def _on_inbound(self, event) -> None:
@@ -776,6 +781,8 @@ class RelayAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a relayed message through the connector-owned platform API."""
+        if not self._descriptor_for_chat(chat_id).supports_edit:
+            return SendResult(success=False, error="Not supported")
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         result = await self._transport.send_outbound(
