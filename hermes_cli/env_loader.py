@@ -311,6 +311,20 @@ def load_hermes_dotenv(
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
+    # Snapshot values that an external secret source (Bitwarden, 1Password,
+    # ...) already resolved during a previous load_hermes_dotenv() call in
+    # this process.  ``load_dotenv(override=True)`` below would otherwise
+    # write the raw .env placeholder (e.g. ``__BITWARDEN_MANAGED__``) back
+    # over the resolved value, and ``_apply_external_secret_sources()`` is an
+    # intentional no-op on the second call (idempotent via
+    # ``_APPLIED_HOMES``), so the clobber would silently stick — breaking
+    # gateway auth every reconnect cycle (#74265).
+    protected_secret_values = {
+        name: os.environ[name]
+        for name in _SECRET_SOURCES
+        if name in os.environ
+    }
+
     # Normalize safe formatting and remove invalid NUL bytes before parsing.
     if user_env.exists():
         _sanitize_env_file_if_needed(user_env)
@@ -338,6 +352,15 @@ def load_hermes_dotenv(
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
+
+    # Restore external-source secrets that load_dotenv(override=True) just
+    # overwrote with raw .env placeholders.  Managed scope (applied last
+    # below by _apply_managed_env with override=True) still intentionally
+    # beats an external-source value — this only undoes the dotenv clobber
+    # so BSM-resolved values survive every reload (#74265).
+    for name, value in protected_secret_values.items():
+        if os.environ.get(name) != value:
+            os.environ[name] = value
 
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
