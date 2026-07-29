@@ -6411,6 +6411,7 @@ async def get_model_options(
     refresh: bool = False,
     include_unconfigured: bool = False,
     explicit_only: bool = False,
+    include_pricing: bool = True,
 ):
     """Return authenticated providers + their curated model lists.
 
@@ -6426,6 +6427,12 @@ async def get_model_options(
     ``refresh`` busts the per-provider model-id disk cache so every row
     re-fetches its live catalog — used by the picker's explicit "Refresh
     Models" control. Normal opens leave it false to stay on the 1h cache.
+
+    ``include_pricing`` (default true) gates the per-provider live pricing +
+    Nous free-tier enrichment. Pricing fetches are sequential network calls
+    (8s timeout each) that dominate cold-load latency; surfaces that never
+    render pricing (e.g. the desktop Model settings page) pass false to skip
+    them. Picker/onboarding consumers leave it true.
     """
     try:
         from hermes_cli.inventory import build_model_options_payload, load_picker_context
@@ -6440,6 +6447,7 @@ async def get_model_options(
                     explicit_only=bool(explicit_only),
                     include_unconfigured=bool(include_unconfigured),
                     refresh=bool(refresh),
+                    include_pricing=bool(include_pricing),
                 )
 
         return await run_in_threadpool(_build_payload_scoped)
@@ -6448,6 +6456,36 @@ async def get_model_options(
     except Exception:
         _log.exception("GET /api/model/options failed")
         raise HTTPException(status_code=500, detail="Failed to list model options")
+
+
+class ModelDiscoverRequest(BaseModel):
+    base_url: str
+    api_key: Optional[str] = None
+    api_mode: str = "chat_completions"
+
+
+@app.post("/api/model/discover")
+def post_model_discover(body: ModelDiscoverRequest, profile: Optional[str] = None):
+    """Discover models from a provider's standard ``/models`` endpoint.
+
+    Profile-scoped so the call runs against the same HERMES_HOME the desktop
+    UI is managing. Returns ``{"models": [{"id", "name"}, ...]}``. A failed
+    discovery (non-200 / network / parse) maps to 502 with the underlying
+    message so the UI can surface it.
+    """
+    try:
+        from hermes_cli.inventory import ModelDiscoveryError, discover_provider_models
+
+        with _profile_scope(profile):
+            models = discover_provider_models(body.base_url, body.api_key, body.api_mode)
+        return {"models": models}
+    except ModelDiscoveryError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("POST /api/model/discover failed")
+        raise HTTPException(status_code=500, detail="Model discovery failed")
 
 
 @app.get("/api/model/recommended-default")
