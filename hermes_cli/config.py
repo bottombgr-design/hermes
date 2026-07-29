@@ -3220,6 +3220,11 @@ DEFAULT_CONFIG = {
         # at-least-once). Disable to lose in-flight final responses on
         # crash/restart, as before.
         "delivery_ledger": True,
+        # Optional per-key text overrides for Hermes-authored gateway messages.
+        # Keys omit the leading ``gateway.`` catalog prefix; values may reuse
+        # the placeholders from the corresponding locale entry. An empty map
+        # preserves locale -> English -> dotted-key fallback behavior.
+        "system_messages": {},
 
         # Seconds the gateway waits for a single messaging platform to finish
         # connecting during startup (and on reconnect). Discord in particular
