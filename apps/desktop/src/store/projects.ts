@@ -16,7 +16,7 @@ import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gatewa
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import { $activeGatewayProfile, requestFreshSession } from '@/store/profile'
-import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, workspaceCwdForNewSession } from '@/store/session'
+import { $currentCwd, $selectedStoredSessionId, $sessions, sessionMatchesStoredId, workspaceCwdForNewSession } from '@/store/session'
 import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
 // First-class, per-profile Projects (named, multi-folder workspaces). State is
@@ -268,10 +268,30 @@ export async function followActiveSessionCwd(cwd: string): Promise<void> {
     return
   }
 
-  await Promise.all([refreshProjects(), refreshProjectTree()])
+  // Snapshot the selection so we can detect a user-initiated session switch
+  // that lands while the async refresh is in flight.
+  const selectedAtStart = $selectedStoredSessionId.get()
 
-  // Resolve only after the refresh, so a just-created/auto project is in the tree.
-  const projectId = projectIdForCwd(target)
+  // Fast path: the project is already in the cached tree — skip the two RPC
+  // round-trips entirely. This is the common case (agent cd's inside a known
+  // repo) and removes the main source of session-switch latency.
+  const knownProjectId = projectIdForCwd(target)
+
+  if (!knownProjectId) {
+    // A just-created/auto project may not be in the tree yet. Refresh, but
+    // guard against the user switching sessions mid-flight: if the live cwd
+    // moved away from `target` or the selected session changed while we
+    // awaited the RPCs, the follow is stale and must NOT yank the sidebar
+    // scope to the old session's project.
+    await Promise.all([refreshProjects(), refreshProjectTree()])
+
+    if ($currentCwd.get().trim() !== target || $selectedStoredSessionId.get() !== selectedAtStart) {
+      return
+    }
+  }
+
+  // Resolve after the (possible) refresh so a just-created project is visible.
+  const projectId = knownProjectId ?? projectIdForCwd(target)
 
   if (projectId) {
     // The Projects tree only renders in grouped mode, so flip the sidebar into
