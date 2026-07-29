@@ -34,7 +34,7 @@ import { $billingSettingsRequest } from '@/store/billing-block'
 import { requestVoiceConversationStart } from '@/store/composer'
 import { setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
-import { $previewTarget } from '@/store/preview'
+import { $filePreviewTarget, $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
   $freshSessionRequest,
@@ -44,7 +44,8 @@ import {
   normalizeProfileKey,
   refreshActiveProfile
 } from '@/store/profile'
-import { $startWorkSessionRequest, followActiveSessionCwd } from '@/store/projects'
+import { $activeProfileName } from '@/store/avatar'
+import { $startWorkSessionRequest, followActiveSessionCwd, resolveNewSessionCwd } from '@/store/projects'
 import {
   $activeSessionId,
   $connection,
@@ -486,6 +487,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     void refreshCurrentModel(true)
     void refreshHermesConfig(true)
     void refreshActiveProfile()
+    // Sync the avatar store so per-profile avatars follow the active gateway profile.
+    $activeProfileName.set(activeGatewayProfile || 'default')
   }, [activeGatewayProfile, refreshCurrentModel, refreshHermesConfig])
 
   // New session anchored to a workspace. Seeds cwd + branch from the clicked
