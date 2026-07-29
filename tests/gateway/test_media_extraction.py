@@ -207,6 +207,60 @@ caption
         tags, _ = _collect_auto_append_media_tags(messages, history_offset=0)
         assert tags == ["MEDIA:/host/dog.jpg"]
 
+    def test_gateway_auto_append_ignores_unrelated_media_placeholder(self):
+        """A bogus model path must not suppress the real generated-image path."""
+        from gateway.run import _append_auto_media_tags_to_response
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_img", "function": {"name": "image_generate"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_img",
+                "content": (
+                    '{"success": true, "host_image": "/host/dog.jpg", '
+                    '"agent_visible_image": "/sandbox/dog.jpg"}'
+                ),
+            },
+        ]
+
+        response = _append_auto_media_tags_to_response(
+            "Here it is: MEDIA:/path/to/image",
+            messages,
+        )
+
+        assert response.endswith("MEDIA:/host/dog.jpg")
+
+    def test_gateway_auto_append_dedupes_existing_response_path(self):
+        """The producer path is not appended twice when the model used it."""
+        from gateway.run import _append_auto_media_tags_to_response
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_img", "function": {"name": "image_generate"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_img",
+                "content": '{"success": true, "host_image": "/host/dog.jpg"}',
+            },
+        ]
+
+        response = _append_auto_media_tags_to_response(
+            "Here it is: MEDIA:/host/dog.jpg",
+            messages,
+        )
+
+        assert response.count("MEDIA:/host/dog.jpg") == 1
+
+
     def test_gateway_auto_append_image_generate_failure_and_url_ignored(self):
         """Failed generations and remote URLs are not auto-delivered."""
         from gateway.run import _collect_auto_append_media_tags
