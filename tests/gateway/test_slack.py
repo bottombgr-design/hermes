@@ -16,7 +16,7 @@ import os
 import socket
 import sys
 import time
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
@@ -5365,6 +5365,8 @@ class TestAssistantThreadLifecycle:
         a = SlackAdapter(config)
         a._app = MagicMock()
         a._app.client = AsyncMock()
+        a._team_clients = {"T_TEAM": a._app.client}
+        a._assistant_thread_title_started_at = 0.0
         a._app.client.users_info = AsyncMock(
             return_value={
                 "user": {
@@ -5721,7 +5723,7 @@ class TestAssistantThreadLifecycle:
         }
 
     @pytest.mark.asyncio
-    async def test_dm_message_sets_assistant_thread_title_once(
+    async def test_dm_message_defers_assistant_thread_title_until_generated(
         self, assistant_adapter
     ):
         assistant_adapter._app.client.users_info = AsyncMock(
@@ -5743,14 +5745,255 @@ class TestAssistantThreadLifecycle:
         await assistant_adapter._handle_slack_message(
             {**event, "ts": "171.222", "thread_ts": "171.111"}
         )
+        assistant_adapter._app.client.assistant_threads_setTitle.assert_not_awaited()
+
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D123",
+            "171.111",
+            "Incident Thread Summary",
+            team_id="T_TEAM",
+        )
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D123",
+            "171.111",
+            "Later Generated Title",
+            team_id="T_TEAM",
+        )
 
         assistant_adapter._app.client.assistant_threads_setTitle.assert_awaited_once_with(
             channel_id="D123",
             thread_ts="171.111",
-            title="Please summarize this incident thread",
+            title="Incident Thread Summary",
         )
         msg_event = assistant_adapter.handle_message.call_args[0][0]
         assert msg_event.metadata["slack_team_id"] == "T_TEAM"
+
+    @pytest.mark.asyncio
+    async def test_generated_assistant_thread_title_is_single_flight(
+        self, assistant_adapter
+    ):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def set_title(**kwargs):
+            started.set()
+            await release.wait()
+
+        assistant_adapter._app.client.assistant_threads_setTitle = AsyncMock(
+            side_effect=set_title
+        )
+
+        first = asyncio.create_task(
+            assistant_adapter.set_generated_assistant_thread_title(
+                "D123",
+                "171.111",
+                "First Generated Title",
+                team_id="T_TEAM",
+            )
+        )
+        await started.wait()
+        second = asyncio.create_task(
+            assistant_adapter.set_generated_assistant_thread_title(
+                "D123",
+                "171.111",
+                "Second Generated Title",
+                team_id="T_TEAM",
+            )
+        )
+        release.set()
+        await asyncio.gather(first, second)
+
+        assistant_adapter._app.client.assistant_threads_setTitle.assert_awaited_once_with(
+            channel_id="D123",
+            thread_ts="171.111",
+            title="First Generated Title",
+        )
+
+    @pytest.mark.asyncio
+    async def test_generated_title_is_not_retried_after_ambiguous_failure(
+        self, assistant_adapter
+    ):
+        assistant_adapter._app.client.assistant_threads_setTitle = AsyncMock(
+            side_effect=TimeoutError("response lost after Slack may have committed")
+        )
+
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D123",
+            "171.111",
+            "Generated Title",
+            team_id="T_TEAM",
+        )
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D123",
+            "171.111",
+            "Generated Title",
+            team_id="T_TEAM",
+        )
+
+        assert assistant_adapter._app.client.assistant_threads_setTitle.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_inflight_title_claim_survives_attempt_history_eviction(
+        self, assistant_adapter
+    ):
+        assistant_adapter._attempted_assistant_thread_titles = {
+            ("T_TEAM", f"D{i}", f"{10000 + i}.0") for i in range(5000)
+        }
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def set_title(**kwargs):
+            started.set()
+            await release.wait()
+
+        assistant_adapter._app.client.assistant_threads_setTitle = AsyncMock(
+            side_effect=set_title
+        )
+        first = asyncio.create_task(
+            assistant_adapter.set_generated_assistant_thread_title(
+                "D_OLD",
+                "1.0",
+                "First Title",
+                team_id="T_TEAM",
+            )
+        )
+        await started.wait()
+        second = asyncio.create_task(
+            assistant_adapter.set_generated_assistant_thread_title(
+                "D_OLD",
+                "1.0",
+                "Second Title",
+                team_id="T_TEAM",
+            )
+        )
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+
+        assert assistant_adapter._app.client.assistant_threads_setTitle.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_evicted_attempt_cannot_redeliver_an_old_thread_title(
+        self, assistant_adapter
+    ):
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D_OLD",
+            "1.0",
+            "Original Title",
+            team_id="T_TEAM",
+        )
+        newer_keys = {
+            ("T_TEAM", f"D{i}", f"{10000 + i}.0") for i in range(5000)
+        }
+        assistant_adapter._attempted_assistant_thread_titles = set(newer_keys)
+        assistant_adapter._titled_assistant_threads = set(newer_keys)
+
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D_OLD",
+            "1.0",
+            "Redelivered Title",
+            team_id="T_TEAM",
+        )
+
+        assistant_adapter._app.client.assistant_threads_setTitle.assert_awaited_once_with(
+            channel_id="D_OLD",
+            thread_ts="1.0",
+            title="Original Title",
+        )
+
+    @pytest.mark.asyncio
+    async def test_distinct_threads_can_be_titled_out_of_creation_order(
+        self, assistant_adapter
+    ):
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D_NEWER",
+            "200.0",
+            "Newer Thread Title",
+            team_id="T_TEAM",
+        )
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D_OLDER",
+            "100.0",
+            "Older Thread Title",
+            team_id="T_TEAM",
+        )
+
+        assert assistant_adapter._app.client.assistant_threads_setTitle.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_pre_restart_thread_is_not_reauthorized_after_process_reconstruction(
+        self, assistant_adapter
+    ):
+        assistant_adapter._assistant_thread_title_started_at = time.time()
+
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D_OLD",
+            "1.0",
+            "Reconstructed Process Title",
+            team_id="T_TEAM",
+        )
+
+        assistant_adapter._app.client.assistant_threads_setTitle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("team_id", ["", "T_UNKNOWN"])
+    async def test_generated_title_fails_closed_without_workspace_client(
+        self, assistant_adapter, team_id
+    ):
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D123",
+            "171.111",
+            "Generated Title",
+            team_id=team_id,
+        )
+
+        assistant_adapter._app.client.assistant_threads_setTitle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_session_reset_at_adapter_boundary_preserves_title_ownership(
+        self, assistant_adapter
+    ):
+        source = SimpleNamespace(
+            platform=Platform.SLACK,
+            chat_id="D123",
+            chat_type="dm",
+            thread_id="171.111",
+            scope_id="T_TEAM",
+        )
+        current_session_id = "session-1"
+        runner = object.__new__(GatewayRunner)
+        runner.adapters = {Platform.SLACK: assistant_adapter}
+        runner.session_store = SimpleNamespace(
+            get_or_create_session=lambda _source: SimpleNamespace(
+                session_id=current_session_id
+            )
+        )
+        boundary_reached = asyncio.Event()
+        release_mutation = asyncio.Event()
+        set_generated_title = assistant_adapter.set_generated_assistant_thread_title
+
+        async def pause_before_mutation(*args, **kwargs):
+            boundary_reached.set()
+            await release_mutation.wait()
+            await set_generated_title(*args, **kwargs)
+
+        assistant_adapter.set_generated_assistant_thread_title = pause_before_mutation
+        title_task = asyncio.create_task(
+            runner._set_slack_generated_thread_title(
+                source,
+                "session-1",
+                "Stale Session Title",
+            )
+        )
+        await boundary_reached.wait()
+        current_session_id = "session-2"
+        release_mutation.set()
+        await title_task
+
+        key = ("T_TEAM", "D123", "171.111")
+        assistant_adapter._app.client.assistant_threads_setTitle.assert_not_awaited()
+        assert key not in assistant_adapter._claimed_assistant_thread_titles
+        assert key not in assistant_adapter._attempted_assistant_thread_titles
 
     @pytest.mark.asyncio
     async def test_dm_message_title_can_be_disabled(self, assistant_adapter):
@@ -5769,6 +6012,12 @@ class TestAssistantThreadLifecycle:
         }
 
         await assistant_adapter._handle_slack_message(event)
+        await assistant_adapter.set_generated_assistant_thread_title(
+            "D123",
+            "171.111",
+            "Generated Title",
+            team_id="T_TEAM",
+        )
 
         assistant_adapter._app.client.assistant_threads_setTitle.assert_not_called()
 
