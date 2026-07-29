@@ -2304,6 +2304,8 @@ def _run_job_script(
             argv,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=script_timeout,
             cwd=_script_cwd,
             env=env,
