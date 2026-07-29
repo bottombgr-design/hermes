@@ -350,13 +350,17 @@ _wal_fallback_warned_lock = threading.Lock()
 _wal_reset_bug_warned_paths: set[str] = set()
 _wal_reset_bug_warned_lock = threading.Lock()
 
+_FTS_TRIGRAM_TRIGGERS = (
+    "messages_fts_trigram_insert",
+    "messages_fts_trigram_delete",
+    "messages_fts_trigram_update",
+)
+
 _FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
-    "messages_fts_trigram_insert",
-    "messages_fts_trigram_delete",
-    "messages_fts_trigram_update",
+    *_FTS_TRIGRAM_TRIGGERS,
 )
 
 
@@ -1456,7 +1460,7 @@ BEGIN
     VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content, tool_name, tool_calls ON messages
 WHEN (old.content IS NOT new.content
     OR old.tool_name IS NOT new.tool_name
     OR old.tool_calls IS NOT new.tool_calls)
@@ -1523,7 +1527,7 @@ BEGIN
     VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE OF content, tool_name, tool_calls, role ON messages
 WHEN (old.content IS NOT new.content
     OR old.tool_name IS NOT new.tool_name
     OR old.tool_calls IS NOT new.tool_calls
@@ -1615,7 +1619,7 @@ BEGIN
     VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_update AFTER UPDATE ON messages
+CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_update AFTER UPDATE OF content, tool_name, tool_calls, role ON messages
 WHEN (old.content IS NOT new.content
     OR old.tool_name IS NOT new.tool_name
     OR old.tool_calls IS NOT new.tool_calls
@@ -1645,6 +1649,10 @@ _FTS_CJK_TRIGGERS = (
 # on are missing from the cjk index, so it must not serve reads until
 # `hermes sessions optimize-storage` rebuilds it on a capable host.
 FTS_CJK_STALE_KEY = "fts_cjk_stale"
+# A runtime without the trigram tokenizer drops trigram maintenance triggers
+# and records this breadcrumb. The next capable open must rebuild the index
+# from canonical messages before serving it again.
+FTS_TRIGRAM_STALE_KEY = "fts_trigram_stale"
 
 
 def fts5_cjk_so_path() -> Path:
@@ -1715,7 +1723,7 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
@@ -1741,12 +1749,60 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON message
     DELETE FROM messages_fts_trigram WHERE rowid = old.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
     DELETE FROM messages_fts_trigram WHERE rowid = old.id;
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
     );
+END;
+"""
+
+
+LEGACY_EXTERNAL_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content)
+    VALUES ('delete', old.id, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content)
+    VALUES ('delete', old.id, old.content);
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+"""
+
+LEGACY_EXTERNAL_FTS_TRIGRAM_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+    content,
+    content='messages',
+    content_rowid='id',
+    tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content)
+    VALUES ('delete', old.id, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE OF content ON messages BEGIN
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content)
+    VALUES ('delete', old.id, old.content);
+    INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, new.content);
 END;
 """
 
@@ -2282,30 +2338,315 @@ class SessionDB:
         )
 
     @staticmethod
+    def _legacy_fts_layout(cursor: sqlite3.Cursor) -> Optional[str]:
+        """Classify matching pre-v23 FTS tables without guessing semantics.
+
+        ``None`` means the standard table is absent/current. ``ambiguous``
+        means existing tables disagree or their storage options cannot be
+        proven; callers must not rewrite triggers in that state.
+        """
+
+        def _tokens(sql: str):
+            tokens = []
+            index = 0
+            while index < len(sql):
+                char = sql[index]
+                if char.isspace():
+                    index += 1
+                    continue
+                if sql.startswith("--", index):
+                    newline = sql.find("\n", index + 2)
+                    index = len(sql) if newline < 0 else newline + 1
+                    continue
+                if sql.startswith("/*", index):
+                    end = sql.find("*/", index + 2)
+                    if end < 0:
+                        return None
+                    index = end + 2
+                    continue
+                if char in ("'", '"', "`", "["):
+                    closing = "]" if char == "[" else char
+                    value = []
+                    index += 1
+                    while index < len(sql):
+                        if sql[index] != closing:
+                            value.append(sql[index])
+                            index += 1
+                            continue
+                        if index + 1 < len(sql) and sql[index + 1] == closing:
+                            value.append(closing)
+                            index += 2
+                            continue
+                        index += 1
+                        break
+                    else:
+                        return None
+                    kind = "string" if char == "'" else "value"
+                    tokens.append((kind, "".join(value).lower()))
+                    continue
+                if char.isalpha() or char == "_":
+                    start = index
+                    index += 1
+                    while index < len(sql) and (
+                        sql[index].isalnum() or sql[index] in "_$"
+                    ):
+                        index += 1
+                    tokens.append(("value", sql[start:index].lower()))
+                    continue
+                if char in "=,()":
+                    tokens.append((char, char))
+                else:
+                    tokens.append(("symbol", char))
+                index += 1
+            return tokens
+
+        def _table_layout(name: str) -> str:
+            row = cursor.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='table' AND name=? COLLATE NOCASE",
+                (name,),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            actual_name = str(row[0]).lower()
+            sql_value = row[1]
+            if isinstance(row, sqlite3.Row):
+                actual_name = str(row["name"]).lower()
+                sql_value = row["sql"]
+            sql = sql_value or ""
+            columns = [
+                str(item[1]).lower()
+                for item in cursor.execute(
+                    f'PRAGMA table_info("{name}")'
+                ).fetchall()
+            ]
+            tokens = _tokens(sql)
+            if not tokens:
+                return "ambiguous"
+
+            # Trust only a real FTS5 virtual-table declaration. PRAGMA
+            # table_info alone is spoofable by an ordinary table with matching
+            # columns, and option-like CHECK expressions must not be parsed as
+            # FTS5 arguments.
+            position = 0
+            required = [
+                ("value", "create"),
+                ("value", "virtual"),
+                ("value", "table"),
+            ]
+            if tokens[:3] != required:
+                return "ambiguous"
+            position = 3
+            if tokens[position : position + 3] == [
+                ("value", "if"),
+                ("value", "not"),
+                ("value", "exists"),
+            ]:
+                position += 3
+            if (
+                actual_name != name.lower()
+                or position >= len(tokens)
+                or tokens[position] != ("value", actual_name)
+            ):
+                return "ambiguous"
+            position += 1
+            if tokens[position : position + 3] != [
+                ("value", "using"),
+                ("value", "fts5"),
+                ("(", "("),
+            ]:
+                return "ambiguous"
+            args_start = position + 3
+            depth = 1
+            args_end = None
+            for offset in range(args_start, len(tokens)):
+                if tokens[offset][0] == "(":
+                    depth += 1
+                elif tokens[offset][0] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        args_end = offset
+                        break
+            if args_end is None:
+                return "ambiguous"
+            trailing = tokens[args_end + 1 :]
+            if trailing not in ([], [("symbol", ";")]):
+                return "ambiguous"
+            arguments = tokens[args_start:args_end]
+
+            # Split the FTS5 argument list at top-level commas and validate
+            # complete declarations. PRAGMA exposes only resulting names, so a
+            # declaration such as ``tool_name UNINDEXED`` otherwise spoofs the
+            # canonical column list while silently changing search semantics.
+            segments = []
+            segment = []
+            nested = 0
+            for token in arguments:
+                if token[0] == "(":
+                    nested += 1
+                elif token[0] == ")":
+                    nested -= 1
+                    if nested < 0:
+                        return "ambiguous"
+                if token[0] == "," and nested == 0:
+                    if not segment:
+                        return "ambiguous"
+                    segments.append(segment)
+                    segment = []
+                else:
+                    segment.append(token)
+            if nested != 0 or not segment:
+                return "ambiguous"
+            segments.append(segment)
+
+            expected_columns = (
+                ["content", "tool_name", "tool_calls"]
+                if columns == ["content", "tool_name", "tool_calls"]
+                else ["content"] if columns == ["content"] else None
+            )
+            if expected_columns is None or len(segments) < len(expected_columns):
+                return "ambiguous"
+            for declaration, expected_name in zip(segments, expected_columns):
+                if declaration != [("value", expected_name)]:
+                    return "ambiguous"
+
+            options = {}
+            for option in segments[len(expected_columns) :]:
+                if (
+                    len(option) != 3
+                    or option[0][0] != "value"
+                    or option[1][0] != "="
+                    or option[2][0] not in ("value", "string")
+                ):
+                    return "ambiguous"
+                key = option[0][1]
+                if key in options:
+                    return "ambiguous"
+                options[key] = option[2][1]
+            if columns == ["content", "tool_name", "tool_calls"]:
+                expected_options = {
+                    "content": (
+                        "messages_fts_trigram_src"
+                        if name == "messages_fts_trigram"
+                        else "messages"
+                    ),
+                    "content_rowid": "id",
+                }
+                if name == "messages_fts_trigram":
+                    expected_options["tokenize"] = "trigram"
+                return "current" if options == expected_options else "ambiguous"
+            if columns != ["content"]:
+                return "ambiguous"
+
+            if name == "messages_fts_trigram":
+                if options == {"tokenize": "trigram"}:
+                    return "inline"
+                if options == {
+                    "content": "messages",
+                    "content_rowid": "id",
+                    "tokenize": "trigram",
+                }:
+                    return "external"
+                return "ambiguous"
+            if not options:
+                return "inline"
+            if options == {"content": "messages", "content_rowid": "id"}:
+                return "external"
+            return "ambiguous"
+
+        def _current_trigram_view_is_valid() -> Optional[bool]:
+            row = cursor.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='view' "
+                "AND name='messages_fts_trigram_src' COLLATE NOCASE"
+            ).fetchone()
+            if row is None:
+                return None
+            actual_name = str(row[0]).lower()
+            sql_value = row[1]
+            if isinstance(row, sqlite3.Row):
+                actual_name = str(row["name"]).lower()
+                sql_value = row["sql"]
+            if actual_name != "messages_fts_trigram_src":
+                return False
+            sql = sql_value or ""
+            tokens = _tokens(sql)
+            if not tokens:
+                return False
+            if tokens[-1:] == [("symbol", ";")]:
+                tokens = tokens[:-1]
+            prefix = [
+                ("value", "create"),
+                ("value", "view"),
+                ("value", "messages_fts_trigram_src"),
+                ("value", "as"),
+                ("value", "select"),
+                ("value", "id"),
+                (",", ","),
+                ("value", "role"),
+                (",", ","),
+                ("value", "content"),
+                (",", ","),
+                ("value", "tool_name"),
+                (",", ","),
+                ("value", "tool_calls"),
+                ("value", "from"),
+                ("value", "messages"),
+                ("value", "where"),
+                ("value", "role"),
+            ]
+            suffixes = (
+                [("symbol", "<"), ("symbol", ">"), ("string", "tool")],
+                [("symbol", "!"), ("=", "="), ("string", "tool")],
+            )
+            return any(tokens == prefix + suffix for suffix in suffixes)
+
+        standard = _table_layout("messages_fts")
+        trigram = _table_layout("messages_fts_trigram")
+        view_valid = _current_trigram_view_is_valid()
+        if standard == "missing" and trigram == "missing":
+            placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+            surviving_triggers = cursor.execute(
+                f"SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                f"AND lower(name) IN ({placeholders}) LIMIT 1",
+                _FTS_TRIGGERS,
+            ).fetchone()
+            if surviving_triggers and view_valid is not True:
+                # With no vtable declarations, only the exact canonical v23
+                # source view can prove current storage semantics. Otherwise
+                # legacy/current trigger bodies are insufficient evidence.
+                return "ambiguous"
+        if standard == "missing" and trigram in ("inline", "external"):
+            # The surviving trigram vtable proves the supported legacy family;
+            # recreate and rebuild the matching standard table.
+            return trigram
+        if standard in ("missing", "current"):
+            if trigram not in ("missing", "current"):
+                return "ambiguous"
+            # A malformed present view is unsafe because IF NOT EXISTS would
+            # preserve it. A missing view is safely repairable even when the
+            # current trigram table already exists: canonical DDL recreates
+            # only the external-content view and preserves the index.
+            if trigram == "current" and view_valid is False:
+                return "ambiguous"
+            if trigram == "missing" and view_valid is False:
+                return "ambiguous"
+            return None
+        if standard in ("inline", "external"):
+            if trigram in ("missing", standard):
+                return standard
+            return "ambiguous"
+        return "ambiguous"
+
+    @staticmethod
     def _db_has_legacy_inline_fts(cursor: sqlite3.Cursor) -> bool:
         """True when messages_fts exists in ANY pre-v23 shape.
 
-        v23's messages_fts is external-content over THREE real columns
-        (content, tool_name, tool_calls). Every pre-v23 shape lacks the
-        tool_name/tool_calls columns — whether the old inline single-column
-        form (v11..v22) or the even older external-content single-column form
-        (v10-era, pre-#16751). We therefore detect "needs optimize" as "the
-        stored CREATE lacks the tool_name column", which is the precise v23
-        marker and correctly catches BOTH legacy variants.
-
-        Returns False when messages_fts doesn't exist yet (fresh DB mid-init):
-        the post-migration FTS setup block will create it in the v23 shape.
+        The historical name is retained because callers use this as the v23
+        optimization gate. Trigger maintenance must use ``_legacy_fts_layout``
+        to distinguish inline from older external-content storage.
         """
-        row = cursor.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'messages_fts'"
-        ).fetchone()
-        if row is None:
-            return False
-        sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
-        # The v23 table declares tool_name/tool_calls columns. Their absence
-        # means a legacy shape that doesn't index tool metadata → optimize.
-        return "tool_name" not in sql
+        return SessionDB._legacy_fts_layout(cursor) is not None
 
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""
@@ -2346,6 +2687,32 @@ class SessionDB:
             self._warn_fts5_unavailable(exc)
             return False
 
+    def _sqlite_supports_trigram(self, cursor: sqlite3.Cursor) -> bool:
+        """Exercise tokenizer registration independently of existing tables."""
+        probe = "_hermes_trigram_probe"
+        try:
+            cursor.execute(f"DROP TABLE IF EXISTS temp.{probe}")
+            cursor.execute(
+                f"CREATE VIRTUAL TABLE temp.{probe} "
+                "USING fts5(x, tokenize='trigram')"
+            )
+            cursor.execute(f"INSERT INTO temp.{probe}(x) VALUES ('capability probe')")
+            cursor.execute(
+                f"SELECT rowid FROM temp.{probe} "
+                f"WHERE {probe} MATCH 'capability'"
+            ).fetchone()
+            cursor.execute(f"DROP TABLE temp.{probe}")
+            return True
+        except sqlite3.OperationalError as exc:
+            try:
+                cursor.execute(f"DROP TABLE IF EXISTS temp.{probe}")
+            except sqlite3.OperationalError:
+                pass
+            if not self._is_trigram_unavailable_error(exc):
+                raise
+            self._warn_trigram_unavailable(exc)
+            return False
+
     def _ensure_fts_cjk_schema(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.
 
@@ -2371,44 +2738,62 @@ class SessionDB:
         """
         cjk_present = bool(cursor.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'messages_fts_cjk'"
+            "AND name = 'messages_fts_cjk' COLLATE NOCASE"
         ).fetchone())
 
+        cjk_live = []
+        if cjk_present:
+            cjk_live = [
+                r[0] for r in cursor.execute(
+                    "SELECT lower(name) FROM sqlite_master WHERE type = 'trigger' "
+                    f"AND lower(name) IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
+                    _FTS_CJK_TRIGGERS,
+                ).fetchall()
+            ]
+
         if not self._fts_cjk_loaded:
-            if cjk_present:
-                live = [
-                    r[0] for r in cursor.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
-                        _FTS_CJK_TRIGGERS,
-                    ).fetchall()
-                ]
-                if live:
-                    # Self-heal: this process cannot tokenize, so every
-                    # message INSERT would die inside the cjk trigger.
-                    # Breadcrumb FIRST (crash between the two statements is
-                    # merely conservative), then drop.
-                    logger.warning(
-                        "messages_fts_cjk triggers present but the "
-                        "cjk_unicode61 tokenizer is unavailable (%s) — "
-                        "dropping the cjk triggers so message writes keep "
-                        "working. CJK search falls back to trigram/LIKE; "
-                        "run `hermes sessions optimize-storage` on a host "
-                        "with the extension to rebuild.",
-                        fts5_cjk_so_path(),
-                    )
-                    cursor.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                        "ON CONFLICT(key) DO UPDATE SET value = '1'",
-                        (FTS_CJK_STALE_KEY,),
-                    )
-                    for trig in live:
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            if cjk_live:
+                # Self-heal: this process cannot tokenize, so every
+                # message INSERT would die inside the cjk trigger.
+                # Breadcrumb FIRST (crash between the two statements is
+                # merely conservative), then drop.
+                logger.warning(
+                    "messages_fts_cjk triggers present but the "
+                    "cjk_unicode61 tokenizer is unavailable (%s) — "
+                    "dropping the cjk triggers so message writes keep "
+                    "working. CJK search falls back to trigram/LIKE; "
+                    "run `hermes sessions optimize-storage` on a host "
+                    "with the extension to rebuild.",
+                    fts5_cjk_so_path(),
+                )
+                cursor.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                    (FTS_CJK_STALE_KEY,),
+                )
+                for trig in cjk_live:
+                    cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
             self._fts_cjk_available = False
             return
 
+        if cjk_present and len(cjk_live) != len(_FTS_CJK_TRIGGERS):
+            # A missing trigger means writes may have crossed an unmaintained
+            # interval. Mark stale before dropping the remainder; recreating
+            # triggers alone would silently serve an index with an unknown gap.
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                (FTS_CJK_STALE_KEY,),
+            )
+            for trig in cjk_live:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            self._fts_cjk_available = False
+            return
+
+        savepoint = "hermes_fts_cjk_ensure"
+        cursor.execute(f"SAVEPOINT {savepoint}")
         try:
-            cursor.executescript(FTS_CJK_TABLE_SQL)
+            self._execute_ddl_statements(cursor, FTS_CJK_TABLE_SQL)
             if not cjk_present:
                 # Freshly created. An empty DB's index is complete by
                 # construction (triggers will cover every future row); a
@@ -2448,14 +2833,18 @@ class SessionDB:
                 # for an unindexed rowid corrupts the index); the next
                 # `optimize-storage` run rebuilds from scratch.
                 self._fts_cjk_available = False
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
                 return
-            cursor.executescript(FTS_CJK_TRIGGER_SQL)
+            self._execute_ddl_statements(cursor, FTS_CJK_TRIGGER_SQL)
             backfill_pending = cursor.execute(
                 "SELECT 1 FROM state_meta "
                 "WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
             ).fetchone()
             self._fts_cjk_available = not backfill_pending
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
         except sqlite3.OperationalError:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             # Includes "no such tokenizer: cjk_unicode61" if the extension
             # loaded but registration failed — degrade to trigram/LIKE.
             logger.warning(
@@ -2463,24 +2852,451 @@ class SessionDB:
                 "trigram/LIKE", exc_info=True,
             )
             self._fts_cjk_available = False
+        except BaseException:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
 
     @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
-        for trigger in _FTS_TRIGGERS:
+        for trigger in _FTS_TRIGGERS + _FTS_CJK_TRIGGERS:
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:
                 pass
 
     @staticmethod
-    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+    def _mark_trigram_stale(cursor: sqlite3.Cursor) -> None:
+        """Disable trigram writes until a tokenizer-capable full rebuild."""
+        cursor.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+            (FTS_TRIGRAM_STALE_KEY,),
+        )
+        for trigger in _FTS_TRIGRAM_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    @staticmethod
+    def _named_trigger_count(
+        cursor: sqlite3.Cursor,
+        names: tuple[str, ...],
+    ) -> int:
+        placeholders = ",".join("?" for _ in names)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
-            f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
+            f"WHERE type = 'trigger' AND lower(name) IN ({placeholders})",
+            names,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+
+    @staticmethod
+    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
+        return SessionDB._named_trigger_count(cursor, _FTS_TRIGGERS)
+
+    @staticmethod
+    def _migrate_broad_fts_update_triggers(
+        cursor: sqlite3.Cursor,
+        ddl: str,
+        *,
+        locked_ddl_resolver: Optional[
+            Callable[[sqlite3.Cursor], str]
+        ] = None,
+        repair_state: Optional[Dict[str, bool]] = None,
+    ) -> bool:
+        """Atomically converge FTS maintenance triggers to proven-layout DDL.
+
+        A cheap read-only preflight keeps already-converged opens free of a
+        write lock. Any apparent mismatch is classified again only after
+        ``BEGIN IMMEDIATE`` so two initializers cannot race. SQLite DDL is
+        transactional; dropping and recreating each affected trigger before
+        COMMIT leaves no triggerless writer window. Header-only UPDATE OF
+        narrowing does not require a rebuild; any body mismatch is reported to
+        the caller because prior writes may have left an indexing gap.
+        """
+        candidate_names = _FTS_TRIGGERS + _FTS_CJK_TRIGGERS
+
+        def _trigger_header_tokens(sql: str):
+            """Lex CREATE TRIGGER SQL through BEGIN, preserving identifiers."""
+            tokens = []
+            index = 0
+            while index < len(sql):
+                char = sql[index]
+                if char.isspace():
+                    index += 1
+                    continue
+                if sql.startswith("--", index):
+                    newline = sql.find("\n", index + 2)
+                    index = len(sql) if newline < 0 else newline + 1
+                    continue
+                if sql.startswith("/*", index):
+                    end = sql.find("*/", index + 2)
+                    if end < 0:
+                        return None
+                    index = end + 2
+                    continue
+                if char == "'":
+                    # String literals are not identifiers. Parse them so their
+                    # contents can never masquerade as trigger-header syntax.
+                    index += 1
+                    while index < len(sql):
+                        if sql[index] != "'":
+                            index += 1
+                            continue
+                        if index + 1 < len(sql) and sql[index + 1] == "'":
+                            index += 2
+                            continue
+                        index += 1
+                        break
+                    else:
+                        return None
+                    tokens.append(("string", ""))
+                    continue
+                if char in ('"', "`", "["):
+                    closing = "]" if char == "[" else char
+                    identifier = []
+                    index += 1
+                    while index < len(sql):
+                        if sql[index] != closing:
+                            identifier.append(sql[index])
+                            index += 1
+                            continue
+                        if index + 1 < len(sql) and sql[index + 1] == closing:
+                            identifier.append(closing)
+                            index += 2
+                            continue
+                        index += 1
+                        break
+                    else:
+                        return None
+                    tokens.append(("identifier", "".join(identifier).lower()))
+                    continue
+                if char.isalpha() or char == "_":
+                    start = index
+                    index += 1
+                    while index < len(sql) and (
+                        sql[index].isalnum() or sql[index] in "_$"
+                    ):
+                        index += 1
+                    word = sql[start:index].lower()
+                    if word == "begin":
+                        return tokens
+                    tokens.append(("word", word))
+                    continue
+                if char == ",":
+                    tokens.append(("comma", char))
+                    index += 1
+                    continue
+                tokens.append(("symbol", char))
+                index += 1
+            return None
+
+        def _columns(sql: str) -> frozenset[str]:
+            # Parse only the CREATE TRIGGER header. SQLite treats UPDATE OF
+            # column order and duplicate names as semantically irrelevant, but
+            # quoted commas belong to one identifier and body strings/comments
+            # must not be able to spoof a narrowed column list.
+            tokens = _trigger_header_tokens(sql)
+            if not tokens:
+                return frozenset()
+            for position in range(len(tokens) - 2):
+                if tokens[position] != ("word", "after") or tokens[
+                    position + 1
+                ] != ("word", "update"):
+                    continue
+                if tokens[position + 2] != ("word", "of"):
+                    return frozenset()
+                columns = set()
+                expect_identifier = True
+                for offset, (kind, value) in enumerate(
+                    tokens[position + 3 :], start=position + 3
+                ):
+                    if kind == "word" and value == "on":
+                        if expect_identifier or not columns:
+                            return frozenset()
+                        on_position = offset
+                        break
+                    if expect_identifier:
+                        if kind not in ("word", "identifier"):
+                            return frozenset()
+                        columns.add(value)
+                        expect_identifier = False
+                    else:
+                        if kind != "comma":
+                            return frozenset()
+                        expect_identifier = True
+                else:
+                    return frozenset()
+
+                if on_position + 1 >= len(tokens):
+                    return frozenset()
+                table_kind, table_name = tokens[on_position + 1]
+                if table_kind not in ("word", "identifier") or table_name != "messages":
+                    return frozenset()
+                return frozenset(columns)
+            return frozenset()
+
+        def _semantic_tokens(sql: str):
+            """Normalize SQL syntax while preserving literal values."""
+            tokens = []
+            index = 0
+            while index < len(sql):
+                char = sql[index]
+                if char.isspace():
+                    index += 1
+                    continue
+                if sql.startswith("--", index):
+                    newline = sql.find("\n", index + 2)
+                    index = len(sql) if newline < 0 else newline + 1
+                    continue
+                if sql.startswith("/*", index):
+                    end = sql.find("*/", index + 2)
+                    if end < 0:
+                        return None
+                    index = end + 2
+                    continue
+                if char in ("'", '"', "`", "["):
+                    closing = "]" if char == "[" else char
+                    value = []
+                    index += 1
+                    while index < len(sql):
+                        if sql[index] != closing:
+                            value.append(sql[index])
+                            index += 1
+                            continue
+                        if index + 1 < len(sql) and sql[index + 1] == closing:
+                            value.append(closing)
+                            index += 2
+                            continue
+                        index += 1
+                        break
+                    else:
+                        return None
+                    if char == "'":
+                        tokens.append(("string", "".join(value)))
+                    else:
+                        tokens.append(("word", "".join(value).lower()))
+                    continue
+                if char.isalpha() or char == "_":
+                    start = index
+                    index += 1
+                    while index < len(sql) and (
+                        sql[index].isalnum() or sql[index] in "_$"
+                    ):
+                        index += 1
+                    tokens.append(("word", sql[start:index].lower()))
+                    continue
+                tokens.append((char, char))
+                index += 1
+            while tokens and tokens[-1] == (";", ";"):
+                tokens.pop()
+            return tokens
+
+        def _trigger_semantics(sql: str):
+            """Return full trigger behavior, allowing only cosmetic SQL changes."""
+            tokens = _semantic_tokens(sql)
+            if not tokens:
+                return None
+            try:
+                position = 0
+                if tokens[position : position + 2] != [
+                    ("word", "create"),
+                    ("word", "trigger"),
+                ]:
+                    return None
+                position += 2
+                if tokens[position : position + 3] == [
+                    ("word", "if"),
+                    ("word", "not"),
+                    ("word", "exists"),
+                ]:
+                    position += 3
+                if position >= len(tokens) or tokens[position][0] != "word":
+                    return None
+                declared_name = tokens[position][1]
+                position += 1
+                if tokens[position] != ("word", "after"):
+                    return None
+                event = tokens[position + 1][1]
+                if event not in ("insert", "delete", "update"):
+                    return None
+                position += 2
+                columns = None
+                if event == "update" and tokens[position] == ("word", "of"):
+                    position += 1
+                    parsed_columns = set()
+                    expect_column = True
+                    while position < len(tokens) and tokens[position] != (
+                        "word",
+                        "on",
+                    ):
+                        kind, value = tokens[position]
+                        if expect_column:
+                            if kind != "word":
+                                return None
+                            parsed_columns.add(value)
+                        elif kind != ",":
+                            return None
+                        expect_column = not expect_column
+                        position += 1
+                    if expect_column or not parsed_columns:
+                        return None
+                    columns = frozenset(parsed_columns)
+                if position >= len(tokens) or tokens[position] != ("word", "on"):
+                    return None
+                position += 1
+                if position >= len(tokens) or tokens[position][0] != "word":
+                    return None
+                table_name = tokens[position][1]
+                position += 1
+                try:
+                    begin = tokens.index(("word", "begin"), position)
+                except ValueError:
+                    return None
+                header_tail = tuple(tokens[position:begin])
+                body = tokens[begin + 1 :]
+                while body and body[-1] == (";", ";"):
+                    body.pop()
+                if not body or body[-1] != ("word", "end"):
+                    return None
+                return (
+                    declared_name,
+                    event,
+                    columns,
+                    table_name,
+                    header_tail,
+                    tuple(body),
+                )
+            except (IndexError, ValueError):
+                return None
+
+        def _parse_ddl(
+            schema_ddl: str,
+        ) -> tuple[Dict[str, str], Dict[str, tuple]]:
+            statements: Dict[str, str] = {}
+            statement = ""
+            for line in schema_ddl.splitlines(keepends=True):
+                statement += line
+                if not sqlite3.complete_statement(statement):
+                    continue
+                normalized = " ".join(statement.split())
+                for name in candidate_names:
+                    marker = f"CREATE TRIGGER IF NOT EXISTS {name} "
+                    if marker in normalized:
+                        statements[name] = statement.strip()
+                        break
+                statement = ""
+            semantics = {
+                name: _trigger_semantics(sql) for name, sql in statements.items()
+            }
+            return statements, semantics
+
+        create_statements, expected_semantics = _parse_ddl(ddl)
+        trigger_names = tuple(
+            name for name in candidate_names if name in create_statements
+        )
+        if not trigger_names:
+            logger.warning("Could not locate narrowed FTS trigger DDL")
+            return False
+        if not all(expected_semantics.values()):
+            logger.warning(
+                "Could not parse narrowed FTS trigger DDL: %s",
+                [name for name, value in expected_semantics.items() if value is None],
+            )
+            return False
+
+        def _is_converged(name: str, sql: str) -> bool:
+            return _trigger_semantics(sql) == expected_semantics[name]
+
+        def _is_header_only_narrowing(name: str, sql: str) -> bool:
+            """True only when canonical behavior differs solely by UPDATE OF."""
+            actual = _trigger_semantics(sql)
+            expected = expected_semantics[name]
+            if actual is None or expected is None:
+                return False
+            if actual[1] != "update" or expected[1] != "update":
+                return False
+            return (
+                actual[0] == expected[0]
+                and actual[1] == expected[1]
+                and actual[3:] == expected[3:]
+                and actual[2] != expected[2]
+            )
+
+        placeholders = ",".join("?" for _ in trigger_names)
+
+        def _read_trigger_sql() -> Dict[str, str]:
+            rows = cursor.execute(
+                f"SELECT lower(name), sql FROM sqlite_master "
+                f"WHERE type = 'trigger' AND lower(name) IN ({placeholders})",
+                trigger_names,
+            ).fetchall()
+            return {
+                str(row[0]).lower(): str(row[1])
+                for row in rows
+                if row[1]
+            }
+
+        try:
+            preflight = _read_trigger_sql()
+        except sqlite3.OperationalError:
+            return False
+        if not any(
+            name in preflight and not _is_converged(name, preflight[name])
+            for name in trigger_names
+        ):
+            return False
+
+        connection = getattr(cursor, "connection", cursor)
+        owns_transaction = not connection.in_transaction
+        if owns_transaction:
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                return False
+
+        try:
+            # The preflight is intentionally non-authoritative. Layout and
+            # trigger DDL are selected again only after acquiring the write
+            # lock: a concurrent storage optimizer may have converted legacy
+            # tables to v23 between the caller's layout read and this point.
+            if locked_ddl_resolver is not None:
+                authoritative_ddl = locked_ddl_resolver(cursor)
+                create_statements, expected_semantics = _parse_ddl(
+                    authoritative_ddl
+                )
+                trigger_names = tuple(
+                    name for name in candidate_names if name in create_statements
+                )
+                if not trigger_names or not all(expected_semantics.values()):
+                    raise sqlite3.OperationalError(
+                        "could not resolve authoritative FTS trigger DDL"
+                    )
+                placeholders = ",".join("?" for _ in trigger_names)
+
+            locked = _read_trigger_sql()
+            mismatched = [
+                name
+                for name in trigger_names
+                if name in locked and not _is_converged(name, locked[name])
+            ]
+            if repair_state is not None and any(
+                not _is_header_only_narrowing(name, locked[name])
+                for name in mismatched
+            ):
+                repair_state["requires_rebuild"] = True
+            for name in mismatched:
+                cursor.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+                cursor.execute(create_statements[name])
+            if owns_transaction:
+                cursor.execute("COMMIT")
+            return bool(mismatched)
+        except BaseException:
+            if owns_transaction:
+                try:
+                    cursor.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+            raise
 
     @staticmethod
     def _rebuild_fts_indexes(
@@ -2488,10 +3304,11 @@ class SessionDB:
         *,
         include_trigram: bool = True,
     ) -> None:
-        # Both FTS tables are external-content (v23+): the special 'rebuild'
-        # command wipes the inverted index and repopulates it from the
-        # content source (messages for the standard index, the tool-row-
-        # excluding messages_fts_trigram_src view for the trigram index).
+        # External-content FTS tables (both v23 and the pre-v11 one-column
+        # layout) support the special 'rebuild' command. It wipes the inverted
+        # index and repopulates from each table's declared content source
+        # (messages for the standard/legacy indexes, and the role-filtered
+        # messages_fts_trigram_src view for the v23 trigram index).
         cursor.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         if include_trigram:
             cursor.execute(
@@ -2556,6 +3373,27 @@ class SessionDB:
                 return False
             raise
 
+    @staticmethod
+    def _execute_ddl_statements(
+        cursor: sqlite3.Cursor,
+        ddl: str,
+    ) -> None:
+        """Execute complete DDL statements without ``executescript`` commits.
+
+        ``Connection.executescript`` commits an active transaction before it
+        runs. Storage migrations that already hold ``BEGIN IMMEDIATE`` must use
+        this helper so table/view/trigger replacement remains atomic.
+        """
+        statement = ""
+        for line in ddl.splitlines(keepends=True):
+            statement += line
+            if not sqlite3.complete_statement(statement):
+                continue
+            cursor.execute(statement)
+            statement = ""
+        if statement.strip():
+            raise sqlite3.OperationalError("incomplete FTS DDL statement")
+
     def _ensure_fts_schema(
         self,
         cursor: sqlite3.Cursor,
@@ -2565,13 +3403,20 @@ class SessionDB:
         status = self._fts_table_probe(cursor, table_name)
         if status is None:
             return False
+        savepoint = "hermes_fts_ensure"
+        cursor.execute(f"SAVEPOINT {savepoint}")
         try:
             # Run even when the virtual table exists so any dropped or missing
             # triggers are recreated after a previous no-FTS5 runtime disabled
-            # them to keep message writes working.
-            cursor.executescript(ddl)
+            # them to keep message writes working. Execute statements
+            # individually: executescript would commit the initializer's
+            # authoritative BEGIN IMMEDIATE transaction.
+            self._execute_ddl_statements(cursor, ddl)
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             return True
         except sqlite3.OperationalError as exc:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             if not self._is_fts5_unavailable_error(exc):
                 raise
             # Only disable FTS entirely when the whole FTS5 module is missing.
@@ -2582,6 +3427,10 @@ class SessionDB:
             else:
                 self._warn_fts5_unavailable(exc)
             return False
+        except BaseException:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
 
     def _execute_write(
         self,
@@ -2889,14 +3738,18 @@ class SessionDB:
                     "AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)",
                     (lo, hi),
                 )
-                conn.execute(
-                    "INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls) "
-                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
-                    "FROM messages m "
-                    "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
-                    "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)",
-                    (lo, hi),
-                )
+                if self._trigram_available:
+                    conn.execute(
+                        "INSERT INTO messages_fts_trigram"
+                        "(rowid, content, tool_name, tool_calls) "
+                        "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                        "FROM messages m "
+                        "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
+                        "AND NOT EXISTS ("
+                        "SELECT 1 FROM messages_fts_trigram_docsize d "
+                        "WHERE d.id = m.id)",
+                        (lo, hi),
+                    )
             conn.execute(
                 "DELETE FROM state_meta WHERE key IN "
                 "('fts_rebuild_high_water', 'fts_rebuild_progress')"
@@ -3149,10 +4002,8 @@ class SessionDB:
             return True
         was_stale = self._execute_write(_do)
         if was_stale:
-            # Recreate outside the write transaction — _ensure_fts_cjk_schema
-            # uses executescript(), which implicitly commits any pending
-            # transaction and must not run inside _execute_write's BEGIN
-            # IMMEDIATE. Sets fresh backfill markers on a populated DB.
+            # Recreate under the normal write lock. The ensure helper preserves
+            # caller transaction ownership and uses a savepoint for partial DDL.
             with self._lock:
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
@@ -3220,15 +4071,15 @@ class SessionDB:
             conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
             had = bool(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name IN ('messages_fts', 'messages_fts_trigram') "
-                "AND sql LIKE 'CREATE VIRTUAL TABLE%' LIMIT 1"
+                "AND lower(name) IN ('messages_fts', 'messages_fts_trigram') "
+                "AND lower(sql) LIKE 'create virtual table%' LIMIT 1"
             ).fetchone())
             if had:
                 conn.execute("PRAGMA writable_schema=ON")
                 conn.execute(
                     "DELETE FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('messages_fts', 'messages_fts_trigram') "
-                    "AND sql LIKE 'CREATE VIRTUAL TABLE%'"
+                    "AND lower(name) IN ('messages_fts', 'messages_fts_trigram') "
+                    "AND lower(sql) LIKE 'create virtual table%'"
                 )
                 conn.execute("PRAGMA writable_schema=RESET")
                 shadows = [
@@ -3240,9 +4091,11 @@ class SessionDB:
                 ]
                 for sh in shadows:
                     conn.execute(f"ALTER TABLE {sh} RENAME TO fts_v22_trash_{sh}")
-            # Create the new v23 empty schema + set the backfill markers.
-            self._ensure_fts_schema(conn, "messages_fts", FTS_SQL)
-            self._ensure_fts_schema(conn, "messages_fts_trigram", FTS_TRIGRAM_SQL)
+            # Create the new v23 empty schema in the SAME BEGIN IMMEDIATE
+            # transaction as trigger/table demotion. ``executescript`` would
+            # commit first and expose a triggerless writer window.
+            self._execute_ddl_statements(conn, FTS_SQL)
+            self._execute_ddl_statements(conn, FTS_TRIGRAM_SQL)
             hw = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
             for k, v in (
                 ("fts_rebuild_high_water", str(hw)),
@@ -3673,8 +4526,11 @@ class SessionDB:
                         cursor, "messages_fts_trigram"
                     )
                     if _fts_trigram_exists is False:
-                        if self._ensure_fts_schema(
-                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                        if (
+                            self._sqlite_supports_trigram(cursor)
+                            and self._ensure_fts_schema(
+                                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                            )
                         ):
                             cursor.execute(
                                 "INSERT INTO messages_fts_trigram(rowid, content) "
@@ -3953,37 +4809,179 @@ class SessionDB:
             pass  # Index already exists
 
         if fts5_available:
+            # Classification, DDL selection/repair, and any required rebuild
+            # are one authoritative schema migration. A concurrent optimizer
+            # cannot change legacy/current layout between these decisions.
+            self._conn.commit()
+            cursor.execute("BEGIN IMMEDIATE")
+
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
             #
-            # OPT-IN v23 boundary: a legacy v22 install (inline-content FTS,
+            # OPT-IN v23 boundary: a legacy pre-v23 install (either the v10
+            # one-column external-content layout or the v11-v22 inline layout,
             # not yet opted into `hermes db optimize`) must keep its EXISTING
-            # inline schema + triggers. Running the v23 external-content DDL
+            # table shape and layout-specific triggers. Running the v23 DDL
             # here would create the trigram source VIEW and leave the DB in a
-            # mixed inline/external state. So for a legacy DB we only ensure
-            # its inline triggers exist (via the legacy DDL), and skip the
-            # v23 view/external tables entirely. Fresh installs and opted-in
-            # DBs have no legacy inline FTS, so they get the v23 DDL.
-            if self._db_has_legacy_inline_fts(cursor):
+            # mixed state. Fresh installs and opted-in DBs have no legacy
+            # layout, so they get the v23 DDL.
+            def _authoritative_trigger_ddl(
+                locked_cursor: sqlite3.Cursor,
+            ) -> str:
+                locked_layout = self._legacy_fts_layout(locked_cursor)
+                if locked_layout == "ambiguous":
+                    raise sqlite3.OperationalError(
+                        "ambiguous FTS layout while narrowing update triggers"
+                    )
+                if locked_layout == "external":
+                    return (
+                        LEGACY_EXTERNAL_FTS_SQL
+                        + "\n"
+                        + LEGACY_EXTERNAL_FTS_TRIGRAM_SQL
+                    )
+                if locked_layout == "inline":
+                    return LEGACY_FTS_SQL + "\n" + LEGACY_FTS_TRIGRAM_SQL
+                current_ddl = FTS_SQL + "\n" + FTS_TRIGRAM_SQL
+                if self._fts_cjk_loaded:
+                    current_ddl += "\n" + FTS_CJK_TRIGGER_SQL
+                return current_ddl
+
+            legacy_layout = self._legacy_fts_layout(cursor)
+            if legacy_layout == "ambiguous":
+                logger.error(
+                    "Ambiguous or mixed legacy FTS table layouts in %s; "
+                    "refusing to rewrite triggers or serve potentially stale indexes",
+                    self.db_path,
+                )
+                self._fts_enabled = False
+                self._trigram_available = False
+                # No maintenance trigger is safe when table storage semantics
+                # are unproven. Preserve tables for inspection, but quarantine
+                # every FTS surface so canonical message writes remain safe.
+                self._drop_fts_triggers(cursor)
+            elif legacy_layout is not None:
+                base_table_missing = (
+                    self._fts_table_probe(cursor, "messages_fts") is False
+                )
+                trigram_table_missing = (
+                    self._fts_table_probe(cursor, "messages_fts_trigram") is False
+                )
+                if legacy_layout == "external":
+                    base_ddl = LEGACY_EXTERNAL_FTS_SQL
+                    trigram_ddl = LEGACY_EXTERNAL_FTS_TRIGRAM_SQL
+                else:
+                    base_ddl = LEGACY_FTS_SQL
+                    trigram_ddl = LEGACY_FTS_TRIGRAM_SQL
+
+                # A surviving name does not prove compatible INSERT/DELETE
+                # semantics. When recreating a table, replace its complete
+                # trigger family from the authoritatively proven layout.
+                if base_table_missing:
+                    for trigger in _FTS_TRIGGERS[:3]:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                if trigram_table_missing:
+                    for trigger in _FTS_TRIGRAM_TRIGGERS:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+                trigger_repair_state: Dict[str, bool] = {}
+                self._migrate_broad_fts_update_triggers(
+                    cursor,
+                    base_ddl + "\n" + trigram_ddl,
+                    locked_ddl_resolver=_authoritative_trigger_ddl,
+                    repair_state=trigger_repair_state,
+                )
+                base_triggers_need_repair = (
+                    self._named_trigger_count(cursor, _FTS_TRIGGERS[:3]) < 3
+                )
                 triggers_need_repair = (
                     self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                )
+                trigram_stale = bool(
+                    cursor.execute(
+                        "SELECT 1 FROM state_meta WHERE key = ?",
+                        (FTS_TRIGRAM_STALE_KEY,),
+                    ).fetchone()
                 )
                 self._fts_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts", LEGACY_FTS_SQL
+                    cursor, "messages_fts", base_ddl
                 )
                 if self._fts_enabled:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
+                    trigram_capable = self._sqlite_supports_trigram(cursor)
+                    trigram_enabled = (
+                        self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", trigram_ddl
+                        )
+                        if trigram_capable
+                        else False
                     )
                     self._trigram_available = trigram_enabled
-                    if triggers_need_repair:
-                        self._rebuild_legacy_fts_indexes(
-                            cursor, include_trigram=trigram_enabled
-                        )
+                    needs_base_rebuild = (
+                        base_table_missing
+                        or base_triggers_need_repair
+                        or trigger_repair_state.get("requires_rebuild", False)
+                    )
+                    needs_full_rebuild = (
+                        trigram_table_missing
+                        or triggers_need_repair
+                        or trigram_stale
+                        or trigger_repair_state.get("requires_rebuild", False)
+                    )
+                    if not trigram_enabled:
+                        self._mark_trigram_stale(cursor)
+                    if needs_base_rebuild or (trigram_enabled and needs_full_rebuild):
+                        include_trigram = trigram_enabled
+                        if legacy_layout == "external":
+                            self._rebuild_fts_indexes(
+                                cursor, include_trigram=include_trigram
+                            )
+                        else:
+                            self._rebuild_legacy_fts_indexes(
+                                cursor, include_trigram=include_trigram
+                            )
+                        if include_trigram:
+                            cursor.execute(
+                                "DELETE FROM state_meta WHERE key = ?",
+                                (FTS_TRIGRAM_STALE_KEY,),
+                            )
             else:
+                base_table_missing = (
+                    self._fts_table_probe(cursor, "messages_fts") is False
+                )
+                trigram_table_missing = (
+                    self._fts_table_probe(cursor, "messages_fts_trigram") is False
+                )
+                migration_ddl = FTS_SQL + "\n" + FTS_TRIGRAM_SQL
+                if self._fts_cjk_loaded:
+                    migration_ddl += "\n" + FTS_CJK_TRIGGER_SQL
+                # Missing current tables are data-loss repairs, not trigger
+                # narrowing. Replace the complete target trigger family before
+                # recreating storage so opposite-layout bodies cannot survive
+                # CREATE TRIGGER IF NOT EXISTS.
+                if base_table_missing:
+                    for trigger in _FTS_TRIGGERS[:3]:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                if trigram_table_missing:
+                    for trigger in _FTS_TRIGRAM_TRIGGERS:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                trigger_repair_state: Dict[str, bool] = {}
+                self._migrate_broad_fts_update_triggers(
+                    cursor,
+                    migration_ddl,
+                    locked_ddl_resolver=_authoritative_trigger_ddl,
+                    repair_state=trigger_repair_state,
+                )
+                base_triggers_need_repair = (
+                    self._named_trigger_count(cursor, _FTS_TRIGGERS[:3]) < 3
+                )
                 triggers_need_repair = (
                     self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                )
+                trigram_stale = bool(
+                    cursor.execute(
+                        "SELECT 1 FROM state_meta WHERE key = ?",
+                        (FTS_TRIGRAM_STALE_KEY,),
+                    ).fetchone()
                 )
                 self._fts_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts", FTS_SQL
@@ -3993,14 +4991,47 @@ class SessionDB:
                 # relative to the main FTS table; if it cannot be created,
                 # CJK search falls back to LIKE.
                 if self._fts_enabled:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    trigram_capable = self._sqlite_supports_trigram(cursor)
+                    trigram_enabled = (
+                        self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                        )
+                        if trigram_capable
+                        else False
                     )
                     self._trigram_available = trigram_enabled
-                    if triggers_need_repair:
+                    if not trigram_enabled:
+                        # The optional tokenizer cannot safely maintain either
+                        # an existing partial index or dangling triggers for a
+                        # missing table. Disable writes to trigram and force a
+                        # complete rebuild on the next capable open.
+                        self._mark_trigram_stale(cursor)
+                        if (
+                            base_table_missing
+                            or base_triggers_need_repair
+                            or trigger_repair_state.get("requires_rebuild", False)
+                        ):
+                            self._rebuild_fts_indexes(
+                                cursor,
+                                include_trigram=False,
+                            )
+                    elif (
+                        triggers_need_repair
+                        or base_table_missing
+                        or trigram_table_missing
+                        or trigram_stale
+                        or trigger_repair_state.get("requires_rebuild", False)
+                    ):
+                        # Shared progress markers govern both current indexes.
+                        # Any repair or stale trigram breadcrumb therefore
+                        # converges both indexes and retires gating together.
                         self._rebuild_fts_indexes(
                             cursor,
-                            include_trigram=trigram_enabled,
+                            include_trigram=True,
+                        )
+                        cursor.execute(
+                            "DELETE FROM state_meta WHERE key = ?",
+                            (FTS_TRIGRAM_STALE_KEY,),
                         )
                     # CJK-bigram index (cjk_unicode61). Strictly additive to
                     # the surfaces above and gated on the loadable tokenizer:
