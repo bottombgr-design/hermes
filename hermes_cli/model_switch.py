@@ -1693,6 +1693,11 @@ def prewarm_picker_cache_async() -> Optional["_threading.Thread"]:
             # Calling this is what populates cached_provider_model_ids() ->
             # provider_models_cache.json for each authed provider. We discard
             # the result; the side effect (warm disk cache) is the point.
+            #
+            # ``persist_discovered=False`` keeps this background warmup
+            # read-only with respect to the user's config.yaml (#67841):
+            # prewarming must never write discovered models back into
+            # user-authored configuration without an explicit user action.
             list_authenticated_providers(
                 current_provider=ctx.current_provider,
                 current_base_url=ctx.current_base_url,
@@ -1700,6 +1705,7 @@ def prewarm_picker_cache_async() -> Optional["_threading.Thread"]:
                 user_providers=ctx.user_providers,
                 custom_providers=ctx.custom_providers,
                 excluded_providers=ctx.excluded_providers or [],
+                persist_discovered=False,
             )
         except Exception:
             # Best-effort warmup — never surface errors into the session.
@@ -1724,6 +1730,7 @@ def list_authenticated_providers(
     probe_current_custom_provider: bool = False,
     for_picker: bool = False,
     excluded_providers: list | None = None,
+    persist_discovered: bool = True,
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
 
@@ -1760,6 +1767,12 @@ def list_authenticated_providers(
     opens: probe only the currently-selected custom endpoint so its model list
     matches the active provider without blocking on every saved/offline custom
     endpoint.
+
+    ``persist_discovered`` controls whether a successful custom-provider probe
+    writes the discovered models back into ``custom_providers`` in config.yaml.
+    Default true for CLI parity. Read-only background callers (e.g. the picker
+    prewarm) pass false so simply starting Hermes never rewrites user-authored
+    configuration without an explicit user action (#67841).
     """
     import os
     from agent.models_dev import (
@@ -2795,9 +2808,12 @@ def list_authenticated_providers(
                         # Auto-save discovered models back to config so
                         # ``discover_models: false`` has a populated cache
                         # on the next read.  A failed save is non-fatal.
-                        _save_discovered_models_to_config(
-                            api_url, live_models
-                        )
+                        # Skipped for read-only callers (e.g. prewarm) so
+                        # startup never rewrites config.yaml (#67841).
+                        if persist_discovered:
+                            _save_discovered_models_to_config(
+                                api_url, live_models
+                            )
                 except Exception:
                     pass
             results.append({
