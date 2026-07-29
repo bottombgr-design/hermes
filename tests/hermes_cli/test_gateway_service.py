@@ -878,6 +878,7 @@ class TestLaunchdServiceRecovery:
             calls.append(cmd)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+        monkeypatch.setattr(gateway_cli, "_wait_for_launchd_service_restart", lambda **kw: True)
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
         gateway_cli.launchd_restart()
@@ -905,6 +906,13 @@ class TestLaunchdServiceRecovery:
             "_request_gateway_self_restart",
             lambda pid: calls.append(("self", pid)) or True,
         )
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
+        # Simulate launchd's automatic KeepAlive respawn succeeding
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_restart",
+            lambda **kw: True,
+        )
         monkeypatch.setattr(
             gateway_cli.subprocess,
             "run",
@@ -914,7 +922,62 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_restart()
 
         assert calls == [("self", 321)]
-        assert "restart requested" in capsys.readouterr().out.lower()
+        out = capsys.readouterr().out.lower()
+        assert "restart requested" in out
+
+    def test_launchd_restart_recovers_stuck_self_restart_with_kickstart(self, monkeypatch, capsys):
+        """When launchd fails to auto-respawn, escalate to kickstart -k."""
+        calls = []
+        waits = []
+        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: True)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
+        monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: None)
+
+        # First call: auto-respawn fails.  Second call: kickstart -k succeeds.
+        wait_results = iter([False, True])
+
+        def fake_wait(**kwargs):
+            waits.append(kwargs)
+            return next(wait_results)
+
+        monkeypatch.setattr(gateway_cli, "_wait_for_launchd_service_restart", fake_wait)
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_restart()
+
+        assert waits == [
+            {"previous_pid": 321, "timeout": 27.0},
+            {"previous_pid": 321, "timeout": 20.0},
+        ]
+        assert calls == [["launchctl", "kickstart", "-k", target]]
+        out = capsys.readouterr().out.lower()
+        assert "forcing kickstart" in out
+
+    def test_launchd_restart_raises_when_gateway_never_relaunches(self, monkeypatch):
+        """After kickstart -k, if the gateway still doesn't become healthy, raise."""
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
+        monkeypatch.setattr(gateway_cli, "_wait_for_launchd_service_restart", lambda **kw: False)
+        monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: None)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, check=False, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        with pytest.raises(gateway_cli.subprocess.CalledProcessError):
+            gateway_cli.launchd_restart()
 
     def test_launchd_stop_uses_bootout_not_kill(self, monkeypatch):
         """launchd_stop must bootout the service so KeepAlive doesn't respawn it."""
@@ -1177,6 +1240,7 @@ class TestLaunchdServiceRecovery:
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+        monkeypatch.setattr(gateway_cli, "_wait_for_launchd_service_restart", lambda **kw: True)
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
         gateway_cli.launchd_restart()
