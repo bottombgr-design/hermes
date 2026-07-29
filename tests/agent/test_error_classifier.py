@@ -1061,6 +1061,55 @@ class TestClassifyApiError:
         )
         result = classify_api_error(e)
         assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_error_code_throttled_triggers_fallback(self):
+        e = MockAPIError(
+            "Throttled",
+            body={"error": {"code": "throttled", "message": "Try again later"}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_nvidia_worker_rate_limit_triggers_fallback(self):
+        msg = (
+            "Upstream error from Nvidia: ResourceExhausted: "
+            "Worker local total request limit reached (32/32)"
+        )
+        e = MockAPIError(msg, status_code=429)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_nvidia_worker_rate_limit_message_only(self):
+        msg = (
+            "Upstream error from Nvidia: Worker local total request limit "
+            "reached (267/32) — rotating credential"
+        )
+        e = RuntimeError(msg)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_error_code_rate_limit_exceeded_triggers_fallback(self):
+        e = MockAPIError(
+            "Rate limit exceeded",
+            body={"error": {"code": "rate_limit_exceeded", "message": "Quota hit"}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
 
     def test_error_code_model_not_found(self):
         e = MockAPIError(
