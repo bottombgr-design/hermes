@@ -24,27 +24,36 @@ from hermes_cli.observability.shared_metrics_contract import (
     COUNT_BUCKETS,
     DURATION_BUCKETS,
     EXECUTION_SURFACES,
-    MODEL_FAMILIES,
-    MODEL_LOCALITIES,
-    MODEL_OUTCOMES,
-    PRIMARY_MODEL_CALL_ROLE,
-    PROVIDER_FAMILIES,
+    MODEL_CALL_PROFILE_MODEL,
+    MODEL_IDENTIFIER_MAX_LENGTH,
+    PROVIDER_IDENTIFIER_MAX_LENGTH,
     TASK_END_REASONS,
     TASK_ENTRYPOINTS,
     TASK_OUTCOMES,
     TASK_TERMINATIONS,
+    TOOL_APPROVAL_ATTRIBUTIONS,
+    TOOL_APPROVAL_OUTCOMES,
+    TOOL_CATEGORIES,
+    TOOL_LATENCY_BUCKETS,
+    TOOL_OUTCOMES,
+    TOOL_RETRY_BUCKETS,
     count_bucket,
     duration_bucket,
     execution_surface,
-    model_call_outcome,
     model_call_dimensions,
-    model_family,
-    model_locality,
-    provider_family,
+    model_call_fields,
     task_counter,
     task_start_fields,
     task_terminal_fields,
     task_terminal_state,
+    tool_approval_counter,
+    tool_approval_outcome,
+    tool_call_dimensions,
+    tool_category,
+    tool_latency_bucket,
+    tool_outcome,
+    tool_retry_bucket,
+    tool_terminal_fields,
 )
 
 
@@ -77,13 +86,15 @@ def _task_dimension_schema(kind: str) -> dict[str, object]:
     return schema["$defs"][kind]["properties"]["dimensions"]
 
 
+def _tool_dimension_schema(kind: str) -> dict[str, object]:
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    return schema["$defs"][kind]["properties"]["dimensions"]
+
+
 def _dimensions() -> dict[str, str]:
     return {
-        "call_role": PRIMARY_MODEL_CALL_ROLE,
-        "locality": "remote",
-        "model_family": "claude",
-        "outcome": "success",
-        "provider_family": "direct",
+        "model": "anthropic/claude-sonnet-4.6",
+        "provider": "openrouter",
     }
 
 
@@ -183,11 +194,11 @@ def test_due_export_runs_once_per_utc_day_and_catches_up_pending_deltas(
 def test_package_schema_matches_the_model_call_contract():
     properties = _package_dimension_schema()["properties"]
 
-    assert properties["call_role"] == {"const": PRIMARY_MODEL_CALL_ROLE}
-    assert set(properties["locality"]["enum"]) == MODEL_LOCALITIES
-    assert set(properties["model_family"]["enum"]) == MODEL_FAMILIES
-    assert set(properties["outcome"]["enum"]) == MODEL_OUTCOMES
-    assert set(properties["provider_family"]["enum"]) == PROVIDER_FAMILIES
+    assert set(properties) == {"model", "provider"}
+    assert properties["model"]["maxLength"] == MODEL_IDENTIFIER_MAX_LENGTH
+    assert properties["provider"]["maxLength"] == PROVIDER_IDENTIFIER_MAX_LENGTH
+    assert "enum" not in properties["model"]
+    assert "enum" not in properties["provider"]
 
 
 def test_package_schema_matches_the_task_contract():
@@ -205,89 +216,186 @@ def test_package_schema_matches_the_task_contract():
     assert set(terminal["termination"]["enum"]) == TASK_TERMINATIONS
 
 
+def test_package_schema_matches_the_tool_contract():
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    tool = _tool_dimension_schema("tool_call_counter")["properties"]
+    approval = _tool_dimension_schema("tool_approval_counter")["properties"]
+
+    assert set(tool["tool_category"]["enum"]) == TOOL_CATEGORIES
+    assert set(tool["outcome"]["enum"]) == TOOL_OUTCOMES
+    assert set(tool["approval_outcome"]["enum"]) == TOOL_APPROVAL_OUTCOMES
+    assert tool["latency_bucket"] == {"$ref": "#/$defs/tool_latency_bucket"}
+    assert tool["retry_count_bucket"] == {"$ref": "#/$defs/tool_retry_bucket"}
+    assert set(schema["$defs"]["tool_latency_bucket"]["enum"]) == (
+        TOOL_LATENCY_BUCKETS
+    )
+    assert set(schema["$defs"]["tool_retry_bucket"]["enum"]) == TOOL_RETRY_BUCKETS
+    assert set(approval["attribution"]["enum"]) == TOOL_APPROVAL_ATTRIBUTIONS
+    assert set(approval["outcome"]["enum"]) == (
+        TOOL_APPROVAL_OUTCOMES - {"not_required"}
+    )
+
+
 @pytest.mark.parametrize(
-    ("provider", "expected"),
+    ("toolset", "expected"),
     [
         ("", "unknown"),
-        ("not-a-hermes-provider", "unknown"),
-        ("custom", "custom"),
-        ("custom-local", "custom"),
-        ("custom:private-endpoint", "custom"),
-        ("lmstudio", "local"),
-        ("lm_studio", "local"),
-        ("ollama", "local"),
-        ("nous", "aggregator"),
-        ("openrouter", "aggregator"),
-        ("kilo", "aggregator"),
-        ("copilot-acp", "aggregator"),
-        ("huggingface", "aggregator"),
-        ("novita", "aggregator"),
-        ("anthropic", "direct"),
-        ("google", "direct"),
-        ("openai-api", "direct"),
+        ("file", "file"),
+        ("terminal", "terminal"),
+        ("code_execution", "code_execution"),
+        ("delegation", "delegation"),
+        ("skills", "skill"),
+        ("browser-cdp", "browser"),
+        ("image_gen", "media"),
+        ("homeassistant", "home_automation"),
+        ("kanban", "planning"),
+        ("project", "project"),
+        ("discord", "communication"),
+        ("feishu_doc", "communication"),
+        ("mcp-github", "mcp"),
+        ("private_plugin", "other"),
     ],
 )
-def test_provider_family_uses_bounded_product_categories(provider, expected):
-    assert provider_family({"provider": provider}) == expected
+def test_tool_category_uses_bounded_runtime_toolsets(toolset, expected):
+    assert tool_category({"toolset": toolset}) == expected
 
 
-def test_provider_family_does_not_resolve_live_provider_metadata(monkeypatch):
-    def fail_live_lookup(_provider):
-        raise AssertionError("telemetry must not refresh provider metadata")
-
-    monkeypatch.setattr("hermes_cli.providers.get_provider", fail_live_lookup)
-    assert provider_family({"provider": "anthropic"}) == "direct"
+def test_tool_category_does_not_classify_raw_tool_names():
+    assert tool_category({"tool_name": "read_file"}) == "unknown"
 
 
-def test_locality_uses_the_endpoint_only_for_local_classification():
-    kwargs = {
-        "provider": "custom",
-        "base_url": "http://127.0.0.1:11434/v1",
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("ok", "success"),
+        ("error", "failed"),
+        ("blocked", "blocked"),
+        ("cancelled", "cancelled"),
+        ("timeout", "timed_out"),
+        ("private", "unknown"),
+        (None, "unknown"),
+    ],
+)
+def test_tool_outcome_is_bounded(status, expected):
+    assert tool_outcome({"status": status}) == expected
+
+
+@pytest.mark.parametrize(
+    ("choice", "expected"),
+    [
+        ("once", "approved"),
+        ("session", "approved"),
+        ("always", "approved"),
+        ("smart_approve", "approved"),
+        ("deny", "denied"),
+        ("smart_deny", "denied"),
+        ("timeout", "timed_out"),
+        (None, "unknown"),
+    ],
+)
+def test_tool_approval_outcome_is_bounded(choice, expected):
+    assert tool_approval_outcome({"choice": choice}) == expected
+
+
+@pytest.mark.parametrize(
+    ("duration_ms", "expected"),
+    [
+        (0, "lt_100ms"),
+        (100, "100ms_to_250ms"),
+        (250, "250ms_to_500ms"),
+        (500, "500ms_to_1s"),
+        (1_000, "1s_to_2s"),
+        (2_000, "2s_to_5s"),
+        (5_000, "5s_to_10s"),
+        (10_000, "10s_to_30s"),
+        (30_000, "gte_30s"),
+        (-1, "unknown"),
+        (True, "unknown"),
+        ("100", "unknown"),
+    ],
+)
+def test_tool_latency_bucket_is_bounded(duration_ms, expected):
+    assert tool_latency_bucket(duration_ms) == expected
+
+
+@pytest.mark.parametrize(
+    ("retry_count", "expected"),
+    [
+        (0, "0"),
+        (1, "1"),
+        (2, "2"),
+        (3, "3_to_5"),
+        (6, "6_to_10"),
+        (11, "gte_11"),
+        (None, "unknown"),
+        (-1, "unknown"),
+        (True, "unknown"),
+    ],
+)
+def test_tool_retry_bucket_requires_an_explicit_non_negative_count(
+    retry_count,
+    expected,
+):
+    assert tool_retry_bucket(retry_count) == expected
+
+
+def test_model_call_fields_report_terminal_model_and_provider_without_a_catalog():
+    assert model_call_fields({
+        "model": "fallback/model",
+        "response_model": "NVIDIA/Nemotron-3-Ultra",
+        "provider": "OpenRouter",
+        "base_url": "https://private-endpoint.example/v1",
+    }) == {
+        "model": "nvidia/nemotron-3-ultra",
+        "provider": "openrouter",
+    }
+    assert model_call_fields({
+        "model": "ZAI/GLM-5.2",
+        "provider": "Brev",
+    }) == {
+        "model": "zai/glm-5.2",
+        "provider": "brev",
     }
 
-    assert provider_family(kwargs) == "custom"
-    assert model_locality(kwargs) == "local"
+
+@pytest.mark.parametrize(
+    "response_model",
+    [
+        "contains a space",
+        "x" * (MODEL_IDENTIFIER_MAX_LENGTH + 1),
+    ],
+)
+def test_model_call_fields_fall_back_when_response_model_is_invalid(response_model):
+    assert model_call_fields({
+        "model": "nvidia/nemotron-3-ultra",
+        "response_model": response_model,
+        "provider": "openrouter",
+    }) == {
+        "model": "nvidia/nemotron-3-ultra",
+        "provider": "openrouter",
+    }
 
 
 @pytest.mark.parametrize(
-    ("model", "expected"),
+    ("field", "value"),
     [
-        ("google/gemma-3", "gemma"),
-        ("x-ai/grok-4", "grok"),
-        ("minimax/minimax-m2.5", "minimax"),
-        ("xiaomi/mimo-v2", "mimo"),
-        ("amazon/nova-pro", "nova"),
-        ("stepfun/step-3.5", "step"),
-        ("arcee-ai/trinity-large", "trinity"),
+        ("model", ""),
+        ("model", "contains a space"),
+        ("model", "contains\ncontrol"),
+        ("model", "_" + "private"),
+        ("model", "x" * (MODEL_IDENTIFIER_MAX_LENGTH + 1)),
+        ("model", object()),
+        ("provider", ""),
+        ("provider", "private provider"),
+        ("provider", "x" * (PROVIDER_IDENTIFIER_MAX_LENGTH + 1)),
+        ("provider", object()),
     ],
 )
-def test_model_family_covers_families_evidenced_by_the_hermes_catalog(model, expected):
-    assert model_family({"model": model}) == expected
+def test_model_call_fields_collapse_malformed_identifiers(field, value):
+    event = {"model": "nvidia/nemotron-3-ultra", "provider": "openrouter"}
+    event[field] = value
 
-
-@pytest.mark.parametrize(
-    "model",
-    [
-        "private-gptish-model",
-        "innovation-private",
-        "mimosa-private",
-        "stepstone-private",
-        "supernova-private",
-    ],
-)
-def test_model_family_requires_identifier_boundaries(model):
-    assert model_family({"model": model}) == "unknown"
-
-
-def test_model_family_accepts_only_allowlisted_declared_metadata():
-    assert model_family({"model": "private", "model_family": "qwen"}) == "qwen"
-    assert model_family({"model": "private", "model_family": "private"}) == "unknown"
-
-
-def test_model_family_prefers_the_provider_reported_terminal_model():
-    assert (
-        model_family({"model": "gpt-5", "response_model": "claude-sonnet"}) == "claude"
-    )
+    assert model_call_fields(event)[field] == "unknown"
 
 
 @pytest.mark.parametrize(
@@ -404,41 +512,26 @@ def test_task_terminal_state_is_bounded(event, expected):
     assert task_terminal_state(event) == expected
 
 
-def test_model_outcome_fails_closed_to_a_bounded_value():
-    assert model_call_outcome({"outcome": "private"}) == "failed"
-
-
-def test_unlisted_model_collapses_to_a_bounded_value():
-    assert model_family({"model": "private-model-name"}) == "unknown"
-
-
 def test_subscriber_contract_rejects_unknown_fields_and_dimension_values():
     event = SimpleNamespace(
         kind="scope",
         category="llm",
-        category_profile={"model_name": "gpt"},
+        category_profile={"model_name": MODEL_CALL_PROFILE_MODEL},
         name="hermes.model_call",
         scope_category="end",
         metadata={"hermes.metrics.schema_version": "hermes.metrics.event.v1"},
-        data={
-            "call_role": "primary",
-            "locality": "remote",
-            "model_family": "gpt",
-            "outcome": "success",
-            "provider_family": "direct",
-        },
+        data=_dimensions(),
     )
 
-    assert model_call_dimensions(event) == {
-        "call_role": "primary",
-        "locality": "remote",
-        "model_family": "gpt",
-        "outcome": "success",
-        "provider_family": "direct",
-    }
+    assert model_call_dimensions(event) == _dimensions()
+    event.category_profile["model_name"] = "gpt"
+    assert model_call_dimensions(event) is None
     event.category_profile["model_name"] = "private-model-name"
     assert model_call_dimensions(event) is None
-    event.category_profile["model_name"] = "gpt"
+    event.category_profile["model_name"] = MODEL_CALL_PROFILE_MODEL
+    event.data["model"] = "contains a space"
+    assert model_call_dimensions(event) is None
+    event.data["model"] = _dimensions()["model"]
     event.data["prompt"] = "must-not-pass"
     assert model_call_dimensions(event) is None
     event.data.pop("prompt")
@@ -496,6 +589,50 @@ def test_task_subscriber_contract_accepts_only_bounded_scope_events():
     end.data["outcome"] = "success"
     end.metadata["prompt"] = "must-not-pass"
     assert task_counter(end) is None
+
+
+def test_tool_subscriber_contract_accepts_only_bounded_events():
+    terminal = SimpleNamespace(
+        kind="scope",
+        category="tool",
+        category_profile={},
+        name="hermes.tool_call",
+        scope_category="end",
+        metadata={"hermes.metrics.schema_version": "hermes.metrics.event.v1"},
+        data={
+            "approval_outcome": "approved",
+            "latency_bucket": "250ms_to_500ms",
+            "outcome": "success",
+            "retry_count_bucket": "0",
+            "tool_category": "terminal",
+        },
+    )
+    assert tool_call_dimensions(terminal) == terminal.data
+
+    terminal.data["result"] = "must-not-pass"
+    assert tool_call_dimensions(terminal) is None
+    terminal.data.pop("result")
+    terminal.data["tool_category"] = "private-tool-name"
+    assert tool_call_dimensions(terminal) is None
+    terminal.data["tool_category"] = "terminal"
+    terminal.category_profile["tool_name"] = "must-not-pass"
+    assert tool_call_dimensions(terminal) is None
+
+    approval = SimpleNamespace(
+        kind="mark",
+        category=None,
+        category_profile=None,
+        name="hermes.tool_approval",
+        scope_category=None,
+        metadata={"hermes.metrics.schema_version": "hermes.metrics.event.v1"},
+        data={"attribution": "unattributed", "outcome": "denied"},
+    )
+    assert tool_approval_counter(approval) == (
+        "hermes.tool_approval.count",
+        approval.data,
+    )
+    approval.data["command"] = "must-not-pass"
+    assert tool_approval_counter(approval) is None
 
 
 def test_store_rejects_an_unsupported_schema_version(tmp_path):
