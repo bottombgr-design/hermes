@@ -12,6 +12,8 @@ so Herm TUI, CLI, and gateway surfaces that already show switch warnings pick it
 
 from __future__ import annotations
 
+import inspect
+
 from typing import Any, Callable, List, Optional
 
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
@@ -144,7 +146,7 @@ def merge_preflight_compression_warning(
     _append_warning(result, "".join(parts))
 
 
-def enrich_model_switch_warnings_for_gateway(
+async def enrich_model_switch_warnings_for_gateway(
     result: ModelSwitchResult,
     runner: Any,
     *,
@@ -153,7 +155,23 @@ def enrich_model_switch_warnings_for_gateway(
     custom_providers: list | None = None,
     load_gateway_config: Callable[[], dict] | None = None,
 ) -> None:
-    """Gateway helper: cached agent + session DB messages."""
+    """Gateway helper: cached agent + session DB messages.
+
+    Coroutine because the gateway holds its session DB as ``AsyncSessionDB``
+    and its store as ``AsyncSessionStore``: both forwarders return an awaitable
+    for every method call so blocking SQLite work runs via
+    ``asyncio.to_thread``. Calling ``get_messages_as_conversation`` without
+    awaiting produced a coroutine instead of the message list, which raised
+    ``TypeError: object of type 'coroutine' has no len()`` inside
+    ``_estimate_tokens``. The callers swallow that at debug level, so the
+    preflight-compression warning was silently dead on every gateway
+    ``/model`` switch.
+
+    ``get_or_create_session`` is awaited through the async store facade for the
+    same reason: it performs SQLite SELECTs, a routing-index rewrite and an
+    ``os.fsync`` (see ``_get_or_create_session_impl``), none of which belong on
+    the event loop.
+    """
     lock = getattr(runner, "_agent_cache_lock", None)
     cache = getattr(runner, "_agent_cache", None)
     agent = None
@@ -183,13 +201,26 @@ def enrich_model_switch_warnings_for_gateway(
 
     messages = None
     db = getattr(runner, "_session_db", None)
-    store = getattr(runner, "session_store", None)
+    # Prefer the async store facade: SessionStore.get_or_create_session runs
+    # blocking SQLite SELECTs plus a routing-index rewrite and os.fsync (see
+    # _get_or_create_session_impl), so calling it bare would sit on the gateway
+    # event loop. Fall back to the sync store for callers that don't expose the
+    # facade. Credit to #64832 for spotting the store half of this.
+    store = getattr(runner, "async_session_store", None) or getattr(
+        runner, "session_store", None
+    )
     if db is not None and store is not None:
         try:
-            entry = store.get_or_create_session(source)
-            messages = db.get_messages_as_conversation(entry.session_id)
+            # Both are async facades on the gateway runner: AsyncSessionStore
+            # and AsyncSessionDB return a coroutine for every method call so the
+            # blocking SQLite work runs off the event loop. Spelled as literal
+            # ``await <alias>.<method>(...)`` — the only shape the static guard
+            # in tests/gateway/test_async_session_db.py can verify, and the
+            # omission of that await here is the bug this function had.
+            entry = await store.get_or_create_session(source)
+            messages = await db.get_messages_as_conversation(entry.session_id)
         except Exception:
-            pass
+            messages = None
 
     merge_preflight_compression_warning(
         result,
