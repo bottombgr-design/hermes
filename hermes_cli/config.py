@@ -3021,6 +3021,14 @@ DEFAULT_CONFIG = {
         # 1 = serial (pre-v0.9 behaviour).
         # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
         "max_parallel_jobs": None,
+        # Opt-in append-only audit log of cron job state changes
+        # (created/paused/resumed/triggered/completed/removed). Off by
+        # default; set true to record lifecycle events.
+        "audit_log": False,
+        # Override the audit log location. null = <HERMES_HOME>/cron/audit.log.
+        "audit_log_path": None,
+        # Rotate the audit log once it exceeds this many megabytes.
+        "audit_log_max_mb": 10,
         # Per-job output-file retention: save_job_output keeps the N most
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
