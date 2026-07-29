@@ -1483,19 +1483,26 @@ export function setModelAssignment(body: ModelAssignmentRequest): Promise<ModelA
   })
 }
 
-export function restartGateway(): Promise<ActionResponse> {
+interface ServiceMutationRequest {
+  confirmation: 'RESTART' | 'UPDATE'
+  idempotency_key: string
+}
+
+export function restartGateway(body?: ServiceMutationRequest): Promise<ActionResponse> {
   return window.hermesDesktop.api<ActionResponse>({
     ...profileScoped(),
     path: '/api/gateway/restart',
-    method: 'POST'
+    method: 'POST',
+    body
   })
 }
 
-export function updateHermes(): Promise<ActionResponse> {
+export function updateHermes(body?: ServiceMutationRequest): Promise<ActionResponse> {
   return window.hermesDesktop.api<ActionResponse>({
     ...profileScoped(),
     path: '/api/hermes/update',
-    method: 'POST'
+    method: 'POST',
+    body
   })
 }
 

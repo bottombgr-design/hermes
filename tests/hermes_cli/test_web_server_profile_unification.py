@@ -506,9 +506,22 @@ class TestProfileScopedGateway:
         )
         web_server._ACTION_PROCS.pop("gateway-restart", None)
         web_server._ACTION_COMMANDS.pop("gateway-restart", None)
+        web_server._ACTION_IDEMPOTENCY_KEYS.pop("gateway-restart", None)
 
         for verb in ("start", "stop", "restart"):
-            resp = client.post(f"/api/gateway/{verb}", params={"profile": "worker_beta"})
+            body = (
+                {
+                    "confirmation": "RESTART",
+                    "idempotency_key": "profile-gateway-restart-0001",
+                }
+                if verb == "restart"
+                else None
+            )
+            resp = client.post(
+                f"/api/gateway/{verb}",
+                params={"profile": "worker_beta"},
+                json=body,
+            )
             assert resp.status_code == 200
 
         assert calls == [

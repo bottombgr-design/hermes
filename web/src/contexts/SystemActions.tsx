@@ -65,15 +65,22 @@ export function SystemActionsProvider({
   }, [activeAction, t.status.actionFinished, t.status.actionFailed]);
 
   const runAction = useCallback(
-    async (action: SystemAction) => {
+    async (
+      action: SystemAction,
+      confirmation: "RESTART" | "UPDATE",
+    ) => {
       setPendingAction(action);
       setActionStatus(null);
+      const operation = {
+        confirmation,
+        idempotency_key: crypto.randomUUID(),
+      };
       try {
         if (action === "restart") {
-          await api.restartGateway();
+          await api.restartGateway(operation);
           setActiveAction(action);
         } else {
-          const resp = await api.updateHermes();
+          const resp = await api.updateHermes(operation);
           // Some installs cannot apply updates from inside the dashboard. The
           // endpoint returns a structured {ok:false, message, update_command}
           // envelope instead of spawning the action; surface that guidance

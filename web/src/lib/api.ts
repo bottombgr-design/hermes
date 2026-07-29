@@ -949,10 +949,18 @@ export const api = {
     ),
 
   // Gateway / update actions
-  restartGateway: () =>
-    fetchJSON<ActionResponse>("/api/gateway/restart", { method: "POST" }),
-  updateHermes: () =>
-    fetchJSON<ActionResponse>("/api/hermes/update", { method: "POST" }),
+  restartGateway: (body?: ServiceMutationRequest) =>
+    fetchJSON<ActionResponse>("/api/gateway/restart", {
+      method: "POST",
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    }),
+  updateHermes: (body?: ServiceMutationRequest) =>
+    fetchJSON<ActionResponse>("/api/hermes/update", {
+      method: "POST",
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    }),
   checkHermesUpdate: (force = false) =>
     fetchJSON<UpdateCheckResponse>(
       `/api/hermes/update/check${force ? "?force=true" : ""}`,
@@ -1345,6 +1353,11 @@ export interface ActionResponse {
   message?: string;
   uploaded_bytes?: number;
   update_command?: string;
+}
+
+export interface ServiceMutationRequest {
+  confirmation: "RESTART" | "UPDATE";
+  idempotency_key: string;
 }
 
 export interface DebugShareResponse {
