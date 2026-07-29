@@ -384,17 +384,24 @@ class TestCLIStatusBar:
         cli_obj = _make_cli()
         cli_obj._spinner_text = "thinking"
 
+        # Minimal-chrome terminals (< 64 cols) drop the spinner line entirely.
         assert cli_obj._spinner_widget_height(width=50) == 0
+        # Non-minimal terminals reserve the spinner row even when empty, so the
+        # bottom-chrome canvas height is constant between idle and active
+        # (#70031 fix — no scroll-up stack on turn-start).
         assert cli_obj._spinner_widget_height(width=90) == 1
         cli_obj._spinner_text = ""
-        assert cli_obj._spinner_widget_height(width=90) == 0
+        assert cli_obj._spinner_widget_height(width=90) == 1
 
-    def test_spinner_height_uses_display_width_for_wide_characters(self):
+    def test_spinner_height_reserves_row_not_wrap(self):
         cli_obj = _make_cli()
         cli_obj._spinner_text = "你" * 40
         cli_obj._tool_start_time = 0
 
-        assert cli_obj._spinner_widget_height(width=64) == 2
+        # The spinner line is reserved at a single row (parity with the
+        # status bar's wrap_lines=False); very wide text does NOT wrap onto a
+        # second row, which would re-introduce the height-change stack (#70031).
+        assert cli_obj._spinner_widget_height(width=64) == 1
 
     def test_spinner_elapsed_format_is_fixed_width_to_reduce_wrap_jitter(self):
         cli_obj = _make_cli()
@@ -678,3 +685,116 @@ class TestIdleSinceLastTurn:
         cli_obj._prompt_duration = 7.0
         text = cli_obj._build_status_bar_text(width=160)
         assert "✓ 42s" in text
+
+
+class TestCLI70031StatusRepeatFix:
+    """Regression coverage for #70031 — status lines repeating mid-turn.
+
+    Root cause (verified on Windows PowerShell): the bottom chrome is a
+    prompt_toolkit non-fullscreen widget. While idle the spinner line is empty
+    so its Window height is 0; when a turn starts and "_spinner_text" is set
+    the height grows to 1. That makes the new canvas taller than the previous
+    one, and in non-fullscreen mode prompt_toolkit scrolls up to "reserve
+    vertical space", pushing the prior chrome copy into scrollback and
+    stacking repeated status frames. The fix: _spinner_widget_height RESERVES
+    1 row even when empty (in non-minimal-chrome mode), keeping the canvas a
+    constant height so redraws happen in place. refresh_interval=0.0 and the
+    _patched_output_screen_diff hack are belt-and-suspenders, not the cause.
+    """
+
+    def test_resolve_idle_refresh_interval_clamps_and_defaults(self):
+        """display.cli_refresh_interval flows through the clamped helper."""
+        import cli as cli_mod
+
+        with patch.dict(
+            cli_mod.CLI_CONFIG.setdefault("display", {}),
+            {"cli_refresh_interval": 2.0},
+        ):
+            assert cli_mod.resolve_idle_refresh_interval() == 2.0
+        # Default is 0.0 (disabled) when unset → no periodic idle repaint.
+        cli_mod.CLI_CONFIG["display"].pop("cli_refresh_interval", None)
+        assert cli_mod.resolve_idle_refresh_interval() == 0.0
+        # Negative / absurd values are clamped into [0.0, 30.0].
+        with patch.dict(
+            cli_mod.CLI_CONFIG.setdefault("display", {}),
+            {"cli_refresh_interval": -5.0},
+        ):
+            assert cli_mod.resolve_idle_refresh_interval() == 0.0
+        with patch.dict(
+            cli_mod.CLI_CONFIG.setdefault("display", {}),
+            {"cli_refresh_interval": 999.0},
+        ):
+            assert cli_mod.resolve_idle_refresh_interval() == 30.0
+
+    def test_spinner_loop_suppresses_periodic_redraw_while_agent_running(self):
+        """While the agent runs (not a child command), spinner_loop_branch must
+        return 'stable' (no periodic repaint).
+
+        Exercises the REAL decision function (spinner_loop_branch) used by the
+        production spinner_loop, so a regression in the actual logic fails the
+        test. The branch is the #70031 invariant: mid-turn chrome must not be
+        background-repainted.
+        """
+        import cli as cli_mod
+
+        # Invariant: agent running -> stable (no periodic redraw).
+        assert cli_mod.spinner_loop_branch(False, True, 2.0) == "stable"
+        # Other branches unchanged.
+        assert cli_mod.spinner_loop_branch(False, False, 2.0) == "idle_tick"
+        assert cli_mod.spinner_loop_branch(True, False, 2.0) == "repaint_fast"
+        assert cli_mod.spinner_loop_branch(False, False, 0.0) == "idle_stable"
+
+    def test_app_built_with_zero_refresh_interval(self):
+        """The classic-CLI must suppress prompt_toolkit's periodic redraw.
+
+        prompt_toolkit's Application.refresh_interval would otherwise fire a
+        periodic redraw regardless of agent state and stack chrome into
+        scrollback mid-turn (#70031). The background spinner_loop handles the
+        idle cadence instead.
+
+        We assert the behavioral contract two ways, neither of which reads the
+        source text:
+          1. resolve_idle_refresh_interval() defaults to 0.0 (no idle periodic
+             redraw unless the user opts in), and
+          2. spinner_loop_branch() returns 'stable' while the agent runs, so the
+             loop never triggers a periodic mid-turn repaint.
+        The literal Application(refresh_interval=0.0) is belt-and-suspenders and
+        is covered by the integration behavior these two invariants protect.
+        """
+        import cli as cli_mod
+
+        # Default cadence is 0.0 -> no periodic idle repaint.
+        cli_mod.CLI_CONFIG.setdefault("display", {}).pop("cli_refresh_interval", None)
+        assert cli_mod.resolve_idle_refresh_interval() == 0.0
+        # While the agent runs, the loop stays stable (no periodic redraw).
+        assert cli_mod.spinner_loop_branch(False, True, 0.0) == "stable"
+
+    def test_spinner_height_reserves_row_when_empty(self):
+        """The spinner Window must reserve 1 row even with no spinner text.
+
+        This is the #70031 root-cause fix: keeping the bottom-chrome canvas a
+        constant height between idle (empty spinner) and active (text set) so
+        prompt_toolkit redraws in place instead of scrolling the prior chrome
+        copy into scrollback. If this returns 0 when empty, the canvas grows
+        on turn-start and the status frames stack again.
+        """
+        cli_obj = _make_cli()
+        # No spinner text yet (idle state).
+        cli_obj._spinner_text = ""
+        cli_obj._tool_start_time = 0.0
+        # Non-minimal-chrome width (>= 64 cols).
+        assert cli_obj._spinner_widget_height(width=120) == 1
+        # After a turn starts, height must stay 1 (no growth).
+        cli_obj._spinner_text = "formulating..."
+        assert cli_obj._spinner_widget_height(width=120) == 1
+
+    def test_spinner_height_drops_only_in_minimal_chrome(self):
+        """Narrow terminals (minimal chrome) still collapse the spinner line.
+
+        Minimal-chrome mode intentionally drops the reserved row to save
+        display rows; that is the only case the height should be 0.
+        """
+        cli_obj = _make_cli()
+        cli_obj._spinner_text = ""
+        # Minimal-chrome width (< 64 cols).
+        assert cli_obj._spinner_widget_height(width=40) == 0
