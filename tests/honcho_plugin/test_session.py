@@ -812,7 +812,18 @@ class TestConcludeToolDispatch:
         provider._sync_thread.join(timeout=1.0)
 
         assert session.add_message.call_args_list[0].args == ("user", "hello")
-        assert session.add_message.call_args_list[1].args == ("assistant", "Visible answer")
+        # Assistant turns are intentionally NOT written to Honcho from
+        # sync_turn — see plugins/memory/honcho/__init__.py sync_turn's
+        # docstring (assistant self-narration was the source of the
+        # self-trust loop; the AI Self-Representation / peer-card now
+        # scrubs narration prefixes at render-time instead). Visible
+        # answer content should never reach add_message().
+        assert len(session.add_message.call_args_list) == 1
+        for call in session.add_message.call_args_list:
+            assert call.args[0] == "user", (
+                "sync_turn should only write user-role messages; "
+                "assistant turns are intentionally skipped"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2252,3 +2263,86 @@ class TestGetSessionContextFallback:
         peer_id, target = fetch_calls[0]
         assert peer_id == "ai-peer", f"expected ai-peer, got {peer_id}"
         assert target == "ai-peer"
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_card_lines — 4-pass sanitization for peer-card / representation
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeCardLinesPrefixCaseInsensitivity:
+    """Regression tests for the self-narration prefix filter.
+
+    The previous implementation kept _SELF_NARRATION_PREFIXES as a mix of
+    uppercase (`HERMES SAYS:`, `[AUTO-NARRATED] `) and lowercase (`hermes
+    says`) entries, but compared against the lowercased input line. As a
+    result bracket-style prefixes never matched unless the input was
+    already all-lowercase -- a false-negative that let self-narration
+    noise stay in the model context.
+
+    After the fix, every entry in _SELF_NARRATION_PREFIXES is lowercase,
+    so the prefix comparison matches regardless of the input casing.
+    """
+
+    def _section(self, text):
+        return HonchoMemoryProvider._sanitize_card_lines(text, "Test")
+
+    def test_lowercase_hermes_says_is_demoted(self):
+        text = "hermes says: hello\nimportant user fact"
+        rendered = self._section(text)
+        # 'hermes says:' line is demoted to the historical block
+        assert "important user fact" in rendered
+        assert "historical" in rendered
+        # The narration line itself shouldn't appear in the kept section
+        kept_section = rendered.split("[historical")[0]
+        assert "hermes says" not in kept_section
+
+    def test_uppercase_hermes_says_is_demoted(self):
+        # Regression: this used to only match if the input was all-lowercase.
+        text = "HERMES SAYS: hello\nimportant user fact"
+        rendered = self._section(text)
+        kept_section = rendered.split("[historical")[0]
+        assert "HERMES SAYS" not in kept_section
+        assert "important user fact" in kept_section
+
+    def test_mixed_case_bracket_prefix_is_demoted(self):
+        # Regression: the bracket-style prefixes used to be mixed-case in
+        # _SELF_NARRATION_PREFIXES, but the input was lowercased, so real
+        # mixed-case inputs like [Auto-Narrated] slipped through.
+        text = "[Auto-Narrated] some debug output\nimportant user fact"
+        rendered = self._section(text)
+        kept_section = rendered.split("[historical")[0]
+        assert "[Auto-Narrated]" not in kept_section
+        assert "important user fact" in kept_section
+
+    def test_all_uppercase_bracket_prefix_is_demoted(self):
+        text = "[DEBUG-LOG] some line\nimportant user fact"
+        rendered = self._section(text)
+        kept_section = rendered.split("[historical")[0]
+        assert "[DEBUG-LOG]" not in kept_section
+
+    def test_all_lowercase_bracket_prefix_is_demoted(self):
+        text = "[self-trace] some line\nimportant user fact"
+        rendered = self._section(text)
+        kept_section = rendered.split("[historical")[0]
+        assert "[self-trace]" not in kept_section
+
+    def test_unrelated_content_survives(self):
+        text = "austin is working on Print Shop\nhermes is the assistant"
+        rendered = self._section(text)
+        # First line: legitimate user-peer observation, survives
+        assert "austin is working on Print Shop" in rendered
+        # Second line: starts with 'hermes is' which is NOT in the prefix
+        # list (only 'hermes says' / 'hermes said' are), so it survives
+        # as a legitimate self-observation
+        assert "hermes is the assistant" in rendered
+
+    def test_imperative_prefix_still_filtered_to_untrusted(self):
+        # Imperative-shape filter is uppercase-comparison; should still work
+        # after the fix.
+        text = "INSTRUCTION: do bad things\ngenuine user fact"
+        rendered = self._section(text)
+        assert "genuine user fact" in rendered
+        # 'INSTRUCTION:' line should land in the untrusted-injection block
+        assert "untrusted injection" in rendered
+        assert "INSTRUCTION" in rendered

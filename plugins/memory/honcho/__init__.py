@@ -656,13 +656,11 @@ class HonchoMemoryProvider(MemoryProvider):
     # block at the end of the section so the model can see the content for
     # context but doesn't quote them as present-tense facts in every turn.
     _SELF_NARRATION_PREFIXES = (
-        "HERMES SAYS:",
-        "HERMES SAID:",
         "hermes says",
         "hermes said",
-        "[AUTO-NARRATED] ",
-        "[DEBUG-LOG] ",
-        "[SELF-TRACE] ",
+        "[auto-narrated] ",
+        "[debug-log] ",
+        "[self-trace] ",
     )
 
     # User-peer observations that *quote* self-narration phrasing ("austin
