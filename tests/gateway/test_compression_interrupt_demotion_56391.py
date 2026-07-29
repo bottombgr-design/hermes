@@ -76,9 +76,11 @@ def _make_runner(*, session_id: str = "parent-session") -> GatewayRunner:
     )
     session_store._ensure_loaded_locked = lambda: None
     runner.session_store = session_store
-    runner._session_db = MagicMock()
-    runner._session_db._db = MagicMock()
-    runner._session_db._db.get_compression_lock_holder.return_value = None
+    raw_db = MagicMock()
+    raw_db.get_compression_lock_holder = MagicMock(return_value=None)
+    session_db = MagicMock()
+    session_db._db = raw_db
+    runner._session_db = session_db
     return runner
 
 
@@ -201,6 +203,11 @@ class TestBusyHandlerDemotesInterruptForCompression:
         assert handled is True
         parent.interrupt.assert_not_called()
         assert adapter._pending_messages.get(sk) is event
+        adapter._send_with_retry.assert_called_once()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Session state unavailable" in content
+        assert "queued" in content.lower()
+        assert "Compressing context" not in content
 
     @pytest.mark.asyncio
     async def test_pending_sentinel_does_not_trigger_false_positive(self) -> None:
