@@ -16,6 +16,8 @@ from plugins.memory.mem0._setup import (
     _check_qdrant_path,
     _check_ollama,
     _check_pgvector,
+    _load_mem0_json,
+    _select_filter_by_agent_id,
 )
 
 
@@ -42,6 +44,30 @@ def _inject_fake_hermes_cli(monkeypatch):
 
 
 class TestParseFlags:
+
+    def test_load_mem0_json_returns_existing_config(self, tmp_path):
+        (tmp_path / "mem0.json").write_text(
+            json.dumps({"filter_by_agent_id": "true"}), encoding="utf-8"
+        )
+
+        assert _load_mem0_json(str(tmp_path))["filter_by_agent_id"] == "true"
+
+    def test_select_filter_by_agent_id_uses_existing_value_as_default(self, monkeypatch):
+        seen = {}
+
+        def select(title, items, default=0):
+            seen["title"] = title
+            seen["default"] = default
+            return default
+
+        monkeypatch.setattr("plugins.memory.mem0._setup._curses_select", select)
+
+        assert _select_filter_by_agent_id("true") == "true"
+        assert seen["default"] == 0
+        assert "Scope memory search to this agent only" in seen["title"]
+
+        assert _select_filter_by_agent_id("false") == "false"
+        assert seen["default"] == 1
 
     def test_mode_platform(self):
         flags = parse_flags(["--mode", "platform", "--api-key", "sk-test"])
@@ -170,14 +196,14 @@ class TestWriteEnv:
     def test_write_new_vars(self, tmp_path):
         env_path = tmp_path / ".env"
         _write_env(env_path, {"OPENAI_API_KEY": "sk-test"})
-        content = env_path.read_text()
+        content = env_path.read_text(encoding="utf-8")
         assert "OPENAI_API_KEY=sk-test" in content
 
     def test_update_existing_var(self, tmp_path):
         env_path = tmp_path / ".env"
-        env_path.write_text("OPENAI_API_KEY=old\nOTHER=keep\n")
+        env_path.write_text("OPENAI_API_KEY=old\nOTHER=keep\n", encoding="utf-8")
         _write_env(env_path, {"OPENAI_API_KEY": "new"})
-        content = env_path.read_text()
+        content = env_path.read_text(encoding="utf-8")
         assert "OPENAI_API_KEY=new" in content
         assert "OTHER=keep" in content
         assert "old" not in content
@@ -234,24 +260,73 @@ class TestPostSetup:
         config = {"memory": {}}
         post_setup(str(tmp_path), config)
         assert config["memory"]["provider"] == "mem0"
-        env_content = (tmp_path / ".env").read_text()
+        env_content = (tmp_path / ".env").read_text(encoding="utf-8")
         assert "MEM0_API_KEY=sk-test" in env_content
-        mem0_json = json.loads((tmp_path / "mem0.json").read_text())
+        mem0_json = json.loads((tmp_path / "mem0.json").read_text(encoding="utf-8"))
         assert mem0_json["mode"] == "platform"
+
+    def test_platform_setup_preserves_native_false_filter_default(self, tmp_path, monkeypatch):
+        (tmp_path / "mem0.json").write_text(
+            json.dumps({"filter_by_agent_id": False}), encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["hermes", "--mode", "platform", "--api-key", "sk-test"],
+        )
+        monkeypatch.setattr(
+            "plugins.memory.mem0._setup.get_hermes_home", lambda: tmp_path
+        )
+        _inject_fake_hermes_cli(monkeypatch)
+        monkeypatch.setattr(
+            "plugins.memory.mem0._setup._curses_select",
+            lambda title, items, default=0: default,
+        )
+        config = {"memory": {}}
+
+        post_setup(str(tmp_path), config)
+
+        mem0_json = json.loads((tmp_path / "mem0.json").read_text(encoding="utf-8"))
+        assert mem0_json["filter_by_agent_id"] == "false"
+
+    def test_platform_setup_saves_filter_by_agent_id(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "sys.argv",
+            ["hermes", "--mode", "platform", "--api-key", "sk-test"],
+        )
+        monkeypatch.setattr(
+            "plugins.memory.mem0._setup.get_hermes_home", lambda: tmp_path
+        )
+        _inject_fake_hermes_cli(monkeypatch)
+
+        def select_filter(title, items, default=0):
+            if "Scope memory search to this agent only" in title:
+                return 0  # "true"
+            return default
+
+        monkeypatch.setattr(
+            "plugins.memory.mem0._setup._curses_select", select_filter
+        )
+        config = {"memory": {}}
+
+        post_setup(str(tmp_path), config)
+
+        mem0_json = json.loads((tmp_path / "mem0.json").read_text(encoding="utf-8"))
+        assert mem0_json["filter_by_agent_id"] == "true"
 
     def test_platform_setup_clears_stale_host(self, tmp_path, monkeypatch):
         # A user who previously ran self-hosted has host in mem0.json. Switching
         # to platform must drop host — otherwise routing (host > platform) keeps
         # sending them to the self-hosted server despite --mode platform.
         (tmp_path / "mem0.json").write_text(
-            json.dumps({"mode": "platform", "host": "http://old-selfhosted:8888"})
+            json.dumps({"mode": "platform", "host": "http://old-selfhosted:8888"}),
+            encoding="utf-8",
         )
         monkeypatch.setattr("sys.argv", ["hermes", "--mode", "platform", "--api-key", "sk-test"])
         monkeypatch.setattr("plugins.memory.mem0._setup.get_hermes_home", lambda: tmp_path)
         _inject_fake_hermes_cli(monkeypatch)
         config = {"memory": {}}
         post_setup(str(tmp_path), config)
-        mem0_json = json.loads((tmp_path / "mem0.json").read_text())
+        mem0_json = json.loads((tmp_path / "mem0.json").read_text(encoding="utf-8"))
         assert mem0_json["mode"] == "platform"
         assert not mem0_json.get("host")  # cleared to falsy so routing → platform
 
@@ -265,7 +340,7 @@ class TestPostSetup:
         config = {"memory": {}}
         post_setup(str(tmp_path), config)
         assert config["memory"]["provider"] == "mem0"
-        mem0_json = json.loads((tmp_path / "mem0.json").read_text())
+        mem0_json = json.loads((tmp_path / "mem0.json").read_text(encoding="utf-8"))
         assert mem0_json["mode"] == "oss"
         assert mem0_json["oss"]["llm"]["provider"] == "openai"
 
@@ -276,15 +351,26 @@ class TestPostSetup:
         ])
         monkeypatch.setattr("plugins.memory.mem0._setup.get_hermes_home", lambda: tmp_path)
         _inject_fake_hermes_cli(monkeypatch)
+
+        def select_filter(title, items, default=0):
+            if "Scope memory search to this agent only" in title:
+                return 0  # "true"
+            return default
+
+        monkeypatch.setattr(
+            "plugins.memory.mem0._setup._curses_select", select_filter
+        )
         monkeypatch.setattr("plugins.memory.mem0._setup._check_selfhosted_server", lambda h: None)
         config = {"memory": {}}
         post_setup(str(tmp_path), config)
         assert config["memory"]["provider"] == "mem0"
-        env_content = (tmp_path / ".env").read_text()
+        env_content = (tmp_path / ".env").read_text(encoding="utf-8")
         assert "MEM0_API_KEY=admin-key" in env_content
-        mem0_json = json.loads((tmp_path / "mem0.json").read_text())
+        mem0_json = json.loads((tmp_path / "mem0.json").read_text(encoding="utf-8"))
         assert mem0_json["host"] == "http://localhost:8888"  # trailing slash stripped
         assert mem0_json["user_id"] == "hermes-user"
+        assert mem0_json["agent_id"] == "hermes"
+        assert mem0_json["filter_by_agent_id"] == "true"
 
     def test_selfhosted_no_api_key_auth_disabled(self, tmp_path, monkeypatch):
         # AUTH_DISABLED servers need no key — setup must not write one.
@@ -298,7 +384,7 @@ class TestPostSetup:
         config = {"memory": {}}
         post_setup(str(tmp_path), config)
         assert not (tmp_path / ".env").exists()
-        mem0_json = json.loads((tmp_path / "mem0.json").read_text())
+        mem0_json = json.loads((tmp_path / "mem0.json").read_text(encoding="utf-8"))
         assert mem0_json["host"] == "http://mem0.lan:8888"
 
     def test_selfhosted_dry_run_no_files(self, tmp_path, monkeypatch):
