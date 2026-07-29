@@ -8818,7 +8818,11 @@ def _default_spawn(
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
-    # session binds ContextVars in this process.
+    # session binds ContextVars in this process. Upstream main (148497f6d,
+    # salvaged from #69181) supersedes this PR's earlier approach of FORWARDING
+    # HERMES_SESSION_* into the worker via build_session_subprocess_env: a
+    # detached worker that inherited routing auto-subscribed child tasks to an
+    # unrelated chat. Strip every registered session-context routing key.
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
