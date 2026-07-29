@@ -214,6 +214,51 @@ class TestCliApprovalUi:
         assert "command)" in rendered
         assert all(len(line) == border_width for line in lines)
 
+    def test_approval_display_renders_heredoc_command_line_by_line(self):
+        cli = _make_cli_stub()
+        heredoc_cmd = (
+            "python3 << 'EOF'\n"
+            "import sqlite3\n"
+            "conn = sqlite3.connect('db')\n"
+            "cur.execute('SELECT * FROM sessions')\n"
+            "print(cur.fetchall())\n"
+            "conn.close()\n"
+            "EOF"
+        )
+        cli._approval_state = {
+            "command": heredoc_cmd,
+            "description": "run a script",
+            "choices": ["once", "session", "always", "deny", "view"],
+            "selected": 0,
+            "response_queue": queue.Queue(),
+            "show_full": True,
+        }
+
+        fragments = cli._get_approval_display_fragments()
+        rendered = "".join(text for _style, text in fragments)
+
+        # No literal backslash-n should leak into the rendered panel text.
+        assert "\\n" not in rendered
+        # Every source line of the heredoc should appear on the panel,
+        # each confined to its own rendered line.
+        for source_line in heredoc_cmd.split("\n"):
+            assert any(source_line in line for line in rendered.splitlines())
+
+    def test_approval_display_one_liner_unaffected_by_heredoc_fix(self):
+        cli = _make_cli_stub()
+        cli._approval_state = {
+            "command": "rm -rf /tmp/some/path",
+            "description": "delete a temp directory",
+            "choices": ["once", "session", "always", "deny", "view"],
+            "selected": 0,
+            "response_queue": queue.Queue(),
+        }
+
+        fragments = cli._get_approval_display_fragments()
+        rendered = "".join(text for _style, text in fragments)
+
+        assert "rm -rf /tmp/some/path" in rendered
+
     def test_approval_display_shows_full_command_after_view(self):
         cli = _make_cli_stub()
         full_command = "sudo dd if=/tmp/in of=/usr/share/keyrings/githubcli-archive-keyring.gpg bs=4M status=progress"
