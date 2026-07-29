@@ -1758,6 +1758,35 @@ class GatewaySlashCommandsMixin:
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
         override = self._session_model_overrides.get(session_key, {})
+
+        # #72838: Apply channel_overrides (lower priority than a session /model
+        # override, higher than the global default) so the "Current model"
+        # shown in the picker and text-list reflects what the channel actually
+        # runs — mirroring the priority the turn dispatch uses
+        # (session /model > channel_overrides > global default).
+        _co_cfg = getattr(self, "config", None)
+        if _co_cfg:
+            try:
+                from gateway.run import _get_channel_override
+
+                _co = _get_channel_override(
+                    _co_cfg,
+                    source.platform,
+                    source.chat_id,
+                    thread_id=source.thread_id,
+                    parent_id=(
+                        str(source.parent_chat_id)
+                        if getattr(source, "parent_chat_id", None)
+                        else None
+                    ),
+                )
+                if _co and _co.model:
+                    current_model = _co.model
+                    if _co.provider:
+                        current_provider = _co.provider
+            except Exception:
+                pass
+
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None
         )

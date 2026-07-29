@@ -15964,10 +15964,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(source)
+        return self._format_session_info(source)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional[SessionSource] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -15976,7 +15976,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
+        # #72838: when a source is available, resolve the model through
+        # channel_overrides (falling back to the global default) so /new and
+        # other session-info callers show the model the channel actually runs
+        # — not the global default. The actual turn dispatch already does this
+        # via _resolve_session_agent_runtime; these display paths used to bypass
+        # it.
+        _channel_override = None
+        if source is not None:
+            _cfg = getattr(self, "config", None)
+            if _cfg:
+                _channel_override = _get_channel_override(
+                    _cfg,
+                    source.platform,
+                    source.chat_id,
+                    thread_id=source.thread_id,
+                    parent_id=(
+                        str(source.parent_chat_id)
+                        if getattr(source, "parent_chat_id", None)
+                        else None
+                    ),
+                )
+            model = (
+                _channel_override.model
+                if _channel_override and _channel_override.model
+                else _resolve_gateway_model()
+            )
+        else:
+            model = _resolve_gateway_model()
         config_context_length = None
         provider = None
         base_url = None
@@ -16010,6 +16037,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     custom_provs = data.get("custom_providers")
         except Exception:
             pass
+
+        # #72838 (cont.): keep configured_model/provider in sync with the
+        # channel override so the context-pin logic (should_clear_context_pin)
+        # and display reflect the effective model for this channel, not the
+        # global default.
+        if _channel_override:
+            if _channel_override.model:
+                configured_model = _channel_override.model
+            if _channel_override.provider:
+                provider = _channel_override.provider
+                configured_provider = provider
 
         # Resolve runtime credentials for probing
         try:
