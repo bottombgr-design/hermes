@@ -1654,11 +1654,23 @@ class SessionStore:
             created_at = datetime.fromtimestamp(float(started_at)) if started_at else now
         except (TypeError, ValueError, OSError):
             created_at = now
+        # updated_at must be the row's REAL last activity, not `now`. It is the
+        # only input to _should_reset(), so stamping a recovered row as
+        # "just active" makes it immune to the very next idle/daily check — a
+        # session recovered long after its reset boundary then keeps absorbing
+        # new messages into stale history instead of rotating. `last_active`
+        # comes from find_latest_gateway_session_for_peer; fall back to `now`
+        # when absent so callers passing hand-built rows keep the old behaviour.
+        last_active = row.get("last_active")
+        try:
+            updated_at = datetime.fromtimestamp(float(last_active)) if last_active else now
+        except (TypeError, ValueError, OSError):
+            updated_at = now
         return SessionEntry(
             session_key=session_key,
             session_id=str(row["id"]),
             created_at=created_at,
-            updated_at=now,
+            updated_at=updated_at,
             origin=source,
             display_name=source.chat_name,
             platform=source.platform,
