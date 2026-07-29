@@ -287,6 +287,68 @@ def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
     assert seen["interactive"] == "1"
 
 
+def test_run_doctor_omits_dev_dependencies_from_npm_audit(monkeypatch, tmp_path):
+    """Doctor should not report Docker-runtime issues from build-only deps."""
+    project_root = tmp_path / "project"
+    hermes_home = tmp_path / ".hermes"
+    (project_root / "node_modules" / "agent-browser").mkdir(parents=True)
+    (project_root / "web" / "node_modules").mkdir(parents=True)
+    (project_root / "ui-tui" / "node_modules").mkdir(parents=True)
+    hermes_home.mkdir()
+    (hermes_home / ".env").write_text("OPENAI_API_KEY=sk-test\n", encoding="utf-8")
+
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+    monkeypatch.setattr(doctor_mod, "get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(
+        doctor_mod,
+        "_safe_which",
+        lambda cmd: f"/usr/bin/{cmd}" if cmd in {"node", "npm", "git", "rg"} else None,
+    )
+
+    audit_calls = []
+
+    def fake_run(argv, **kwargs):
+        if len(argv) >= 2 and argv[1] == "audit":
+            audit_calls.append((argv, kwargs["cwd"]))
+            return SimpleNamespace(
+                stdout='{"metadata":{"vulnerabilities":{"critical":0,"high":0,"moderate":0}}}',
+                returncode=0,
+            )
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(doctor_mod.subprocess, "run", fake_run)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: (_ for _ in ()).throw(SystemExit(0)),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    with pytest.raises(SystemExit):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    assert audit_calls
+    assert all("--omit=dev" in argv for argv, _cwd in audit_calls)
+
+    root_browser_audits = [
+        argv for argv, cwd in audit_calls
+        if cwd == str(project_root) and "--workspaces=false" in argv
+    ]
+    assert root_browser_audits
+
+    workspace_audits = [
+        argv for argv, cwd in audit_calls
+        if cwd == str(project_root) and "--workspace" in argv
+    ]
+    assert workspace_audits
+    assert all("--workspaces=false" not in argv for argv in workspace_audits)
+    assert {argv[argv.index("--workspace") + 1] for argv in workspace_audits} == {
+        "web",
+        "ui-tui",
+    }
+
+
 def test_check_gateway_service_linger_warns_when_disabled(monkeypatch, tmp_path, capsys):
     unit_path = tmp_path / "hermes-gateway.service"
     unit_path.write_text("[Unit]\n")

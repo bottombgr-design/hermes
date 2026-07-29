@@ -1920,7 +1920,9 @@ def run_doctor(args):
     else:
         check_warn("Node.js not found", "(optional, needed for browser tools)")
     
-    # npm audit for all Node.js packages
+    # npm audit for runtime Node.js packages. The monorepo lockfile also
+    # contains desktop/build-tool dev dependencies that are not part of the
+    # Hermes Docker runtime and should not page `doctor` users.
     _npm_bin = _safe_which("npm")
     if _npm_bin:
         # Each entry: (cwd, label, extra_audit_args)
@@ -1954,7 +1956,7 @@ def run_doctor(args):
                 # Use resolved absolute path so Windows can execute
                 # npm.cmd (CreateProcessW can't run bare .cmd names).
                 audit_result = subprocess.run(
-                    [_npm_bin, "audit", "--json", *audit_extra],
+                    [_npm_bin, "audit", "--omit=dev", "--json", *audit_extra],
                     cwd=str(npm_dir),
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30,
                 )

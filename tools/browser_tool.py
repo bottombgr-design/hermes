@@ -1167,6 +1167,7 @@ def _run_chrome_fallback_command(
     browser_env = _build_browser_env()
     browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
     browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
+    _ensure_agent_browser_executable_path(browser_env)
 
     if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
         browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
@@ -2511,6 +2512,7 @@ def _run_browser_command(
         # used during CLI discovery.
         browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
+        _ensure_agent_browser_executable_path(browser_env)
 
         # Tell the agent-browser daemon to self-terminate after being idle
         # for our configured inactivity timeout.  This is the daemon-side
@@ -4656,6 +4658,59 @@ def _chromium_search_roots() -> List[str]:
     return roots
 
 
+def _is_executable_file(path: Path) -> bool:
+    """Return True when path points at a usable browser executable."""
+    if not path.is_file():
+        return False
+    if os.name == "nt":
+        return True
+    return os.access(path, os.X_OK)
+
+
+def _playwright_chromium_executable() -> Optional[str]:
+    """Find the concrete Chromium executable inside Playwright's cache."""
+    for root in _chromium_search_roots():
+        root_path = Path(root)
+        if not root or not root_path.is_dir():
+            continue
+        try:
+            entries = sorted(root_path.iterdir(), key=lambda p: p.name, reverse=True)
+        except OSError:
+            continue
+
+        for entry in entries:
+            candidates: tuple[Path, ...] = ()
+            if entry.name.startswith("chromium_headless_shell-"):
+                candidates = (
+                    entry / "chrome-headless-shell-linux64" / "chrome-headless-shell",
+                    entry / "chrome-headless-shell-linux-arm64" / "chrome-headless-shell",
+                    entry / "chrome-linux" / "headless_shell",
+                    entry / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium",
+                    entry / "chrome-win" / "headless_shell.exe",
+                    entry / "chrome-win" / "chrome.exe",
+                )
+            elif entry.name.startswith("chromium-"):
+                candidates = (
+                    entry / "chrome-linux" / "chrome",
+                    entry / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium",
+                    entry / "chrome-win" / "chrome.exe",
+                )
+
+            for candidate in candidates:
+                if _is_executable_file(candidate):
+                    return str(candidate)
+    return None
+
+
+def _ensure_agent_browser_executable_path(browser_env: Dict[str, str]) -> None:
+    """Point agent-browser at a Playwright-installed Chromium when needed."""
+    if browser_env.get("AGENT_BROWSER_EXECUTABLE_PATH"):
+        return
+    executable = _playwright_chromium_executable()
+    if executable:
+        browser_env["AGENT_BROWSER_EXECUTABLE_PATH"] = executable
+
+
 def _chromium_installed() -> bool:
     """Return True when a usable Chromium (or headless-shell) build is on disk.
 
@@ -4697,22 +4752,10 @@ def _chromium_installed() -> bool:
         _cached_chromium_installed = True
         return True
 
-    # 3. Playwright browser cache (legacy — chromium-* / chromium_headless_shell-* dirs)
-    for root in _chromium_search_roots():
-        if not root or not os.path.isdir(root):
-            continue
-        try:
-            entries = os.listdir(root)
-        except OSError:
-            continue
-        # Playwright names them ``chromium-<build>`` and
-        # ``chromium_headless_shell-<build>``; agent-browser accepts either.
-        for entry in entries:
-            if entry.startswith("chromium-") or entry.startswith(
-                "chromium_headless_shell-"
-            ):
-                _cached_chromium_installed = True
-                return True
+    # 3. Playwright browser cache.
+    if _playwright_chromium_executable():
+        _cached_chromium_installed = True
+        return True
 
     _cached_chromium_installed = False
     return False
