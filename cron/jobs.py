@@ -568,6 +568,8 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     Returns dict with:
         - kind: "once" | "interval" | "cron"
         - For "once": "run_at" (ISO timestamp)
+        - For bare durations: internal ``interval_minutes`` metadata, used only
+          to promote explicit multi-run jobs into intervals
         - For "interval": "minutes" (int)
         - For "cron": "expr" (cron expression)
     
@@ -647,7 +649,11 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         return {
             "kind": "once",
             "run_at": run_at.isoformat(),
-            "display": f"once in {original}"
+            "display": f"once in {original}",
+            # Internal: retain the source duration so create/update can promote
+            # a finite repeat schedule to an interval without guessing from
+            # the wall-clock ``run_at`` timestamp.
+            "interval_minutes": minutes,
         }
     except ValueError:
         pass
@@ -659,6 +665,86 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         f"  - Cron: '0 9 * * *' (cron expression)\n"
         f"  - Timestamp: '2026-02-03T14:00:00' (one-shot at time)"
     )
+
+
+def _promote_duration_repeat_to_interval(
+    schedule: Dict[str, Any], repeat: Optional[int]
+) -> Dict[str, Any]:
+    """Turn a bare duration plus multiple runs into a recurring interval.
+
+    Bare durations normally mean a one-shot.  When paired with ``repeat > 1``,
+    however, the job needs a recurring ``next_run_at``; otherwise it can only
+    run once and is marked completed with repeats remaining.  Older job records
+    did not retain ``interval_minutes``; their canonical ``once in <duration>``
+    display string is recovered for a lazy compatibility migration.
+    """
+    if (
+        schedule.get("kind") != "once"
+        or not isinstance(repeat, int)
+        or repeat <= 1
+    ):
+        return schedule
+
+    minutes = schedule.get("interval_minutes")
+    if not isinstance(minutes, int) or minutes <= 0:
+        display = schedule.get("display")
+        match = re.fullmatch(r"once in\s+(.+)", display, flags=re.IGNORECASE) if isinstance(display, str) else None
+        if match:
+            try:
+                minutes = parse_duration(match.group(1))
+            except ValueError:
+                minutes = None
+    if not isinstance(minutes, int) or minutes <= 0:
+        return schedule
+    return {
+        "kind": "interval",
+        "minutes": minutes,
+        "display": f"every {minutes}m",
+    }
+
+
+def _migrate_duration_repeat_jobs(jobs: List[Dict[str, Any]]) -> None:
+    """Lazily upgrade legacy bare-duration jobs with a finite repeat count.
+
+    The migration is intentionally in-memory.  Callers that later write job
+    state persist it, while pure reads remain side-effect free.
+    """
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        repeat = job.get("repeat")
+        if isinstance(repeat, int):
+            # The legacy HTTP API stored its public integer shape directly.
+            # Restore the scheduler's persisted repeat-state representation.
+            repeat = {"times": repeat if repeat > 0 else None, "completed": 0}
+            job["repeat"] = repeat
+        schedule = job.get("schedule")
+        if not isinstance(schedule, dict) or not isinstance(repeat, dict):
+            continue
+        promoted = _promote_duration_repeat_to_interval(schedule, repeat.get("times"))
+        if promoted is schedule:
+            continue
+        job["schedule"] = promoted
+        job["schedule_display"] = promoted["display"]
+
+        # Legacy jobs were disabled as "completed" after their first run even
+        # when a finite repeat count remained. Re-arm only that impossible
+        # terminal state; a genuinely exhausted interval remains completed.
+        times = repeat.get("times")
+        completed = repeat.get("completed", 0)
+        if (
+            job.get("state") == "completed"
+            and not job.get("enabled")
+            and isinstance(times, int)
+            and isinstance(completed, int)
+            and 0 <= completed < times
+        ):
+            job["enabled"] = True
+            job["state"] = "scheduled"
+            if not job.get("next_run_at"):
+                job["next_run_at"] = compute_next_run(
+                    promoted, job.get("last_run_at")
+                )
 
 
 def _ensure_aware(dt: datetime) -> datetime:
@@ -1044,12 +1130,15 @@ def load_jobs() -> List[Dict[str, Any]]:
     # down the whole cron subsystem.
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
+        if isinstance(jobs, list):
+            _migrate_duration_repeat_jobs(jobs)
         if _strict_retry and jobs:
             # Hit control-character corruption — rewrite with proper escaping.
             save_jobs(jobs)
             logger.warning("Auto-repaired jobs.json (had invalid control characters)")
         return jobs
     if isinstance(data, list):
+        _migrate_duration_repeat_jobs(data)
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
         if data:
@@ -1318,6 +1407,7 @@ def create_job(
     # Auto-set repeat=1 for one-shot schedules if not specified
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
+    parsed_schedule = _promote_duration_repeat_to_interval(parsed_schedule, repeat)
 
     # Default delivery to origin if available, otherwise local
     if deliver is None:
@@ -1533,6 +1623,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
             schedule_changed = "schedule" in updates
+            repeat_changed = "repeat" in updates
+            if repeat_changed and isinstance(updated.get("repeat"), int):
+                # Public API and dashboard updates use an integer repeat count,
+                # while jobs persist repeat state as a dict. Normalize at the
+                # data boundary before scheduler logic consumes the state.
+                previous_repeat = job.get("repeat")
+                repeat_state = dict(previous_repeat) if isinstance(previous_repeat, dict) else {}
+                repeat_state["times"] = updated["repeat"] if updated["repeat"] > 0 else None
+                repeat_state.setdefault("completed", 0)
+                updated["repeat"] = repeat_state
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes
@@ -1542,19 +1642,35 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
 
-            if schedule_changed:
+            if schedule_changed or repeat_changed:
                 updated_schedule = updated["schedule"]
                 # The API may pass schedule as a raw string (e.g. "every 10m")
                 # instead of a pre-parsed dict.  Normalize it the same way
                 # create_job() does so downstream code can call .get() safely.
                 if isinstance(updated_schedule, str):
                     updated_schedule = parse_schedule(updated_schedule)
-                    updated["schedule"] = updated_schedule
-                updated["schedule_display"] = updates.get(
-                    "schedule_display",
-                    updated_schedule.get("display", updated.get("schedule_display")),
+                repeat_state = updated.get("repeat")
+                repeat_times = repeat_state.get("times") if isinstance(repeat_state, dict) else None
+                promoted_schedule = _promote_duration_repeat_to_interval(
+                    updated_schedule,
+                    repeat_times,
                 )
-                if updated.get("state") != "paused":
+                was_promoted = promoted_schedule is not updated_schedule
+                if schedule_changed or was_promoted:
+                    updated_schedule = promoted_schedule
+                    updated["schedule"] = updated_schedule
+                    updated["schedule_display"] = (
+                        updated_schedule["display"]
+                        if was_promoted
+                        else updates.get(
+                            "schedule_display",
+                            updated_schedule.get("display", updated.get("schedule_display")),
+                        )
+                    )
+                # A repeat-only promotion preserves the one-shot's pending
+                # deadline; rescheduling from the edit time would delay its
+                # first run. A changed schedule, by contrast, starts from now.
+                if schedule_changed and updated.get("state") != "paused":
                     updated_next_run = compute_next_run(updated_schedule)
                     # Same guard as create_job: an UPDATE that sets a one-shot
                     # to a time >ONESHOT_GRACE_SECONDS in the past would store
