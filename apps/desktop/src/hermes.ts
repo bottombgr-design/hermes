@@ -433,9 +433,20 @@ export interface SidebarSessionSlice {
 }
 
 /** Which profiles filled their per-profile window in a returned page. The
- *  legacy per-slice endpoint doesn't report this, so derive it from the rows:
- *  a profile at (or over) the cap still has more on disk. */
-function profilesTruncatedFrom(sessions: SessionInfo[], cap: number): Record<string, boolean> {
+ *  legacy per-slice endpoint doesn't report `profiles_truncated`, so derive it
+ *  from the rows. When the endpoint carries `profile_totals` (the exact
+ *  conversation count per profile), compare each profile's returned count
+ *  against its known total — the most precise signal, and already paid for by
+ *  the request. When `profile_totals` is absent (even older backends), fall
+ *  back to checking whether each profile's window filled the cap, or whether
+ *  the global window was full (meaning every profile in the result likely has
+ *  more rows on disk). */
+function profilesTruncatedFrom(
+  sessions: SessionInfo[],
+  cap: number,
+  profileTotals?: Record<string, number>
+): Record<string, boolean> {
+  const globalTruncated = sessions.length >= cap
   const counts = new Map<string, number>()
 
   for (const session of sessions) {
@@ -444,7 +455,16 @@ function profilesTruncatedFrom(sessions: SessionInfo[], cap: number): Record<str
     counts.set(key, (counts.get(key) ?? 0) + 1)
   }
 
-  return Object.fromEntries([...counts].map(([name, count]) => [name, count >= cap]))
+  return Object.fromEntries(
+    [...counts].map(([name, count]) => {
+      // Exact total known → truncated whenever the loaded window is smaller.
+      if (profileTotals && typeof profileTotals[name] === 'number') {
+        return [name, count < profileTotals[name]]
+      }
+
+      return [name, globalTruncated || count >= cap]
+    })
+  )
 }
 
 export interface SidebarSessionsResponse {
@@ -518,7 +538,7 @@ async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<S
 
   return {
     recents: {
-      profiles_truncated: profilesTruncatedFrom(recents.sessions, req.recentsLimit),
+      profiles_truncated: profilesTruncatedFrom(recents.sessions, req.recentsLimit, recents.profile_totals),
       sessions: recents.sessions
     },
     cron: { sessions: cron.sessions },
