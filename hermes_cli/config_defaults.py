@@ -10,6 +10,24 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "compute": {
+        "provider": "modal",
+        "image": "trycua/cua:latest",
+        "capabilities": ["terminal", "files", "process", "computer_use"],
+        "modal": {
+            "cpu": 2,
+            "memory": 8192,
+            "persistent_filesystem": True,
+        },
+        "cua_fleet": {
+            "base_url": "https://run.cua.ai",
+            "token_url": "https://auth.cua.ai/realms/cyclops-cs/protocol/openid-connect/token",
+            "pool": "hermes-desktop",
+            "replicas": 1,
+            "image_pull_secret": "ecr-credentials",
+            "ready_timeout": 600,
+        },
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
