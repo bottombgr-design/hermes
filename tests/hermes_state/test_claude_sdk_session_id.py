@@ -1,0 +1,156 @@
+"""The sessions.claude_sdk_session_id column (W3 continuity, #25267).
+
+Declarative migration: the column lives in SCHEMA_SQL and
+_reconcile_columns adds it to older DBs on startup — so a fresh DB and an
+upgraded DB both expose it, nullable.
+"""
+
+from hermes_state import SessionDB
+
+
+def test_column_exists_null_by_default_and_round_trips(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("sess-cc-1", source="telegram")
+        row = db.get_session("sess-cc-1")
+        assert "claude_sdk_session_id" in row
+        assert row["claude_sdk_session_id"] is None
+
+        db.update_claude_sdk_session_id("sess-cc-1", "sdk-uuid-42")
+        assert db.get_session("sess-cc-1")["claude_sdk_session_id"] == "sdk-uuid-42"
+
+        # Clearing (error retire) round-trips to NULL.
+        db.update_claude_sdk_session_id("sess-cc-1", None)
+        assert db.get_session("sess-cc-1")["claude_sdk_session_id"] is None
+    finally:
+        db.close()
+
+
+def test_new_session_row_never_inherits_an_id(tmp_path):
+    # /new and expiry rotate to a NEW Hermes session row — fresh-by-keying:
+    # the new row must carry no resume id.
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("sess-old", source="telegram")
+        db.update_claude_sdk_session_id("sess-old", "sdk-uuid-1")
+        db.create_session("sess-new", source="telegram")
+        assert db.get_session("sess-new")["claude_sdk_session_id"] is None
+    finally:
+        db.close()
+
+
+def test_fts_probe_error_classifier():
+    # Validator C2: only a MISSING fts object may disable read-only search;
+    # a transient lock must never latch a silent false-empty.
+    import sqlite3
+
+    from hermes_state import _fts_object_missing
+
+    assert _fts_object_missing(sqlite3.OperationalError("no such table: messages_fts"))
+    assert _fts_object_missing(sqlite3.OperationalError("no such module: fts5"))
+    assert not _fts_object_missing(sqlite3.OperationalError("database is locked"))
+    assert not _fts_object_missing(sqlite3.OperationalError("disk I/O error"))
+
+
+def _read_only_db_with_probe_error(tmp_path, monkeypatch, message, sql_needle):
+    """Open a read-only SessionDB where the probe matching `sql_needle` raises.
+
+    The seed DB is created first with a normal write handle (schema load),
+    THEN sqlite3.connect is wrapped so only statements containing
+    `sql_needle` error — every other statement runs for real. The primary
+    probe is ``SELECT 1 FROM messages_fts LIMIT 1`` and the trigram probe
+    is ``SELECT 1 FROM messages_fts_trigram LIMIT 1``, so use
+    "messages_fts LIMIT" to hit the primary one only ("messages_fts" alone
+    is a substring of the trigram table name).
+    """
+    import sqlite3
+
+    import hermes_state
+
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path=db_path).close()
+
+    real_connect = sqlite3.connect
+
+    def _connect_with_probe_error(*args, **kwargs):
+        # A real sqlite3.Connection subclass via the factory kwarg — a plain
+        # object proxy dies in sqlite_safe_read._retrofit_tracking's
+        # __class__ swap (object layout differs from TrackedConnection).
+        base = kwargs.get("factory", sqlite3.Connection)
+
+        class _ProbeErrorConnection(base):
+            def execute(self, sql, *eargs, **ekwargs):
+                if sql_needle in sql:
+                    raise sqlite3.OperationalError(message)
+                return super().execute(sql, *eargs, **ekwargs)
+
+        kwargs["factory"] = _ProbeErrorConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(
+        hermes_state.sqlite3, "connect", _connect_with_probe_error
+    )
+    return SessionDB(db_path=db_path, read_only=True)
+
+
+def _read_only_db_with_trigram_probe_error(tmp_path, monkeypatch, message):
+    return _read_only_db_with_probe_error(
+        tmp_path, monkeypatch, message, sql_needle="messages_fts_trigram"
+    )
+
+
+def test_primary_fts_probe_transient_error_keeps_search_enabled(
+    tmp_path, monkeypatch
+):
+    # The transient-vs-absent rule on the PRIMARY messages_fts probe itself
+    # (the trigram tests below exercise only the second probe): a lock during
+    # a checkpoint must classify as transient and keep _fts_enabled=True, so
+    # a silent false-empty is confined to the query that hits the error
+    # instead of latching for the handle's lifetime.
+    db = _read_only_db_with_probe_error(
+        tmp_path, monkeypatch, "database is locked", sql_needle="messages_fts LIMIT"
+    )
+    try:
+        assert db._fts_enabled is True
+    finally:
+        db.close()
+
+
+def test_trigram_probe_transient_error_keeps_trigram_available(tmp_path, monkeypatch):
+    # Same transient-vs-absent rule as the messages_fts probe directly above
+    # it: a lock during a checkpoint must not latch the LIKE fallback (which
+    # ORs tokens and drops NOT/rank) for the handle's lifetime. A wrongly-kept
+    # True costs nothing — search_messages catches the per-query error and
+    # falls through to LIKE.
+    db = _read_only_db_with_trigram_probe_error(
+        tmp_path, monkeypatch, "database is locked"
+    )
+    try:
+        assert db._trigram_available is True
+        assert db._fts_enabled is True
+    finally:
+        db.close()
+
+
+def test_trigram_probe_missing_table_disables_trigram(tmp_path, monkeypatch):
+    db = _read_only_db_with_trigram_probe_error(
+        tmp_path, monkeypatch, "no such table: messages_fts_trigram"
+    )
+    try:
+        assert db._trigram_available is False
+    finally:
+        db.close()
+
+
+def test_trigram_probe_missing_tokenizer_disables_trigram(tmp_path, monkeypatch):
+    # A build with FTS5 but without the trigram tokenizer (SQLite < 3.34)
+    # raises "no such tokenizer: trigram" — persistent absence, same latch as
+    # a missing table. _fts_object_missing alone does NOT classify this one;
+    # the probe must also consult _is_trigram_unavailable_error.
+    db = _read_only_db_with_trigram_probe_error(
+        tmp_path, monkeypatch, "no such tokenizer: trigram"
+    )
+    try:
+        assert db._trigram_available is False
+    finally:
+        db.close()
