@@ -2190,6 +2190,33 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+def _windows_git_bash() -> str | None:
+    """Return Git for Windows' bash instead of a legacy WSL launcher.
+
+    Native Windows service processes commonly put ``System32`` before Git on
+    ``PATH``.  In that environment ``shutil.which("bash")`` resolves the legacy
+    WSL ``bash.exe`` launcher, whose first argument is a shell command string.
+    Passing a native script path to that launcher strips its backslashes and
+    exits 127.  Locate bash beside the resolved Git installation so the script
+    path remains a real argv element.
+    """
+    if sys.platform != "win32":
+        return None
+
+    git = shutil.which("git")
+    if not git:
+        return None
+
+    # Standard, portable, and package-manager Git installs place bash within
+    # four ancestors of git.exe. Keep the search local to that installation.
+    for parent in list(Path(git).resolve().parents)[:4]:
+        for relative in (Path("bin") / "bash.exe", Path("usr") / "bin" / "bash.exe"):
+            candidate = parent / relative
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -2203,7 +2230,7 @@ def _run_job_script(
 
     Supported interpreters (chosen by file extension):
 
-    * ``.sh`` / ``.bash`` — run with ``/bin/bash``
+    * ``.sh`` / ``.bash`` — run with Bash (Git Bash is preferred on Windows)
     * anything else — run with the current Python interpreter
       (``sys.executable``), preserving the original behaviour for
       Python-based pre-check and data-collection scripts.
@@ -2263,12 +2290,11 @@ def _run_job_script(
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
     if suffix in {".sh", ".bash"}:
-        # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
-        # all work.  On native Windows without Git for Windows installed
-        # shutil.which returns None — fall back to a clear error rather
-        # than a FileNotFoundError with a confusing "[WinError 2]"
-        # traceback.
-        _bash = shutil.which("bash") or (
+        # Prefer Git Bash explicitly on Windows. A service PATH often resolves
+        # ``bash`` to System32's legacy WSL launcher, which consumes the native
+        # path as a command string and strips its backslashes. Linux/macOS keep
+        # the ordinary PATH lookup.
+        _bash = _windows_git_bash() or shutil.which("bash") or (
             "/bin/bash" if os.path.isfile("/bin/bash") else None
         )
         if _bash is None:
