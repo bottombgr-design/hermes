@@ -102,6 +102,8 @@ async def test_rich_result_shapes_extract_message_id(raw, expected_id):
 
     assert result.success is True
     assert result.message_id == expected_id
+    assert result.delivery_route == "telegram.rich"
+    assert result.chunk_count == 1
     bot = adapter._bot
     assert bot is not None
     bot.do_api_request.assert_awaited_once()
@@ -116,6 +118,8 @@ async def test_rich_happy_path_sends_raw_markdown():
 
     assert result.success is True
     assert result.message_id == "123"
+    assert result.delivery_route == "telegram.rich"
+    assert result.chunk_count == 1
     adapter._bot.do_api_request.assert_awaited_once()
     api_kwargs = _rich_api_kwargs(adapter)
     # Raw markdown — NOT MarkdownV2-escaped. Table pipes still present.
