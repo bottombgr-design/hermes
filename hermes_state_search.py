@@ -716,7 +716,9 @@ class SessionSearchMixin:
         session_id: str,
         limit: int = 20,
         include_inactive: bool = False,
-    ) -> List[Dict[str, Any]]:
+        *,
+        with_revision: bool = False,
+    ):
         """Return the *limit* most-recent user messages, newest first.
 
         Each entry is a dict with keys ``id``, ``timestamp``, ``preview``.
@@ -776,6 +778,8 @@ class SessionSearchMixin:
                     "preview": preview,
                 }
             )
+        if with_revision:
+            return result, getattr(self, "get_active_message_revision")(session_id)
         return result
 
     @staticmethod
