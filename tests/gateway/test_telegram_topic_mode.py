@@ -11,7 +11,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from hermes_state import SessionDB
-from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway.config import (
+    ContextRolloverPolicy,
+    GatewayConfig,
+    HomeChannel,
+    Platform,
+    PlatformConfig,
+)
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
@@ -567,6 +573,228 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
     )
     assert refreshed is not None
     assert refreshed["session_id"] == "child-session"
+
+
+@pytest.mark.asyncio
+async def test_topic_binding_advances_to_context_rollover_child(
+    tmp_path, monkeypatch
+):
+    """A stale topic binding must not switch a rollover child to its parent."""
+    import gateway.run as gateway_run
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    session_db.create_session(
+        session_id="context-parent",
+        source="telegram",
+        user_id="208214988",
+    )
+    session_db.end_session("context-parent", end_reason="context_rollover")
+    session_db.create_session(
+        session_id="context-child",
+        source="telegram",
+        user_id="208214988",
+        parent_session_id="context-parent",
+    )
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=topic_key,
+        session_id="context-parent",
+    )
+
+    runner = _make_runner(session_db=session_db)
+    runner.session_store.get_or_create_session.side_effect = None
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=topic_key,
+        session_id="context-child",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=topic_source,
+        was_auto_reset=True,
+        auto_reset_reason="context_rollover",
+        reset_had_activity=True,
+        reset_prompt_tokens=130000,
+        prev_session_id="context-parent",
+    )
+    runner.session_store.build_continuity_checkpoint.return_value = "checkpoint"
+    runner._run_agent = AsyncMock(
+        return_value={
+            "success": True,
+            "final_response": "continued",
+            "session_id": "context-child",
+            "messages": [],
+        }
+    )
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    await runner._handle_message(
+        _make_event("continue after rollover", thread_id="17585")
+    )
+
+    runner.session_store.switch_session.assert_not_called()
+    refreshed = session_db.get_telegram_topic_binding(
+        chat_id="208214988",
+        thread_id="17585",
+    )
+    assert refreshed is not None
+    assert refreshed["session_id"] == "context-child"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notify", [False, True])
+async def test_context_rollover_notice_is_opt_in(
+    tmp_path, monkeypatch, notify
+):
+    import gateway.run as gateway_run
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    runner = _make_runner(session_db=session_db)
+    runner.config.context_rollover = ContextRolloverPolicy(
+        enabled=True,
+        notify=notify,
+    )
+    runner.session_store.config = runner.config
+    runner.session_store.get_or_create_session.side_effect = None
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=topic_key,
+        session_id="context-child",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=topic_source,
+        was_auto_reset=True,
+        auto_reset_reason="context_rollover",
+        reset_had_activity=True,
+        reset_prompt_tokens=350_000,
+        prev_session_id="context-parent",
+    )
+    runner.session_store.build_continuity_checkpoint.return_value = "checkpoint"
+    runner._run_agent = AsyncMock(
+        return_value={
+            "success": True,
+            "final_response": "continued",
+            "session_id": "context-child",
+            "messages": [],
+        }
+    )
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    await runner._handle_message(
+        _make_event("continue invisibly", thread_id="17585")
+    )
+
+    sent_text = "\n".join(
+        str(call.args[1])
+        for call in runner.adapters[Platform.TELEGRAM].send.await_args_list
+        if len(call.args) > 1
+    )
+    if notify:
+        assert "Context segment rolled over" in sent_text
+    else:
+        assert "Context segment rolled over" not in sent_text
+
+
+@pytest.mark.asyncio
+async def test_topic_binding_advances_when_compression_child_rolls_for_context(
+    tmp_path, monkeypatch
+):
+    """A rollover edge must stop the tip walk before the rollover child."""
+    import gateway.run as gateway_run
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    session_db.create_session(
+        session_id="compression-parent",
+        source="telegram",
+        user_id="208214988",
+    )
+    session_db.end_session("compression-parent", end_reason="compression")
+    session_db.create_session(
+        session_id="compression-child",
+        source="telegram",
+        user_id="208214988",
+        parent_session_id="compression-parent",
+    )
+    session_db.end_session(
+        "compression-child",
+        end_reason="context_rollover",
+    )
+    session_db.create_session(
+        session_id="context-child",
+        source="telegram",
+        user_id="208214988",
+        parent_session_id="compression-child",
+    )
+
+    assert session_db.get_compression_tip("compression-parent") == "compression-child"
+    assert session_db.get_compression_tip("compression-child") == "compression-child"
+
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=topic_key,
+        session_id="compression-parent",
+    )
+
+    runner = _make_runner(session_db=session_db)
+    runner.session_store.get_or_create_session.side_effect = None
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=topic_key,
+        session_id="context-child",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=topic_source,
+        was_auto_reset=True,
+        auto_reset_reason="context_rollover",
+        reset_had_activity=True,
+        reset_prompt_tokens=130000,
+        prev_session_id="compression-child",
+    )
+    runner.session_store.build_continuity_checkpoint.return_value = "checkpoint"
+    runner._run_agent = AsyncMock(
+        return_value={
+            "success": True,
+            "final_response": "continued",
+            "session_id": "context-child",
+            "messages": [],
+        }
+    )
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    await runner._handle_message(
+        _make_event("continue after chained rollover", thread_id="17585")
+    )
+
+    runner.session_store.switch_session.assert_not_called()
+    refreshed = session_db.get_telegram_topic_binding(
+        chat_id="208214988",
+        thread_id="17585",
+    )
+    assert refreshed is not None
+    assert refreshed["session_id"] == "context-child"
 
 
 @pytest.mark.asyncio

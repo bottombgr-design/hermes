@@ -110,7 +110,6 @@ class TestSchema:
         assert "session_search as secondary" in desc
         assert "not found" in desc
 
-
 class TestHiddenSources:
     def test_tool_source_hidden(self):
         assert "tool" in _HIDDEN_SESSION_SOURCES
@@ -959,6 +958,14 @@ class TestResolveToParent:
         assert root == "s_parent"
         assert has_compression is True
 
+    def test_context_rollover_is_an_archived_lineage_hop(self, db):
+        db.create_session("s_parent", source="cli")
+        db.end_session("s_parent", "context_rollover")
+        db.create_session("s_child", source="cli", parent_session_id="s_parent")
+        root, has_archived_hop = _resolve_to_parent(db, "s_child")
+        assert root == "s_parent"
+        assert has_archived_hop is True
+
     def test_delegation_no_compression(self, db):
         """Delegation child: parent_session_id set but no compression end_reason."""
         db.create_session("s_parent", source="cli")
@@ -1304,6 +1311,11 @@ class TestCompressionEndedHelper:
         db.end_session("s1", "compression")
         assert _is_compression_ended(db, "s1") is True
 
+    def test_context_rollover_is_an_archived_continuation(self, db):
+        db.create_session("s1", source="cli")
+        db.end_session("s1", "context_rollover")
+        assert _is_compression_ended(db, "s1") is True
+
     def test_active_session_not_ended(self, db):
         db.create_session("s1", source="cli")
         assert _is_compression_ended(db, "s1") is False
@@ -1363,3 +1375,32 @@ class TestLegacyContinuationPlusDelegation:
 
         # Delegation child must NOT appear
         assert "s_delegate" not in sids
+
+
+class TestRolloverDiscovery:
+    def test_previous_segment_is_searchable_from_current_child(
+        self, db
+    ):
+        db.create_session("s_previous", source="telegram")
+        db.append_message(
+            "s_previous",
+            role="user",
+            content="deterministic rollover acceptance criteria",
+        )
+        db.end_session("s_previous", "context_rollover")
+        db.create_session(
+            "s_current",
+            source="telegram",
+            parent_session_id="s_previous",
+        )
+
+        result = json.loads(
+            session_search(
+                query="deterministic rollover",
+                db=db,
+                current_session_id="s_current",
+            )
+        )
+
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "s_previous"
