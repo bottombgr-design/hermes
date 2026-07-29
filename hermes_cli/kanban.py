@@ -76,6 +76,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "verify_mode": t.verify_mode,
+        "verify_cmd": t.verify_cmd,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "session_id": t.session_id,
@@ -393,6 +395,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--verify-cmd", default=None, metavar="CMD",
+                          dest="verify_cmd",
+                          help="Opt-in verified completion: run CMD (via "
+                               "/bin/sh -c, in the task's workspace) when the "
+                               "worker calls kanban_complete. Exit 0 lets the "
+                               "task complete; non-zero rejects the completion, "
+                               "counts a failure toward --max-retries, and feeds "
+                               "the output back to the worker. Exhausted retries "
+                               "block the task with the evidence attached. "
+                               "Pair with --max-retries (default budget is "
+                               f"{kb.DEFAULT_FAILURE_LIMIT}).")
+    p_create.add_argument("--verify", default=None, choices=["auto"],
+                          dest="verify_auto", metavar="auto",
+                          help="Opt-in verified completion without running "
+                               "anything: accept only fresh, full-scope green "
+                               "evidence from the verification ledger (the "
+                               "worker must have run the project's verify "
+                               "command to completion this session, with no "
+                               "edits after it). Mutually exclusive with "
+                               "--verify-cmd.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -600,6 +622,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument("--skip-verify", action="store_true",
+                            help="Human override for a verified-completion gate "
+                                 "(--verify-cmd / --verify auto tasks): complete "
+                                 "without running the verification. Refused "
+                                 "without this flag; the bypass is recorded on "
+                                 "the task (event + comment).")
 
     p_edit = sub.add_parser(
         "edit",
@@ -1495,6 +1523,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    verify_cmd = getattr(args, "verify_cmd", None)
+    verify_auto = getattr(args, "verify_auto", None)
+    if verify_cmd is not None and not verify_cmd.strip():
+        print("kanban: --verify-cmd requires a non-empty command", file=sys.stderr)
+        return 2
+    if verify_cmd and verify_auto:
+        print("kanban: --verify-cmd and --verify auto are mutually exclusive",
+              file=sys.stderr)
+        return 2
+    verify_mode = "cmd" if verify_cmd else ("auto" if verify_auto else None)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1518,6 +1556,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            verify_mode=verify_mode,
+            verify_cmd=verify_cmd,
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
@@ -1692,6 +1732,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+    if task.verify_mode == "cmd":
+        print(f"  verify:    cmd: {task.verify_cmd}")
+    elif task.verify_mode == "auto":
+        print("  verify:    auto (ledger evidence)")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
@@ -2175,6 +2219,32 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # `hermes kanban complete <id>` from the terminal tool and
             # bypass the auxiliary judge that the tool-call path enforces.
             task = kb.get_task(conn, tid)
+            # Verified completion (#70806): manual CLI completion is the
+            # documented human override for the gate — but it must be one
+            # deliberate keystroke away, not the default. The CLI is
+            # reachable from any worker's terminal tool (the exact bypass
+            # the goal-judge comment below exists for), so an unflagged
+            # complete on a gated card is refused, and a --skip-verify
+            # override leaves a durable audit trail on the task instead
+            # of just an ephemeral stderr line.
+            if task and task.verify_mode:
+                if not getattr(args, "skip_verify", False):
+                    print(
+                        f"kanban: {tid} has a verified-completion gate "
+                        f"({task.verify_mode}); completing it from the CLI "
+                        f"would bypass the gate. Let the worker complete "
+                        f"it, or re-run with --skip-verify to record a "
+                        f"human override.",
+                        file=sys.stderr,
+                    )
+                    failed.append(tid)
+                    continue
+                print(
+                    f"note: {tid} has a verified-completion gate "
+                    f"({task.verify_mode}); --skip-verify bypasses it "
+                    f"(recorded on the task).",
+                    file=sys.stderr,
+                )
             if task and task.goal_mode:
                 judge_available = False
                 try:
@@ -2224,6 +2294,34 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
+                if task and task.verify_mode:
+                    # Auditable human override (#70806): persist the bypass
+                    # as an event + comment so the board records that this
+                    # 'done' was NOT verified. Command redacted — events
+                    # and comments are broadcast surfaces.
+                    from agent.redact import redact_sensitive_text
+                    shown_cmd = (
+                        redact_sensitive_text(task.verify_cmd, force=True)
+                        if task.verify_cmd else None
+                    )
+                    with kb.write_txn(conn):
+                        kb._append_event(
+                            conn, tid, "verify_bypassed",
+                            {
+                                "mode": task.verify_mode,
+                                "command": shown_cmd,
+                                "actor": "cli",
+                                "flag": "--skip-verify",
+                            },
+                        )
+                    kb.add_comment(
+                        conn, tid, "verify-gate",
+                        (
+                            f"Human override: completed from the CLI with "
+                            f"--skip-verify, bypassing the "
+                            f"{task.verify_mode} verification gate."
+                        ),
+                    )
     return 0 if not failed else 1
 
 
