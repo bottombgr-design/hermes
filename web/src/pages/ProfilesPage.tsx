@@ -44,6 +44,7 @@ import { Checkbox } from "@nous-research/ui/ui/components/checkbox";
 import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { cn, themedBody } from "@/lib/utils";
+import { EFFORT_OPTIONS } from "@/lib/reasoning-effort";
 
 // Mirrors hermes_cli/profiles.py::_PROFILE_ID_RE so we can reject obviously
 // invalid names (uppercase, spaces, …) before round-tripping a doomed POST.
@@ -303,6 +304,10 @@ export default function ProfilesPage() {
       editModel: p.editModel ?? "Change model",
       modelSaved: p.modelSaved ?? "Model updated",
       modelSelect: p.modelSelect ?? "Select a model",
+      reasoningEffort: p.reasoningEffort ?? "Reasoning effort",
+      reasoningInherit: p.reasoningInherit ?? "Inherit provider default",
+      reasoningSaved: p.reasoningSaved ?? "Reasoning effort updated",
+      reasoningUnset: p.reasoningUnset ?? "provider default",
       actions: p.actions ?? "Actions",
       manageSkills: p.manageSkills ?? "Manage skills & tools",
       activeSetHint:
@@ -360,13 +365,15 @@ export default function ProfilesPage() {
   // Inline model editor state
   const [editingModelFor, setEditingModelFor] = useState<string | null>(null);
   const [modelEditChoice, setModelEditChoice] = useState("");
+  const [modelEditInitialChoice, setModelEditInitialChoice] = useState("");
+  const [reasoningEditChoice, setReasoningEditChoice] = useState("");
   const [modelSaving, setModelSaving] = useState(false);
 
   // Per-profile "set active" in-flight name
   const [settingActive, setSettingActive] = useState<string | null>(null);
 
   const modelKey = (provider: string | null, model: string | null) =>
-    provider && model ? `${provider}\u0000${model}` : "";
+    model ? `${provider ?? ""}\u0000${model}` : "";
 
   const loadModelChoices = useCallback(() => {
     if (modelChoices !== null || modelChoicesLoading.current) return;
@@ -653,11 +660,24 @@ export default function ProfilesPage() {
       setEditingSoulFor(null);
       setEditingDescFor(null);
       setEditingModelFor(p.name);
-      setModelEditChoice(modelKey(p.provider, p.model));
+      const initialChoice = modelKey(p.provider, p.model);
+      setModelEditChoice(initialChoice);
+      setModelEditInitialChoice(initialChoice);
+      setReasoningEditChoice(p.reasoning_effort ?? "");
       loadModelChoices();
     },
     [closeEditor, editingModelFor, loadModelChoices],
   );
+
+  // Keep a persisted custom/unknown model visible in the picker even when the
+  // dashboard catalog has no matching option. It remains a display-only
+  // option: the save path below still only writes catalog selections.
+  const unlistedInitialModel =
+    modelChoices !== null &&
+    modelEditInitialChoice !== "" &&
+    !modelChoices.some(
+      (c) => `${c.provider}\u0000${c.model}` === modelEditInitialChoice,
+    );
 
   const handleSaveModel = async (name: string) => {
     const picked = modelEditChoice
@@ -665,15 +685,38 @@ export default function ProfilesPage() {
           (c) => `${c.provider}\u0000${c.model}` === modelEditChoice,
         )
       : undefined;
-    if (!picked) return;
+    const unchangedUnlistedModel =
+      modelEditChoice !== "" && modelEditChoice === modelEditInitialChoice;
+    if (modelEditChoice && modelChoices?.length && !picked && !unchangedUnlistedModel) {
+      return;
+    }
+    const changedModel =
+      picked !== undefined && modelEditChoice !== modelEditInitialChoice ? picked : null;
     setModelSaving(true);
     try {
-      await api.setProfileModel(name, picked.provider, picked.model);
-      showToast(`${L.modelSaved}: ${picked.model}`, "success");
+      const settings = await api.setProfileSettings(
+        name,
+        changedModel?.provider ?? null,
+        changedModel?.model ?? null,
+        reasoningEditChoice,
+      );
+      if (changedModel) {
+        showToast(`${L.modelSaved}: ${changedModel.model}`, "success");
+      }
+      showToast(
+        `${L.reasoningSaved}: ${settings.reasoning_effort || L.reasoningUnset}`,
+        "success",
+      );
       setProfiles((prev) =>
         prev.map((p) =>
           p.name === name
-            ? { ...p, model: picked.model, provider: picked.provider }
+            ? {
+                ...p,
+                ...(changedModel
+                  ? { model: changedModel.model, provider: changedModel.provider }
+                  : {}),
+                reasoning_effort: settings.reasoning_effort,
+              }
             : p,
         ),
       );
@@ -1216,6 +1259,10 @@ export default function ProfilesPage() {
                           {t.profiles.skills}: {p.skill_count}
                         </span>
 
+                        <span className="truncate">
+                          {L.reasoningEffort}: {p.reasoning_effort || L.reasoningUnset}
+                        </span>
+
                         <span className="font-mono truncate">{p.path}</span>
                       </div>
                     </>
@@ -1273,11 +1320,11 @@ export default function ProfilesPage() {
                 editorKind === "soul" && "min-h-0 overflow-y-auto",
               )}
             >
-              {editorKind === "model" &&
-                (modelChoices !== null && modelChoices.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">{L.modelNone}</p>
-                ) : (
-                  <>
+              {editorKind === "model" && (
+                <>
+                  {modelChoices !== null && modelChoices.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">{L.modelNone}</p>
+                  ) : (
                     <Select
                       value={modelEditChoice}
                       disabled={modelChoices === null}
@@ -1286,6 +1333,11 @@ export default function ProfilesPage() {
                       }
                       onValueChange={setModelEditChoice}
                     >
+                      {unlistedInitialModel && (
+                        <SelectOption value={modelEditInitialChoice}>
+                          {modelEditInitialChoice.replace("\u0000", " · ")}
+                        </SelectOption>
+                      )}
                       {(modelChoices ?? []).map((c) => (
                         <SelectOption
                           key={`${c.provider}\u0000${c.model}`}
@@ -1295,26 +1347,49 @@ export default function ProfilesPage() {
                         </SelectOption>
                       ))}
                     </Select>
+                  )}
 
-                    <div className="flex justify-end">
-                      <Button
-                        size="sm"
-                        className="uppercase"
-                        onClick={() => handleSaveModel(editorName)}
-                        disabled={
-                          modelSaving ||
-                          !modelChoices?.some(
-                            (c) =>
-                              `${c.provider}\u0000${c.model}` ===
-                              modelEditChoice,
-                          )
-                        }
-                      >
-                        {modelSaving ? t.common.saving : t.common.save}
-                      </Button>
-                    </div>
-                  </>
-                ))}
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="profile-reasoning-effort">
+                      {L.reasoningEffort}
+                    </Label>
+                    <Select
+                      id="profile-reasoning-effort"
+                      value={reasoningEditChoice}
+                      disabled={modelSaving}
+                      onValueChange={setReasoningEditChoice}
+                    >
+                      <SelectOption value="">{L.reasoningInherit}</SelectOption>
+                      {EFFORT_OPTIONS.map((option) => (
+                        <SelectOption key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectOption>
+                      ))}
+                    </Select>
+                  </div>
+
+                  <div className="flex justify-end">
+                    <Button
+                      size="sm"
+                      className="uppercase"
+                      onClick={() => handleSaveModel(editorName)}
+                      disabled={
+                        modelSaving ||
+                        (modelEditChoice !== "" &&
+                          (modelChoices === null ||
+                            (modelChoices.length > 0 &&
+                              !modelChoices.some(
+                                (c) =>
+                                  `${c.provider}\u0000${c.model}` === modelEditChoice,
+                              ) &&
+                              modelEditChoice !== modelEditInitialChoice)))
+                      }
+                    >
+                      {modelSaving ? t.common.saving : t.common.save}
+                    </Button>
+                  </div>
+                </>
+              )}
 
               {editorKind === "desc" && (
                 <>

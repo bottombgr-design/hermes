@@ -3142,6 +3142,24 @@ class TestWebServerEndpoints:
         assert len(data["category_order"]) > 0
         assert "general" in data["category_order"]
 
+    def test_config_schema_exposes_main_reasoning_effort(self):
+        schema = self.client.get("/api/config/schema").json()["fields"]
+        entry = schema["agent.reasoning_effort"]
+        assert entry["type"] == "select"
+        assert entry["category"] == "agent"
+        assert entry["emptyLabel"] == "Inherit provider default"
+        assert entry["options"] == [
+            "",
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        ]
+
     def _schema_provider_options(self, key):
         resp = self.client.get("/api/config/schema")
         assert resp.status_code == 200
@@ -5726,6 +5744,36 @@ class TestConfigRoundTrip:
         assert isinstance(config.get("model"), str), \
             f"model should be string, got {type(config.get('model'))}"
 
+    def test_reasoning_effort_can_be_selected_and_cleared(self):
+        from hermes_cli.config import load_config, save_config
+
+        save_config({"agent": {"reasoning_effort": "high"}})
+        web_config = self.client.get("/api/config").json()
+        assert web_config["agent"]["reasoning_effort"] == "high"
+
+        web_config["agent"]["reasoning_effort"] = ""
+        response = self.client.put("/api/config", json={"config": web_config})
+        assert response.status_code == 200
+        assert "reasoning_effort" not in load_config().get("agent", {})
+
+    @pytest.mark.parametrize("legacy", [False, "false", "disabled"])
+    def test_reasoning_effort_legacy_disabled_values_normalize_to_none(self, legacy):
+        from hermes_cli.config import load_config, save_config
+
+        save_config({"agent": {"reasoning_effort": legacy}})
+        web_config = self.client.get("/api/config").json()
+        response = self.client.put("/api/config", json={"config": web_config})
+        assert response.status_code == 200
+        assert load_config()["agent"]["reasoning_effort"] == "none"
+
+    @pytest.mark.parametrize("invalid", [42, True, {"effort": "high"}, ["high"]])
+    def test_reasoning_effort_rejects_invalid_types(self, invalid):
+        web_config = self.client.get("/api/config").json()
+        web_config.setdefault("agent", {})["reasoning_effort"] = invalid
+        response = self.client.put("/api/config", json={"config": web_config})
+        assert response.status_code == 400
+        assert response.json()["detail"] == "invalid agent.reasoning_effort"
+
     def test_round_trip_preserves_model_subkeys(self):
         """Save and reload should not lose model.provider, model.base_url, etc."""
         from hermes_cli.config import load_config, save_config
@@ -6498,6 +6546,148 @@ class TestNewEndpoints:
             json={"provider": "", "model": ""},
         )
         assert resp.status_code == 400
+
+    def test_profile_settings_are_scoped_and_saved_once(self, monkeypatch):
+        from copy import deepcopy
+
+        import hermes_cli.profiles as profiles_mod
+        import hermes_cli.web_server as web_server
+        from hermes_cli.config import load_config, save_config
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        self.client.post("/api/profiles", json={"name": "settings-prof"})
+        default_config_before = deepcopy(load_config())
+        profile_dir = get_hermes_home() / "profiles" / "settings-prof"
+
+        token = set_hermes_home_override(str(profile_dir))
+        try:
+            config = load_config()
+            config["model"] = {
+                "provider": "provider-a",
+                "default": "model-a",
+                "context_length": 12345,
+            }
+            save_config(config)
+        finally:
+            reset_hermes_home_override(token)
+
+        saves = []
+        original_save_config = web_server.save_config
+
+        def tracked_save_config(config):
+            saves.append(config)
+            return original_save_config(config)
+
+        monkeypatch.setattr(web_server, "save_config", tracked_save_config)
+        response = self.client.put(
+            "/api/profiles/settings-prof/settings",
+            json={"provider": "", "model": "", "effort": "high"},
+        )
+        assert response.status_code == 200
+        assert len(saves) == 1
+
+        token = set_hermes_home_override(str(profile_dir))
+        try:
+            config = load_config()
+            assert config["model"]["context_length"] == 12345
+            assert config["agent"]["reasoning_effort"] == "high"
+        finally:
+            reset_hermes_home_override(token)
+
+        response = self.client.put(
+            "/api/profiles/settings-prof/settings",
+            json={
+                "provider": "provider-b",
+                "model": "model-b",
+                "effort": "low",
+            },
+        )
+        assert response.status_code == 200
+        assert len(saves) == 2
+
+        token = set_hermes_home_override(str(profile_dir))
+        try:
+            config = load_config()
+            assert config["model"]["provider"] == "provider-b"
+            assert config["model"]["default"] == "model-b"
+            assert "context_length" not in config["model"]
+            assert config["agent"]["reasoning_effort"] == "low"
+        finally:
+            reset_hermes_home_override(token)
+
+        assert load_config() == default_config_before
+
+    def test_profile_settings_require_a_complete_model_pair(self, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        self.client.post("/api/profiles", json={"name": "settings-prof2"})
+        response = self.client.put(
+            "/api/profiles/settings-prof2/settings",
+            json={"provider": "provider-a", "model": "", "effort": "high"},
+        )
+        assert response.status_code == 400
+
+    def test_profile_reasoning_effort_round_trip_and_clear(self, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+        from hermes_cli.config import load_config
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        self.client.post("/api/profiles", json={"name": "reasoning-prof"})
+
+        profile = next(
+            p for p in self.client.get("/api/profiles").json()["profiles"]
+            if p["name"] == "reasoning-prof"
+        )
+        assert profile["reasoning_effort"] == ""
+
+        response = self.client.put(
+            "/api/profiles/reasoning-prof/reasoning",
+            json={"effort": "HIGH"},
+        )
+        assert response.status_code == 200
+        assert response.json()["reasoning_effort"] == "high"
+
+        profile_dir = get_hermes_home() / "profiles" / "reasoning-prof"
+        token = set_hermes_home_override(str(profile_dir))
+        try:
+            assert load_config()["agent"]["reasoning_effort"] == "high"
+        finally:
+            reset_hermes_home_override(token)
+
+        response = self.client.put(
+            "/api/profiles/reasoning-prof/reasoning",
+            json={"effort": ""},
+        )
+        assert response.status_code == 200
+        assert response.json()["reasoning_effort"] == ""
+
+        token = set_hermes_home_override(str(profile_dir))
+        try:
+            assert "reasoning_effort" not in load_config().get("agent", {})
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_profile_reasoning_effort_rejects_unknown_value(self, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        self.client.post("/api/profiles", json={"name": "reasoning-invalid"})
+        response = self.client.put(
+            "/api/profiles/reasoning-invalid/reasoning",
+            json={"effort": "turbo"},
+        )
+        assert response.status_code == 400
 
     def test_profile_describe_auto_success(self, monkeypatch):
         import hermes_cli.profiles as profiles_mod
