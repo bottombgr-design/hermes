@@ -1601,6 +1601,10 @@ def _resolve_explicit_runtime(
             )
         elif provider == "xai":
             api_mode = "codex_responses"
+        elif provider in ("opencode-zen", "opencode-go"):
+            from hermes_cli.models import opencode_model_api_mode
+            effective_model = target_model or model_cfg.get("default") or ""
+            api_mode = opencode_model_api_mode(provider, effective_model)
         else:
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
             if configured_mode:
@@ -1611,6 +1615,15 @@ def _resolve_explicit_runtime(
                 detected = _detect_api_mode_for_url(base_url)
                 if detected:
                     api_mode = detected
+
+        # OpenCode base URLs end with /v1 for OpenAI-compatible models, but the
+        # Anthropic SDK prepends its own /v1/messages to the base_url. Strip the
+        # trailing /v1 so the SDK constructs the correct path (e.g.
+        # https://opencode.ai/zen/v1/messages instead of .../v1/v1/messages).
+        # Mirrors the same step in _resolve_runtime_from_pool_entry.
+        if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
+            import re as _re
+            base_url = _re.sub(r"/v1/?$", "", base_url)
 
         return {
             "provider": provider,
