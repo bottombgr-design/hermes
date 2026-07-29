@@ -174,7 +174,7 @@ def test_fast_path_no_marker_never_probes(tmp_path, monkeypatch):
 
 def test_update_argv_skips_recovery(tmp_path, monkeypatch):
     root = _project(tmp_path)
-    (root / ".lazy-refresh-incomplete").write_text("x", encoding="utf-8")
+    (root / er.LAZY_REFRESH_MARKER_NAME).write_text("x", encoding="utf-8")
     probed = []
     monkeypatch.setattr(er, "_probe_broken_packages", lambda: probed.append(1) or [])
     er.recover_if_needed(project_root=root, argv=["update"])
@@ -195,7 +195,7 @@ def test_no_pyproject_skips_and_preserves_marker(tmp_path, monkeypatch):
 
 def test_marker_plus_broken_probe_repairs_with_pinned_specs(tmp_path, monkeypatch):
     root = _project(tmp_path)
-    marker = root / ".lazy-refresh-incomplete"
+    marker = root / er.LAZY_REFRESH_MARKER_NAME
     marker.write_text("x", encoding="utf-8")
 
     probe_results = iter([["PyYAML", "python-dotenv"], []])
@@ -226,7 +226,7 @@ def test_healthy_probe_skips_install(tmp_path, monkeypatch):
 
 def test_lock_held_skips_repair(tmp_path, monkeypatch):
     root = _project(tmp_path)
-    (root / ".lazy-refresh-incomplete").write_text("x", encoding="utf-8")
+    (root / er.LAZY_REFRESH_MARKER_NAME).write_text("x", encoding="utf-8")
     (root / ".update-incomplete.lock").write_text("123\n", encoding="utf-8")
     monkeypatch.setattr(er, "_probe_broken_packages", lambda: ["PyYAML"])
     installs = []
@@ -239,7 +239,7 @@ def test_lock_held_skips_repair(tmp_path, monkeypatch):
 
 def test_failed_repair_prints_manual_command_with_pins(tmp_path, monkeypatch, capsys):
     root = _project(tmp_path)
-    (root / ".lazy-refresh-incomplete").write_text("x", encoding="utf-8")
+    (root / er.LAZY_REFRESH_MARKER_NAME).write_text("x", encoding="utf-8")
     monkeypatch.setattr(er, "_probe_broken_packages", lambda: ["PyJWT"])
     monkeypatch.setattr(er, "_run_repair_install", lambda specs, r: False)
     er.recover_if_needed(project_root=root, argv=[])

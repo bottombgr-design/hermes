@@ -55,6 +55,13 @@ LAZY_REFRESH_REPAIR_PACKAGES: dict[str, str] = {
     "jwt": "PyJWT",
 }
 
+# The original marker name was accidentally committed with live PID/timestamp
+# data. Keep that tracked legacy file inert: deleting or rewriting it would make
+# updates autostash a runtime-only modification and can produce modify/delete
+# conflicts while users cross the migration. New runtime state uses an ignored,
+# untracked filename instead.
+LAZY_REFRESH_MARKER_NAME = ".lazy-refresh-incomplete.runtime"
+
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -194,7 +201,7 @@ def recover_if_needed(
             return
         root = _project_root() if project_root is None else project_root
         core_marker = root / ".update-incomplete"
-        lazy_marker = root / ".lazy-refresh-incomplete"
+        lazy_marker = root / LAZY_REFRESH_MARKER_NAME
         if not core_marker.exists() and not lazy_marker.exists():
             return
         # Managed/Docker/PyPI installs have no source tree here — the marker
