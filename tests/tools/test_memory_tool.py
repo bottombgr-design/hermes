@@ -19,6 +19,14 @@ def _blocked(content, pattern_id=None):
     if pattern_id:
         assert pattern_id in result, f"expected {pattern_id} in {result!r}"
 
+    def test_routes_project_local_decisions_away_from_memory(self):
+        description = MEMORY_SCHEMA["description"].lower()
+        assert "project-specific" in description
+        assert "repo docs/adr/tests" in description
+        assert "correction does not automatically" in description
+        assert "if the current project ended" in description
+        assert "preferences & corrections >" not in description
+
 
 # =========================================================================
 # Security scanning
