@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # entirely — the adapter chunks in its own send() and the full output is
 # preserved.
 MAX_PLATFORM_OUTPUT = 4000
+_STRICT_ROUTE_METADATA_KEY = "_hermes_strict_route"
 
 # Matches strings that are *only* a "silence" narration with optional markdown
 # wrappers. Covers: *(silent)*, _silent_, `silent`, ~silent~, (silent), silent,
@@ -77,16 +78,22 @@ class DeliveryTransport:
         chat_id: str,
         content: str,
         metadata: Optional[Dict[str, Any]],
+        *,
+        strict_route: bool = False,
     ) -> Any:
         """Send through this transport while preserving the logical platform."""
+        send_metadata = metadata
+        if strict_route:
+            send_metadata = dict(metadata or {})
+            send_metadata[_STRICT_ROUTE_METADATA_KEY] = True
         if self.is_relay:
             return await self.adapter.send_for_platform(
                 logical_platform,
                 chat_id,
                 content,
-                metadata=metadata,
+                metadata=send_metadata,
             )
-        return await self.adapter.send(chat_id, content, metadata=metadata)
+        return await self.adapter.send(chat_id, content, metadata=send_metadata)
 
 
 def resolve_delivery_transport(
@@ -461,7 +468,9 @@ class DeliveryRouter:
         self,
         target: DeliveryTarget,
         content: str,
-        metadata: Optional[Dict[str, Any]]
+        metadata: Optional[Dict[str, Any]],
+        *,
+        preserve_exact_content: bool = False,
     ) -> Dict[str, Any]:
         """Deliver content to a messaging platform."""
         transport = resolve_delivery_transport(target.platform, self.config, self.adapters)
@@ -485,7 +494,7 @@ class DeliveryRouter:
         job_id = (metadata or {}).get("job_id", "unknown")
         saved_path: Optional[Path] = None
 
-        if len(content) > MAX_PLATFORM_OUTPUT:
+        if not preserve_exact_content and len(content) > MAX_PLATFORM_OUTPUT:
             # Step 1 — audit save (best-effort).  The save is a side-effect
             # audit trail, not essential to delivery.  If it fails (full disk,
             # permissions), delivery proceeds — the content reaches the adapter
@@ -530,7 +539,7 @@ class DeliveryRouter:
         # platform adapter regardless of which persona's prompt failed.
         # Local/file delivery (_deliver_local) is a separate path and is never
         # filtered — saved silence has no loop risk.
-        if self._filter_silence_narration_enabled() and _is_silence_narration(content):
+        if not preserve_exact_content and self._filter_silence_narration_enabled() and _is_silence_narration(content):
             logger.warning(
                 "Dropped silence-narration outbound to %s (chat=%s): %r",
                 target.platform.value,
@@ -640,7 +649,5 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
-
 
 

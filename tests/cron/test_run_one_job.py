@@ -11,6 +11,7 @@ the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
 import cron.scheduler as s
+import pytest
 
 
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
@@ -27,8 +28,11 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
-    def fake_deliver(job, content, adapters=None, loop=None):
-        calls.append(("deliver", job["id"]))
+    def fake_deliver(job, content, adapters=None, loop=None, **kwargs):
+        calls.append((
+            "deliver", job["id"], kwargs.get("protect_final_result"),
+            kwargs.get("final_result_gate_mode"),
+        ))
         return None
 
     def fake_mark(jid, ok, err=None, delivery_error=None):
@@ -38,6 +42,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
     monkeypatch.setattr(s, "save_job_output", fake_save)
     monkeypatch.setattr(s, "_deliver_result", fake_deliver)
     monkeypatch.setattr(s, "mark_job_run", fake_mark)
+    monkeypatch.setattr(s, "load_config", lambda: {})
     return calls
 
 
@@ -51,6 +56,7 @@ def test_tick_process_job_sequence(monkeypatch):
     s.tick(verbose=False, sync=True)
 
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
+    assert calls[2] == ("deliver", "j1", True, "enforce")
     assert calls[-1] == ("mark", "j1", True)
 
 
@@ -63,7 +69,74 @@ def test_run_one_job_success_sequence(monkeypatch):
 
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
+    assert calls[2] == ("deliver", "j2", True, "enforce")
     assert calls[-1] == ("mark", "j2", True)
+
+
+def test_successful_cron_defaults_to_enforce_and_ignores_job_boundary_fields(monkeypatch):
+    calls = _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(s, "load_config", lambda: {})
+    job = {
+        "id": "j-profile-default", "name": "t",
+        "final_result_boundary_enabled": False,
+        "final_result_gate_mode": "off",
+        "cron": {"final_result_boundary_enabled": False, "final_result_gate_mode": "off"},
+    }
+
+    assert s.run_one_job(job) is True
+    assert next(call for call in calls if call[0] == "deliver") == (
+        "deliver", "j-profile-default", True, "enforce",
+    )
+
+
+@pytest.mark.parametrize(
+    ("cron_config", "expected_mode"),
+    [
+        ({"final_result_boundary_enabled": False}, "enforce"),
+        ({"final_result_gate_mode": "off"}, "off"),
+    ],
+)
+def test_profile_config_can_disable_successful_final_result_boundary(
+    monkeypatch, cron_config, expected_mode,
+):
+    calls = _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(s, "load_config", lambda: {"cron": cron_config})
+
+    assert s.run_one_job({"id": "j-profile-off", "name": "t"}) is True
+    assert next(call for call in calls if call[0] == "deliver") == (
+        "deliver", "j-profile-off", False, expected_mode,
+    )
+
+
+@pytest.mark.parametrize("gate_mode", ["enforce", "observe", "warn", "downgrade"])
+def test_profile_non_off_gate_modes_keep_boundary_enabled(monkeypatch, gate_mode):
+    calls = _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        s, "load_config", lambda: {"cron": {"final_result_gate_mode": gate_mode}},
+    )
+
+    assert s.run_one_job({"id": "j-profile-mode", "name": "t"}) is True
+    assert next(call for call in calls if call[0] == "deliver") == (
+        "deliver", "j-profile-mode", True, gate_mode,
+    )
+
+
+@pytest.mark.parametrize(
+    "cron_config",
+    [
+        {"final_result_gate_mode": "bypass"},
+        {"final_result_gate_mode": 0},
+        {"final_result_boundary_enabled": "false"},
+    ],
+)
+def test_invalid_profile_boundary_config_falls_back_to_enforce(monkeypatch, cron_config):
+    calls = _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(s, "load_config", lambda: {"cron": cron_config})
+
+    assert s.run_one_job({"id": "j-profile-invalid", "name": "t"}) is True
+    assert next(call for call in calls if call[0] == "deliver") == (
+        "deliver", "j-profile-invalid", True, "enforce",
+    )
 
 
 def test_run_one_job_silent_skips_delivery(monkeypatch):
@@ -117,6 +190,29 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
 
     assert ok is False
     assert marks == [("j6", False)]
+
+
+def test_run_one_job_tears_down_deferred_agent_when_run_raises(monkeypatch):
+    """A failing run still returns its deferred agent for immediate cleanup."""
+    order = []
+
+    class FakeAgent:
+        def close(self):
+            order.append("agent.close")
+
+    def boom(job, *, defer_agent_teardown=None):
+        defer_agent_teardown.append(FakeAgent())
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(s, "run_job", boom)
+    monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
+    import agent.auxiliary_client as aux
+    monkeypatch.setattr(
+        aux, "cleanup_stale_async_clients", lambda: order.append("cleanup_stale")
+    )
+
+    assert s.run_one_job({"id": "j6-cleanup", "name": "t"}) is False
+    assert order == ["agent.close", "cleanup_stale"]
 
 
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
@@ -282,7 +378,7 @@ def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    def fake_deliver(job, content, adapters=None, loop=None, **kwargs):
         order.append("deliver")
         return None
 
@@ -317,7 +413,7 @@ def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch)
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
-    def boom_deliver(job, content, adapters=None, loop=None):
+    def boom_deliver(job, content, adapters=None, loop=None, **kwargs):
         order.append("deliver-raise")
         raise RuntimeError("send blew up")
 
