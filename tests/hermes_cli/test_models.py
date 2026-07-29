@@ -999,3 +999,13 @@ class TestClaudeSonnet5InCuratedLists:
     def test_nous_list_includes_sonnet_5(self):
         from hermes_cli.models import _PROVIDER_MODELS
         assert "anthropic/claude-sonnet-5" in _PROVIDER_MODELS["nous"]
+
+
+class TestLing3FlashInCuratedLists:
+    """Regression: Ling 3.0 Flash must appear in the OpenRouter picker (#73686)."""
+
+    def test_openrouter_fallback_includes_ling_3_flash_free(self):
+        from hermes_cli.models import OPENROUTER_MODELS
+
+        ids = [mid for mid, _ in OPENROUTER_MODELS]
+        assert "inclusionai/ling-3.0-flash:free" in ids
