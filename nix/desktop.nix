@@ -26,8 +26,7 @@ let
     ];
   };
 
-  packageJson = builtins.fromJSON (builtins.readFile (npm.src + "/apps/desktop/package.json"));
-  version = packageJson.version;
+  version = npm.passthru.packageJson.version;
 
   electronHeaders = pkgs.fetchurl {
     url = "https://artifacts.electronjs.org/headers/dist/v${electron.version}/node-v${electron.version}-headers.tar.gz";
