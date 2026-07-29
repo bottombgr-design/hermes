@@ -34,7 +34,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -409,6 +409,7 @@ class WebSocketRelayTransport:
         # (primary-identity) descriptor for back-compat; this map is the
         # per-platform capability surface read via `descriptor_for_platform`.
         self._descriptors_by_platform: Dict[str, CapabilityDescriptor] = {}
+        self._descriptor_handler: Optional[Callable[[CapabilityDescriptor], None]] = None
         self._descriptor_ready: asyncio.Future[CapabilityDescriptor] | None = None
         # requestId -> future awaiting the matching outbound_result.
         self._pending: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
@@ -431,6 +432,13 @@ class WebSocketRelayTransport:
     async def connect(self) -> bool:
         await self._dial_and_start()
         return True
+
+    def set_descriptor_handler(
+        self,
+        handler: Callable[[CapabilityDescriptor], None],
+    ) -> None:
+        """Observe every negotiated descriptor via a synchronous callback."""
+        self._descriptor_handler = handler
 
     async def _dial_and_start(self) -> None:
         """Open the socket, start the reader, send hello. Used by connect() and
@@ -821,19 +829,45 @@ class WebSocketRelayTransport:
             # platforms onto whichever descriptor arrived last.
             if descriptor.platform:
                 self._descriptors_by_platform[descriptor.platform] = descriptor
-            # The FIRST descriptor of this connection generation is the session
-            # default (the primary identity's) — later arrivals must NOT
-            # overwrite it, or the scalar capability surface silently becomes
-            # last-writer-wins across platforms.
-            if self._descriptor is None:
+            # The configured first identity is the session default. Descriptor
+            # frames may arrive out of order, so arrival order is not enough to
+            # choose the scalar capability surface in a multiplexed connection.
+            primary_platform = self._identities[0][0] if self._identities else self._platform
+            is_primary = descriptor.platform == primary_platform or (
+                len(self._identities) == 1 and not descriptor.platform
+            )
+            if is_primary:
                 self._descriptor = descriptor
+            # Secondary descriptors remain available through
+            # descriptor_for_platform; applying them to the scalar surface would
+            # make capability state depend on arrival order. A reconnect resets
+            # _descriptor, so the configured primary descriptor refreshes it.
             # Phase 7 Unit 7d-B: a received descriptor means the WS upgrade auth
             # passed and the connector accepted us — record that we've handshaked
             # at least once, so a LATER 4401 close is read as a revocation
             # (opt-out), not a cold-start race.
             self._handshake_succeeded = True
-            if self._descriptor_ready is not None and not self._descriptor_ready.done():
+            if (
+                self._descriptor_ready is not None
+                and is_primary
+                and not self._descriptor_ready.done()
+            ):
                 self._descriptor_ready.set_result(descriptor)
+            if is_primary and self._descriptor_handler is not None:
+                try:
+                    result = self._descriptor_handler(descriptor)
+                    if asyncio.iscoroutine(result):
+                        # The callback is deliberately synchronous: awaiting it
+                        # in the sole reader could deadlock on a future frame.
+                        result.close()
+                        logger.warning(
+                            "relay descriptor handler must be synchronous; result ignored"
+                        )
+                except Exception:
+                    # Descriptor adoption is advisory to the adapter surface.
+                    # Never sacrifice the authenticated handshake/read loop if a
+                    # callback regresses; the transport's descriptor stays valid.
+                    logger.warning("relay descriptor handler failed", exc_info=True)
         elif ftype == "inbound":
             if self._inbound is not None:
                 event = _event_from_wire(frame.get("event", {}))
