@@ -2686,6 +2686,7 @@ export const en: Translations = {
       refresh: 'Refresh',
       moreActions: 'More actions',
       branchNewChat: 'Branch in new chat',
+      quoteInNewMessage: 'Quote in new message',
       dismissError: 'Dismiss error',
       readAloudFailed: 'Read aloud failed',
       preparingAudio: 'Preparing audio...',

@@ -2452,6 +2452,7 @@ export const zhHant = defineLocale({
       refresh: '重新整理',
       moreActions: '更多動作',
       branchNewChat: '在新聊天中分支',
+      quoteInNewMessage: '在新訊息中引用',
       dismissError: '关闭错误',
       readAloudFailed: '朗讀失敗',
       preparingAudio: '正在準備音訊...',

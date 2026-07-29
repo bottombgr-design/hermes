@@ -2284,6 +2284,7 @@ export const ar = defineLocale({
       refresh: 'تحديث',
       moreActions: 'إجراءات إضافية',
       branchNewChat: 'تفريع إلى محادثة جديدة',
+      quoteInNewMessage: 'اقتباس في رسالة جديدة',
       dismissError: 'تجاهل الخطأ',
       readAloudFailed: 'فشلت القراءة بصوت عال',
       preparingAudio: 'جار تجهيز الصوت',
