@@ -7247,17 +7247,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-    async def _launch_detached_restart_command(self) -> None:
+    def _rollback_restart_state(self, backup: Optional[Any] = None) -> None:
+        """Roll back restart flags and restore notification files if handoff fails."""
+        if backup is not None:
+            backup.rollback(self)
+            return
+
+        self._restart_requested = False
+        self._restart_task_started = False
+        self._detached_restart_helper_started = False
+        self._draining = False
+        try:
+            (_hermes_home / ".restart_notify.json").unlink(missing_ok=True)
+            (_hermes_home / ".restart_last_processed.json").unlink(missing_ok=True)
+        except Exception as exc:
+            logger.debug("Failed to clean up restart files during rollback: %s", exc)
+
+    async def _launch_detached_restart_command(self) -> bool:
         import shutil
         import subprocess
 
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             logger.error("Could not locate hermes binary for detached /restart")
-            return
+            return False
         if self._detached_restart_helper_started:
-            return
-        self._detached_restart_helper_started = True
+            return True
 
         current_pid = os.getpid()
         restart_after_s = max(float(getattr(self, "_restart_drain_timeout", 0.0) or 0.0) + 5.0, 5.0)
@@ -7370,6 +7385,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     env=watcher_env,
                     **windows_detach_popen_kwargs(),
                 )
+                self._detached_restart_helper_started = True
+                return True
             except OSError:
                 try:
                     subprocess.Popen(
@@ -7379,6 +7396,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         env=watcher_env,
                         creationflags=windows_detach_flags_without_breakaway(),
                     )
+                    self._detached_restart_helper_started = True
+                    return True
                 except OSError as exc:
                     # Both spawn attempts failed (a breakaway-denying job object
                     # is the common cause, but OSError covers others too).
@@ -7399,7 +7418,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         error_field,
                         error_code,
                     )
-            return
+                    return False
 
         cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
         shell_cmd = (
@@ -7415,22 +7434,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         watcher_env = os.environ.copy()
         watcher_env.pop("_HERMES_GATEWAY", None)
         setsid_bin = shutil.which("setsid")
-        if setsid_bin:
-            subprocess.Popen(
-                [setsid_bin, "bash", "-lc", shell_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=watcher_env,
-                start_new_session=True,
-            )
-        else:
-            subprocess.Popen(
-                ["bash", "-lc", shell_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=watcher_env,
-                start_new_session=True,
-            )
+        try:
+            if setsid_bin:
+                subprocess.Popen(
+                    [setsid_bin, "bash", "-lc", shell_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=watcher_env,
+                    start_new_session=True,
+                )
+            else:
+                subprocess.Popen(
+                    ["bash", "-lc", shell_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=watcher_env,
+                    start_new_session=True,
+                )
+            self._detached_restart_helper_started = True
+            return True
+        except Exception as exc:
+            logger.error("Failed to spawn detached restart watcher: %s", exc)
+            return False
 
     def _launch_systemd_restart_shortcut(self) -> None:
         """Best-effort helper to bypass systemd's automatic restart delay.
@@ -7527,7 +7552,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.debug("Failed to launch systemd planned-restart helper: %s", e)
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+    def request_restart(
+        self,
+        *,
+        detached: bool = False,
+        via_service: bool = False,
+        transaction: Optional[Any] = None,
+    ) -> bool:
         if self._restart_task_started:
             return False
         self._restart_requested = True
@@ -7536,27 +7567,208 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_task_started = True
 
         async def _run_restart() -> None:
-            if detached:
-                try:
-                    await self._launch_detached_restart_command()
-                except Exception as e:
-                    logger.error("Failed to launch detached gateway restart helper: %s", e)
-            await asyncio.sleep(0.05)
-            await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
+            # Lazy import to avoid circular import at module load time.
+            try:
+                from gateway.slash_commands import (
+                    _LauncherResult,
+                    _RestartAckOutcome,
+                    _RestartFinalOutcome,
+                    _RestartStage,
+                    _TransitionResult,
+                )
+            except ImportError:
+                _LauncherResult = None  # type: ignore
+                _RestartAckOutcome = None  # type: ignore
+                _RestartFinalOutcome = None  # type: ignore
+                _RestartStage = None  # type: ignore
 
-        # _run_restart is a short-lived self-terminating task (calls stop()
-        # then returns).  Don't add it to _background_tasks — _stop_impl
-        # cancels all entries in that set, which would cancel _run_restart
-        # while it's awaiting _stop_task, propagating CancelledError into
-        # _stop_impl and preventing _shutdown_event.set() / _exit_code = 75.
-        # See #12875.
-        #
-        # We still hold a strong reference in self._restart_task: a bare
-        # asyncio.create_task() keeps only a weak reference, so the event
-        # loop may garbage-collect a still-pending task mid-flight.  The
-        # cancel loop in _stop_impl explicitly skips _restart_task for the
-        # same reason it skips _stop_task.
-        self._restart_task = asyncio.create_task(_run_restart())
+            if transaction is not None:
+                # ----- CLAIM HANDOFF (spec section 二) ------------------
+                # The helper MUST win the handoff gate BEFORE performing
+                # any irreversible external side-effect (Popen, supervisor
+                # signal). The lock is released before we call out to any
+                # external operation. If the caller already won the abort
+                # gate, claim_handoff returns False and we must NOT
+                # launch.
+                #
+                # CancelledError propagates naturally (spec section 三):
+                # if the helper is cancelled before claiming handoff,
+                # the caller owns the abort and must not be overridden.
+                try:
+                    handoff_won = await transaction.claim_handoff()
+                except asyncio.CancelledError:
+                    # Helper was cancelled before claiming handoff.
+                    # The caller-side abort path handles state; do NOT
+                    # write NOT_STARTED here.
+                    raise
+                if not handoff_won:
+                    logger.warning(
+                        "Restart helper refused: caller owns abort gate "
+                        "(request_id=%s).",
+                        transaction.request_id,
+                    )
+                    # The caller owns the abort; do NOT write ack or
+                    # final_outcome here. The caller's
+                    # _handle_timeout_or_cancel will do that.
+                    return
+
+                # ----- LAUNCH (no lock held) -----------------------------
+                # Map the helper's outcome to the three-state terminal
+                # transition. Each complete_* method updates stage,
+                # final_outcome, and launcher_result atomically in a
+                # single critical section, then publishes the matching
+                # ack and sets final_outcome_event.
+                launcher_result = _LauncherResult.UNKNOWN
+                launched = False
+                if detached:
+                    try:
+                        launched = await self._launch_detached_restart_command()
+                        launcher_result = (
+                            _LauncherResult.STARTED if launched
+                            else _LauncherResult.NOT_STARTED
+                        )
+                    except asyncio.CancelledError:
+                        # Helper was cancelled mid-launch while IN_FLIGHT.
+                        # Complete unknown, re-raise.
+                        await transaction.complete_unknown()
+                        raise
+                    except (KeyboardInterrupt, SystemExit):
+                        await transaction.complete_unknown()
+                        raise
+                    except Exception:
+                        # Popen raised after potentially forking; or any
+                        # other launch-time exception. Per spec section
+                        # 三: NOT_STARTED must only be claimed when we can
+                        # prove no side-effect occurred. A generic
+                        # exception cannot prove that — UNKNOWN.
+                        launcher_result = _LauncherResult.UNKNOWN
+                        launched = False
+                else:
+                    # Service path: supervisor accepted the restart
+                    # synchronously inside _launch_detached_restart_command.
+                    try:
+                        launched = await self._launch_detached_restart_command()
+                        # Service-managed: False does NOT prove no
+                        # side-effect (the supervisor may have already
+                        # scheduled a restart). Always UNKNOWN.
+                        launcher_result = (
+                            _LauncherResult.STARTED if launched
+                            else _LauncherResult.UNKNOWN
+                        )
+                    except asyncio.CancelledError:
+                        await transaction.complete_unknown()
+                        raise
+                    except (KeyboardInterrupt, SystemExit):
+                        await transaction.complete_unknown()
+                        raise
+                    except Exception:
+                        launcher_result = _LauncherResult.UNKNOWN
+                        launched = False
+
+                if launcher_result is _LauncherResult.STARTED:
+                    tr = await transaction.complete_started()
+                    if tr is _TransitionResult.LOST_RACE:
+                        # Another terminal stage won. This is a consistency
+                        # error — after Fix 1, the dispatcher no longer
+                        # terminates IN_FLIGHT, so the only way to reach
+                        # another terminal before STARTED is a genuine
+                        # state machine violation. Log and do NOT stop.
+                        if transaction.stage is _RestartStage.ABORTED:
+                            runner_logger.error(
+                                "STARTED → ABORTED: state machine conflict "
+                                "(request_id=%s). stop() NOT called.",
+                                transaction.request_id,
+                            )
+                        elif transaction.stage is _RestartStage.OUTCOME_UNKNOWN:
+                            runner_logger.error(
+                                "STARTED → OUTCOME_UNKNOWN: internal inconsistency "
+                                "(request_id=%s). stop() NOT called.",
+                                transaction.request_id,
+                            )
+                        return
+                elif launcher_result is _LauncherResult.NOT_STARTED:
+                    # NOT_STARTED: helper claims ownership of CAS rollback
+                    # because the dispatcher may have already returned
+                    # OUTCOME_UNKNOWN and left.
+                    # Per spec section 三: detached NOT_STARTED guarantees
+                    # no side-effect (Popen never ran). Safe to rollback.
+                    # Rollback BEFORE complete_* so it happens even if the
+                    # transaction is already in a terminal state (LOST_RACE).
+                    if transaction.backup is not None:
+                        try:
+                            transaction.backup.rollback(self)
+                        except Exception:
+                            pass
+                    tr = await transaction.complete_not_started()
+                    if tr is _TransitionResult.LOST_RACE:
+                        return
+                    return
+                else:  # UNKNOWN
+                    tr = await transaction.complete_unknown()
+                    if tr is _TransitionResult.LOST_RACE:
+                        return
+                    return
+
+                # ----- POST-LAUNCH (helper may be cancelled here) ------
+                # Spec section 四: any BaseException (including
+                # CancelledError) AFTER HANDOFF_COMMITTED must NOT regress
+                # stage to PREPARING, and MUST leave ack / final_outcome
+                # in a consistent state. complete_started() already
+                # published the ACCEPTED ack and set the event.
+                try:
+                    await asyncio.sleep(0.05)
+                    await self.stop(
+                        restart=True,
+                        detached_restart=detached,
+                        service_restart=via_service,
+                    )
+                except Exception:
+                    # Stage is HANDOFF_COMMITTED already. DO NOT regress.
+                    # Re-raise so the task is properly cancelled.
+                    raise
+            else:
+                # Legacy fallback for callers without a transaction object
+                if detached:
+                    try:
+                        launched = await self._launch_detached_restart_command()
+                    except Exception as e:
+                        logger.error(
+                            "Failed to launch detached gateway restart helper: %s", e
+                        )
+                        launched = False
+
+                    if not launched:
+                        logger.error(
+                            "Detached restart helper launch failed. "
+                            "Aborting gateway shutdown."
+                        )
+                        self._rollback_restart_state(
+                            getattr(self, "_restart_backup", None)
+                        )
+                        ack_fut = getattr(self, "_handoff_ack_future", None)
+                        if ack_fut is not None and not ack_fut.done():
+                            ack_fut.set_result(False)
+                        return
+                    else:
+                        ack_fut = getattr(self, "_handoff_ack_future", None)
+                        if ack_fut is not None and not ack_fut.done():
+                            ack_fut.set_result(True)
+                else:
+                    ack_fut = getattr(self, "_handoff_ack_future", None)
+                    if ack_fut is not None and not ack_fut.done():
+                        ack_fut.set_result(True)
+
+                await asyncio.sleep(0.05)
+                await self.stop(
+                    restart=True,
+                    detached_restart=detached,
+                    service_restart=via_service,
+                )
+
+        task = asyncio.create_task(_run_restart())
+        self._restart_task = task
+        if transaction is not None:
+            transaction.restart_task = task
         return True
 
     # Drain-timeout reasons set by _stop_impl() when a still-running turn is
@@ -11184,6 +11396,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(source, "chat_id", None),
             )
             return None
+
+        if self._is_stale_restart_redelivery(event):
+            logger.info(
+                "Suppressing stale restart redelivery message on platform=%s chat=%s msg=%s",
+                source.platform.value if source.platform else "unknown",
+                getattr(source, "chat_id", None),
+                getattr(event, "message_id", None),
+            )
+            return ""
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
@@ -15430,71 +15651,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
     def _is_stale_restart_redelivery(self, event: MessageEvent) -> bool:
-        """Return True if this /restart is a Telegram re-delivery we already handled.
+        """Return True if this message is a redelivery we already handled.
 
-        The previous gateway wrote ``.restart_last_processed.json`` with the
-        triggering platform + update_id when it processed the /restart.  If
-        we now see a /restart on the same platform with an update_id <= that
-        recorded value, it is a redelivery when this process booted from that
-        restart. Otherwise the marker must still be recent (< 5 minutes).
-
-        Only applies to Telegram today (the only platform that exposes a
-        numeric cross-session update ordering); other platforms return False.
+        Checks ``.restart_last_processed.json``:
+        - For slash_command (Telegram): update_id <= recorded_update_id.
+        - For agent_tool (natural language): exact 4-tuple match on
+          (platform, chat_id, normalized thread_id, message_id) across ANY platform.
         """
         if event is None or event.source is None:
             return False
-        if event.platform_update_id is None:
-            return False
         if event.source.platform is None:
             return False
-        # Only Telegram populates platform_update_id currently; be explicit
-        # so future platforms aren't accidentally gated by this check.
         try:
             platform_value = event.source.platform.value
         except Exception:
-            return False
-        if platform_value != "telegram":
             return False
 
         try:
             marker_path = _hermes_home / ".restart_last_processed.json"
             if not marker_path.exists():
-                # Belt-and-suspenders for when the dedup marker goes missing
-                # (manually cleaned up, or the previous cycle's write failed).
-                # Without a marker the update_id comparison below can't run, so
-                # a redelivered /restart would sail through and re-restart the
-                # gateway — an infinite loop (issue #18528).
-                #
-                # Suppress ONLY when we can independently confirm we just came
-                # out of a restart cycle: this process booted from a
-                # chat-originated /restart (_booted_from_restart) AND is still
-                # within a short post-boot window. This never swallows a
-                # genuine first /restart on a fresh boot (no restart marker on
-                # boot → flag stays False). Consume the flag one-shot so a
-                # legitimate /restart sent later in the same session is honored.
-                if (
-                    getattr(self, "_booted_from_restart", False)
-                    and time.time() - getattr(self, "_startup_time", 0.0) < 60
-                ):
-                    self._booted_from_restart = False
-                    return True
+                if getattr(self, "_booted_from_restart", False):
+                    startup_time = getattr(self, "_startup_time", 0.0)
+                    if startup_time and (time.time() - startup_time) < 60.0:
+                        self._booted_from_restart = False
+                        return True
                 return False
+
             data = json.loads(marker_path.read_text(encoding="utf-8"))
-        except Exception:
-            return False
+            if data.get("platform") != platform_value:
+                return False
 
-        if data.get("platform") != platform_value:
-            return False
-        recorded_uid = data.get("update_id")
-        if not isinstance(recorded_uid, int):
-            return False
-        if event.platform_update_id > recorded_uid:
-            return False
+            booted_from_restart = getattr(self, "_booted_from_restart", False)
+            req_at = float(data.get("requested_at", 0))
+            is_recent = (time.time() - req_at) < 300.0 or booted_from_restart
+            if not is_recent:
+                return False
 
-        # A service-managed restart can legitimately take longer than the
-        # marker's normal five-minute trust window while adapters, cron, and
-        # in-flight deliveries drain. If this process booted from the recorded
-        # chat restart, the first same-or-older update is still that restart's
+            origin = data.get("origin", "slash_command")
+
+            if origin == "slash_command":
+                if platform_value == "telegram":
+                    last_update_id = data.get("update_id")
+                    if (
+                        event.platform_update_id is not None
+                        and last_update_id is not None
+                        and event.platform_update_id <= last_update_id
+                    ):
+                        if booted_from_restart:
+                            self._booted_from_restart = False
+                        return True
+
+            elif origin == "agent_tool":
+                recorded_chat_id = data.get("chat_id")
+                recorded_thread_id = data.get("thread_id")
+                recorded_msg_id = data.get("message_id")
+
+                evt_chat_id = event.source.chat_id
+                evt_thread_id = event.source.thread_id or None
+                evt_msg_id = str(event.message_id) if event.message_id is not None else None
+
+                if (
+                    evt_chat_id == recorded_chat_id
+                    and evt_thread_id == (recorded_thread_id or None)
+                    and evt_msg_id is not None
+                    and recorded_msg_id is not None
+                    and evt_msg_id == str(recorded_msg_id)
+                ):
+                    if booted_from_restart:
+                        self._booted_from_restart = False
+                    return True
+
+        except Exception as e:
+            logger.debug("Failed to check restart redelivery marker: %s", e)
+        return False
         # redelivery regardless of elapsed wall time. Consume the boot signal
         # one-shot so a later genuine command is evaluated normally.
         if getattr(self, "_booted_from_restart", False):
