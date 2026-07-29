@@ -1327,6 +1327,7 @@ export const en: Translations = {
       connected: 'Connected',
       connecting: 'Connecting',
       disabled: 'Disabled',
+      enabled: 'Enabled',
       fatal: 'Error',
       gateway_stopped: 'Messaging gateway stopped',
       not_configured: 'Needs setup',

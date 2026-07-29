@@ -1523,6 +1523,7 @@ export const zh: Translations = {
       connected: '已连接',
       connecting: '连接中',
       disabled: '已禁用',
+      enabled: '已启用',
       fatal: '错误',
       gateway_stopped: '消息网关已停止',
       not_configured: '需要设置',
