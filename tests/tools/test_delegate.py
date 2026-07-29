@@ -121,6 +121,46 @@ class TestDelegateRequirements(unittest.TestCase):
             self.assertNotIn("default 3", surface)
             self.assertNotIn("default 2", surface)
 
+    def test_schema_description_uses_non_default_runtime_limits_everywhere(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+        from tools.registry import registry
+
+        with (
+            patch("tools.delegate_tool._get_max_concurrent_children", return_value=7),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=4),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+        ):
+            overrides = _build_dynamic_schema_overrides()
+            definition = registry.get_definitions({"delegate_task"})[0]["function"]
+
+        for surface in (overrides["description"], definition["description"]):
+            self.assertIn("up to 7", surface)
+            self.assertIn("max_spawn_depth=4", surface)
+        for parameters in (overrides["parameters"], definition["parameters"]):
+            self.assertIn("up to 7", parameters["properties"]["tasks"]["description"])
+            self.assertIn("max_spawn_depth=4", parameters["properties"]["role"]["description"])
+
+    def test_schema_description_is_compact_without_losing_safety_contract(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        desc = _build_dynamic_schema_overrides()["description"]
+
+        self.assertLessEqual(len(desc), 3000)
+        self.assertIn("background", desc.lower())
+        self.assertIn("reasoning-heavy", desc)
+        self.assertIn("user interaction", desc)
+        self.assertIn("external side effects", desc)
+        self.assertIn("inherit the parent model", desc)
+        self.assertIn("Do not wait or poll", desc)
+        self.assertIn("Top-level delegations run in the background", desc)
+        self.assertIn("Nested orchestrator calls wait synchronously", desc)
+        self.assertIn("one consolidated result", desc)
+        self.assertIn("Background delegations are not durable", desc)
+        self.assertIn("non-English language", desc)
+        self.assertIn("language, tone, or style", desc)
+        self.assertIn("verifiable handle", desc)
+        self.assertIn("verify it independently from the parent before reporting success", desc)
+
     def test_schema_overrides_applied_via_get_definitions(self):
         """Registry.get_definitions() must apply dynamic_schema_overrides so
         the model API call sees current values, not the static import-time text.
