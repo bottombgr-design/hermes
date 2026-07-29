@@ -61,6 +61,7 @@ class FakeTextChannel:
         self.name = name
         self.guild = SimpleNamespace(name=guild_name)
         self.topic = None
+        self.send = AsyncMock()
 
 
 class FakeThread:
@@ -354,6 +355,123 @@ async def test_auto_thread_failure_notify_error_does_not_crash(adapter, monkeypa
     adapter._auto_create_thread.assert_awaited_once()
     adapter.handle_message.assert_not_awaited()
     channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_reuses_existing_message_thread(adapter):
+    """If another bot already created the starter thread, don't post a fallback seed."""
+    existing = FakeThread(channel_id=123, name="already-there")
+    channel = FakeTextChannel(channel_id=800)
+    message = make_message(channel=channel, content="Trip idea")
+    message.create_thread = AsyncMock(side_effect=RuntimeError("thread already exists"))
+    message.thread = existing
+
+    thread = await adapter._auto_create_thread(message)
+
+    assert thread is existing
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_fetches_existing_thread_by_starter_message_id(adapter):
+    """Discord message-backed thread IDs match the starter message ID."""
+    existing = FakeThread(channel_id=123, name="already-there")
+    channel = FakeTextChannel(channel_id=800)
+    message = make_message(channel=channel, content="Trip idea")
+    message.create_thread = AsyncMock(side_effect=RuntimeError("thread already exists"))
+    message.thread = None
+    adapter._client.get_channel = MagicMock(return_value=existing)
+    adapter._client.fetch_channel = AsyncMock()
+
+    thread = await adapter._auto_create_thread(message)
+
+    assert thread is existing
+    adapter._client.get_channel.assert_called_once_with(message.id)
+    adapter._client.fetch_channel.assert_not_awaited()
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_fetches_thread_after_cache_miss(adapter):
+    """A committed thread may be absent from the client's local cache."""
+    existing = FakeThread(channel_id=123, name="already-there")
+    channel = FakeTextChannel(channel_id=800)
+    message = make_message(channel=channel, content="Trip idea")
+    message.create_thread = AsyncMock(side_effect=ConnectionError("response lost"))
+    message.thread = None
+    adapter._client.get_channel = MagicMock(return_value=None)
+    adapter._client.fetch_channel = AsyncMock(return_value=existing)
+
+    thread = await adapter._auto_create_thread(message)
+
+    assert thread is existing
+    adapter._client.get_channel.assert_called_once_with(message.id)
+    adapter._client.fetch_channel.assert_awaited_once_with(message.id)
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_retries_reconciliation_before_fallback(adapter, monkeypatch):
+    """Wait briefly when the committed thread is not immediately visible."""
+    existing = FakeThread(channel_id=123, name="eventually-visible")
+    channel = FakeTextChannel(channel_id=800)
+    message = make_message(channel=channel, content="Trip idea")
+    message.create_thread = AsyncMock(side_effect=ConnectionError("response lost"))
+    message.thread = None
+    adapter._client.get_channel = MagicMock(return_value=None)
+    adapter._client.fetch_channel = AsyncMock(side_effect=[None, existing])
+    sleep = AsyncMock()
+    monkeypatch.setattr(discord_platform.asyncio, "sleep", sleep)
+
+    thread = await adapter._auto_create_thread(message)
+
+    assert thread is existing
+    assert adapter._client.fetch_channel.await_count == 2
+    sleep.assert_awaited_once_with(0.25)
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_ignores_unrelated_cached_channel(adapter, monkeypatch):
+    """Only a Discord thread with the starter message ID is reusable."""
+    unrelated = FakeTextChannel(channel_id=999)
+    channel = FakeTextChannel(channel_id=800)
+    fallback_thread = FakeThread(channel_id=456, name="fallback")
+    seed_message = SimpleNamespace(create_thread=AsyncMock(return_value=fallback_thread))
+    channel.send.return_value = seed_message
+    message = make_message(channel=channel, content="Trip idea")
+    message.create_thread = AsyncMock(side_effect=RuntimeError("direct failed"))
+    message.thread = unrelated
+    adapter._client.get_channel = MagicMock(return_value=unrelated)
+    adapter._client.fetch_channel = AsyncMock(return_value=None)
+    monkeypatch.setattr(discord_platform.asyncio, "sleep", AsyncMock())
+
+    thread = await adapter._auto_create_thread(message)
+
+    assert thread is fallback_thread
+    channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_skips_fallback_when_reconciliation_is_inconclusive(
+    adapter,
+    monkeypatch,
+):
+    """A failed lookup cannot prove that Discord did not commit the create."""
+    channel = FakeTextChannel(channel_id=800)
+    message = make_message(channel=channel, content="Trip idea")
+    message.create_thread = AsyncMock(side_effect=ConnectionError("response lost"))
+    message.thread = None
+    adapter._client.get_channel = MagicMock(return_value=None)
+    adapter._client.fetch_channel = AsyncMock(side_effect=ConnectionError("lookup failed"))
+    monkeypatch.setattr(discord_platform.asyncio, "sleep", AsyncMock())
+
+    thread = await adapter._auto_create_thread(message)
+
+    assert thread is None
+    assert message.create_thread.await_count == 2
+    assert adapter._client.fetch_channel.await_count == 4
+    channel.send.assert_not_awaited()
 
 
 # ── config.py bridging ───────────────────────────────────────────────
