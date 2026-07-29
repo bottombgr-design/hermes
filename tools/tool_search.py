@@ -934,27 +934,152 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     return frozenset(names)
 
 
+def _check_type(value: Any, expected_type: Any) -> bool:
+    """Check if a value matches the expected JSON Schema type.
+
+    Handles single types and union types (list of types).
+    Nullable types (including 'null' in the union) are accepted when value is None.
+    """
+    if expected_type is None:
+        return True
+    if isinstance(expected_type, list):
+        return any(_check_type(value, t) for t in expected_type)
+    if not isinstance(expected_type, str):
+        return True
+
+    if value is None:
+        return expected_type == "null"
+
+    type_map = {
+        "string": str,
+        "integer": int,
+        "number": (int, float),
+        "boolean": bool,
+        "array": list,
+        "object": dict,
+        "null": type(None),
+    }
+    py_type = type_map.get(expected_type)
+    if py_type is None:
+        return True
+    if expected_type == "integer" and isinstance(value, bool):
+        return False
+    if expected_type == "number" and isinstance(value, bool):
+        return False
+    return isinstance(value, py_type)
+
+
+def _validate_against_schema(
+    args: Dict[str, Any],
+    params: Dict[str, Any],
+    path: str = "",
+) -> Optional[str]:
+    """Recursively validate args against a JSON Schema params object.
+
+    Returns an error message string on first violation, or None if valid.
+    Focuses on: required fields, type, enum, nested required, additionalProperties.
+    Fails open on unsupported/malformed schemas.
+    """
+    if not isinstance(params, dict):
+        return None
+
+    if not isinstance(args, dict):
+        return None
+
+    required = params.get("required")
+    if isinstance(required, list):
+        for field in required:
+            if isinstance(field, str) and field not in args:
+                field_path = f"{path}.{field}" if path else field
+                return f"missing required field '{field_path}'"
+
+    properties = params.get("properties")
+    if isinstance(properties, dict):
+        for key, value in args.items():
+            prop_schema = properties.get(key)
+            if not isinstance(prop_schema, dict):
+                continue
+
+            prop_type = prop_schema.get("type")
+            if prop_type is not None:
+                if not _check_type(value, prop_type):
+                    field_path = f"{path}.{key}" if path else key
+                    type_desc = prop_type if isinstance(prop_type, str) else "/".join(prop_type)
+                    return (
+                        f"field '{field_path}' has invalid type "
+                        f"(expected {type_desc}, got {type(value).__name__})"
+                    )
+
+            if isinstance(value, dict) and prop_type in ("object", None):
+                nested_required = prop_schema.get("required")
+                if isinstance(nested_required, list):
+                    for nreq in nested_required:
+                        if isinstance(nreq, str) and nreq not in value:
+                            field_path = f"{path}.{key}" if path else key
+                            return f"missing required field '{field_path}.{nreq}'"
+
+                nested_props = prop_schema.get("properties")
+                nested_additional = prop_schema.get("additionalProperties")
+                if nested_additional is False and isinstance(nested_props, dict):
+                    allowed_keys = set(nested_props.keys())
+                    for k in value:
+                        if k not in allowed_keys:
+                            field_path = f"{path}.{key}" if path else key
+                            return (
+                                f"field '{field_path}' has unexpected property '{k}' "
+                                f"(additionalProperties is false)"
+                            )
+
+                if isinstance(nested_props, dict):
+                    nested_err = _validate_against_schema(
+                        value, prop_schema, path=f"{path}.{key}" if path else key
+                    )
+                    if nested_err:
+                        return nested_err
+
+            prop_enum = prop_schema.get("enum")
+            if isinstance(prop_enum, list) and value is not None:
+                if value not in prop_enum:
+                    field_path = f"{path}.{key}" if path else key
+                    allowed = ", ".join(str(e) for e in prop_enum)
+                    return (
+                        f"field '{field_path}' has invalid value '{value}' "
+                        f"(must be one of: [{allowed}])"
+                    )
+
+    additional_props = params.get("additionalProperties")
+    if additional_props is False and isinstance(properties, dict):
+        allowed_keys = set(properties.keys())
+        for key in args:
+            if key not in allowed_keys:
+                field_path = f"{path}.{key}" if path else key
+                return (
+                    f"field '{field_path}' has unexpected property '{key}' "
+                    f"(additionalProperties is false)"
+                )
+
+    return None
+
+
 def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str]:
     """Probe-validate ``tool_call`` arguments against the deferred tool's schema.
 
     A deferred tool's parameter schema is invisible to the model until it
     calls ``tool_describe`` — so models routinely invoke deferred tools
-    "blind" by name alone, omitting required arguments. Dispatching such a
-    call produces an opaque downstream failure (``KeyError: 'document_id'``)
-    that tells the model nothing about what the tool expects, and cheap
-    models loop on it until the iteration budget dies.
+    "blind" by name alone, omitting required arguments or violating type/
+    enum/additionalProperties constraints. Dispatching such a call produces
+    an opaque downstream failure that tells the model nothing about what the
+    tool expects, and cheap models loop on it until the iteration budget dies.
 
-    Port of the describe-first probe-validation fix from nearai/ironclaw#5149:
-    when required arguments are missing, return the tool's parameter schema
-    instead of dispatching blind — the model repairs the call in one
-    round-trip. Valid calls (and any call we can't confidently validate)
-    dispatch untouched, so this can never block a legitimate invocation.
+    Extended from the original ironclaw#5149 fix: in addition to missing
+    required keys, now also validates type, enum, nested required, and
+    additionalProperties constraints. On validation failure, returns an
+    actionable error with the failing path and schema constraint so the
+    model can repair the call in one round-trip.
 
-    Only *key absence* of schema-``required`` fields counts as invalid.
-    No type checking, no null rejection — nullable/typed edge cases are the
-    tool's own business, and ``coerce_tool_args`` already handles type repair
-    downstream. Returns a JSON error string when invalid, ``None`` when the
-    call should dispatch.
+    Valid calls (and any call we can't confidently validate) dispatch
+    untouched — this can never block a legitimate invocation. Fail-open on
+    unsupported/malformed schemas.
     """
     try:
         from tools.registry import registry as _registry
@@ -967,16 +1092,15 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         params = fn.get("parameters")
         if not isinstance(params, dict):
             return None
-        required = params.get("required")
-        if not isinstance(required, list) or not required:
+
+        missing_err = _validate_against_schema(args, params)
+        if missing_err is None:
             return None
-        missing = [r for r in required if isinstance(r, str) and r not in args]
-        if not missing:
-            return None
+
         return json.dumps({
             "error": (
-                f"tool_call to '{name}' is missing required argument(s): "
-                f"{', '.join(missing)}. The tool was NOT invoked."
+                f"tool_call to '{name}' failed schema validation: "
+                f"{missing_err}. The tool was NOT invoked."
             ),
             "parameters": params,
             "hint": (
