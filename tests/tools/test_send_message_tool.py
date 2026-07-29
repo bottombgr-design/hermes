@@ -318,6 +318,7 @@ class TestSendMessageTool:
             thread_id=None,
             media_files=[],
             force_document=False,
+            mentions=None,
         )
 
     def test_cron_duplicate_target_is_skipped_and_explained(self):
@@ -383,6 +384,7 @@ class TestSendMessageTool:
             thread_id="17585",
             media_files=[],
             force_document=False,
+            mentions=None,
         )
 
     def test_display_label_target_resolves_via_channel_directory(self, tmp_path):
@@ -422,6 +424,7 @@ class TestSendMessageTool:
             thread_id="17585",
             media_files=[],
             force_document=False,
+            mentions=None,
         )
 
     def test_resolved_slack_thread_name_preserves_thread_id(self):
@@ -456,6 +459,7 @@ class TestSendMessageTool:
             thread_id="171.000001",
             media_files=[],
             force_document=False,
+            mentions=None,
         )
 
     def test_resolved_matrix_thread_name_preserves_thread_id(self):
@@ -497,6 +501,7 @@ class TestSendMessageTool:
             thread_id="$thread123:matrix.example.org",
             media_files=[],
             force_document=False,
+            mentions=None,
         )
 
     def test_mirror_receives_current_session_user_id(self):
@@ -568,6 +573,7 @@ class TestSendMessageTool:
             thread_id=None,
             media_files=[],
             force_document=False,
+            mentions=None,
         )
 
     def test_top_level_send_failure_redacts_query_token(self):
