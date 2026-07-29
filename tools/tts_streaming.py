@@ -119,7 +119,16 @@ class SentenceChunker:
 
     def flush(self) -> List[str]:
         """Drain the tail (end-of-text or long-idle flush)."""
-        tail = _THINK_BLOCK_RE.sub("", self.buf).strip()
+        tail = _THINK_BLOCK_RE.sub("", self.buf)
+        # ``_THINK_BLOCK_RE`` only matches closed blocks. An unterminated
+        # ``<think`` tail (model truncated at max tokens mid-reasoning, or
+        # a long pause inside a think block that trips the idle flush) has
+        # no closing tag to strip, so cut it: speaking it would read raw
+        # chain-of-thought aloud.
+        think_at = tail.find("<think")
+        if think_at != -1:
+            tail = tail[:think_at]
+        tail = tail.strip()
         self.buf = ""
         return [tail] if tail else []
 
@@ -365,12 +374,16 @@ class GeminiStreamer(StreamingTTSProvider):
         }
         # ``?alt=sse`` flips the response from a single JSON blob to an SSE
         # feed of base64 PCM chunks — the whole point of this provider.
+        # The key rides in the ``x-goog-api-key`` header, not the query
+        # string: ``requests`` puts the full URL into HTTPError messages,
+        # so a ``key=`` param would land in logs on any 4xx/5xx.
         url = f"{base_url}/models/{model}:streamGenerateContent"
 
         def _sse_chunks() -> Iterator[bytes]:
             with requests.post(
                 url,
-                params={"alt": "sse", "key": api_key},
+                params={"alt": "sse"},
+                headers={"x-goog-api-key": api_key},
                 json=payload,
                 timeout=60,
                 stream=True,

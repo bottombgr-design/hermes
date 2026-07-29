@@ -40,6 +40,20 @@ class TestSentenceChunker:
         assert c.feed("<think>secret reason") == []
         assert c.feed("ing</think>The actual spoken answer. ") == ["The actual spoken answer. "]
 
+    def test_flush_cuts_unterminated_think_tail(self):
+        # Model truncated at max tokens mid-reasoning: no closing tag ever
+        # arrives. The tail must not be spoken as raw chain-of-thought.
+        c = ts.SentenceChunker()
+        assert c.feed("The spoken part. <think>half-formed reas") == []
+        assert c.flush() == ["The spoken part."]
+
+    def test_flush_with_only_an_open_think_block_speaks_nothing(self):
+        # A long pause inside a think block trips the pipeline's idle flush
+        # with nothing but reasoning buffered.
+        c = ts.SentenceChunker()
+        assert c.feed("<think>still thinking, no close tag") == []
+        assert c.flush() == []
+
     def test_flush_drains_the_tail(self):
         c = ts.SentenceChunker()
         c.feed("no boundary here")
@@ -460,6 +474,7 @@ def test_gemini_streamer_decodes_sse_pcm_chunks(monkeypatch):
     def _post(url, **kwargs):
         captured["url"] = url
         captured["params"] = kwargs.get("params")
+        captured["headers"] = kwargs.get("headers")
         captured["stream"] = kwargs.get("stream")
         return _Resp()
 
@@ -471,7 +486,11 @@ def test_gemini_streamer_decodes_sse_pcm_chunks(monkeypatch):
     streamer = ts.GeminiStreamer({}, {"voice": "Kore"})
     assert list(streamer.stream("Hello there.")) == [pcm1, pcm2]
     assert captured["params"]["alt"] == "sse"
-    assert captured["params"]["key"] == "g-key"
+    # The key must ride in the header: ``requests`` echoes the full URL
+    # (query string included) into HTTPError messages, so a ``key=`` param
+    # would land in logs on any 4xx/5xx.
+    assert "key" not in captured["params"]
+    assert captured["headers"]["x-goog-api-key"] == "g-key"
     assert captured["stream"] is True, "Gemini SSE must use a bounded streamed body"
 
 
