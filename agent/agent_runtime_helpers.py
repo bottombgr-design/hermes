@@ -2816,7 +2816,73 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
         return matches[0]
 
     return None
+def compact_historical_tool_results(
+    messages: List[Dict[str, Any]],
+    *,
+    current_turn_user_idx: int,
+    max_words: int = 10,
+) -> List[Dict[str, Any]]:
+    """Compact completed tool outputs in the request-only history copy."""
+    limit = max(1, int(max_words))
+    call_names: Dict[str, str] = {}
 
+    for message in messages[:current_turn_user_idx]:
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            call_id = str(call.get("id") or call.get("call_id") or "")
+            name = str(function.get("name") or "tool")
+            if call_id:
+                call_names[call_id] = name
+
+    compacted: List[Dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if index >= current_turn_user_idx:
+            compacted.append(message)
+            continue
+
+        if message.get("role") == "assistant":
+            replacement = message.copy()
+            for field in (
+                "reasoning",
+                "reasoning_content",
+                "reasoning_details",
+                "codex_reasoning_items",
+                "codex_message_items",
+            ):
+                replacement.pop(field, None)
+
+            calls = []
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    calls.append(call)
+                    continue
+                copied_call = call.copy()
+                function = copied_call.get("function")
+                if isinstance(function, dict):
+                    copied_call["function"] = {**function, "arguments": "{}"}
+                calls.append(copied_call)
+            if calls:
+                replacement["tool_calls"] = calls
+
+            compacted.append(replacement)
+            continue
+
+        if message.get("role") != "tool":
+            compacted.append(message)
+            continue
+
+        call_id = str(message.get("tool_call_id") or "")
+        name = call_names.get(call_id, str(message.get("name") or "tool"))
+        summary_words = f"{name} result omitted; full output retained in transcript".split()
+        replacement = message.copy()
+        replacement["content"] = " ".join(summary_words[:limit])
+        compacted.append(replacement)
+
+    return compacted
 
 
 # Placeholder substituted for an empty non-final message that would otherwise
