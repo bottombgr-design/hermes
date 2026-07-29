@@ -496,6 +496,62 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
+def test_dispatcher_capacity_excludes_nonspawnable_guarded_and_profile_capped(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "profile_exists", lambda name: name in {"busy", "free"},
+    )
+    with kb.connect() as conn:
+        nonspawnable = kb.create_task(conn, title="terminal", assignee="orion-cc")
+        capped = kb.create_task(conn, title="busy-ready", assignee="busy")
+        guarded = kb.create_task(
+            conn, title="pr-open", assignee="free", workspace_kind="worktree"
+        )
+        dispatchable = kb.create_task(conn, title="real-work", assignee="free")
+        kb.add_comment(
+            conn,
+            guarded,
+            "worker",
+            "PR ready: https://github.com/NousResearch/hermes-agent/pull/123",
+        )
+        running = kb.create_task(conn, title="busy-running", assignee="busy")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='running' WHERE id=?",
+                (running,),
+            )
+
+        snapshot = kb.dispatcher_capacity_snapshot(
+            conn,
+            max_spawn=4,
+            max_in_progress_per_profile=1,
+        )
+
+    assert snapshot["free_global_slots"] == 3
+    assert snapshot["dispatchable_task_ids"] == [dispatchable]
+    assert nonspawnable not in snapshot["dispatchable_task_ids"]
+    assert capped not in snapshot["dispatchable_task_ids"]
+    assert guarded not in snapshot["dispatchable_task_ids"]
+
+
+def test_dispatcher_capacity_reports_no_work_when_global_slots_are_full(
+    kanban_home, all_assignees_spawnable
+):
+    with kb.connect() as conn:
+        kb.create_task(conn, title="waiting", assignee="worker")
+        running = kb.create_task(conn, title="running", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (running,))
+
+        snapshot = kb.dispatcher_capacity_snapshot(conn, max_spawn=1)
+
+    assert snapshot["free_global_slots"] == 0
+    assert snapshot["dispatchable_count"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Respawn guard (check_respawn_guard + dispatch_once integration)
 # ---------------------------------------------------------------------------
