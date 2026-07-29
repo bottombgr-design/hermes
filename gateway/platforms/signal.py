@@ -70,6 +70,8 @@ SSE_RETRY_DELAY_INITIAL = 2.0
 SSE_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
+SIGNAL_HEALTH_CHECK_PATH = "/api/v1/check"  # native signal-cli --http, returns 200 OK
+SIGNAL_HEALTHY_STATUS_CODES = (200,)
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +82,11 @@ HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before conc
 def _parse_comma_list(value: str) -> List[str]:
     """Split a comma-separated string into a list, stripping whitespace."""
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _is_healthy_status(status_code: int) -> bool:
+    """Return whether a signal-cli health check response counts as healthy."""
+    return status_code in SIGNAL_HEALTHY_STATUS_CODES
 
 
 def _guess_extension(data: bytes) -> str:
@@ -365,8 +372,8 @@ class SignalAdapter(BasePlatformAdapter):
         try:
             # Health check — verify signal-cli daemon is reachable
             try:
-                resp = await self.client.get(f"{self.http_url}/api/v1/check", timeout=10.0)
-                if resp.status_code != 200:
+                resp = await self.client.get(f"{self.http_url}{SIGNAL_HEALTH_CHECK_PATH}", timeout=10.0)
+                if not _is_healthy_status(resp.status_code):
                     logger.error("Signal: health check failed (status %d)", resp.status_code)
                     return False
             except Exception as e:
@@ -501,22 +508,21 @@ class SignalAdapter(BasePlatformAdapter):
 
             elapsed = time.time() - self._last_sse_activity
             if elapsed > HEALTH_CHECK_STALE_THRESHOLD:
-                logger.warning("Signal: SSE idle for %.0fs, checking daemon health", elapsed)
+                # Stale SSE means the receive path is dead regardless of daemon
+                # process health — reconnect first, and never let the daemon
+                # probe below refresh the activity clock (#40199).
+                logger.warning("Signal: SSE idle for %.0fs, forcing reconnect", elapsed)
+                self._force_reconnect()
                 try:
                     resp = await self.client.get(
-                        f"{self.http_url}/api/v1/check", timeout=10.0
+                        f"{self.http_url}{SIGNAL_HEALTH_CHECK_PATH}", timeout=10.0
                     )
-                    if resp.status_code == 200:
-                        # Daemon is alive but SSE is idle — update activity to
-                        # avoid repeated warnings (connection may just be quiet)
-                        self._last_sse_activity = time.time()
-                        logger.debug("Signal: daemon healthy, SSE idle")
+                    if _is_healthy_status(resp.status_code):
+                        logger.debug("Signal: daemon reachable, reconnect triggered by stale SSE")
                     else:
-                        logger.warning("Signal: health check failed (%d), forcing reconnect", resp.status_code)
-                        self._force_reconnect()
+                        logger.warning("Signal: daemon health check also failed (%d)", resp.status_code)
                 except Exception as e:
-                    logger.warning("Signal: health check error: %s, forcing reconnect", e)
-                    self._force_reconnect()
+                    logger.warning("Signal: daemon health check error: %s", e)
 
     def _force_reconnect(self) -> None:
         """Force SSE reconnection by closing the current response."""

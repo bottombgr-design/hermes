@@ -1,6 +1,7 @@
 """Tests for Signal messenger platform adapter."""
 import asyncio
 import base64
+import httpx
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -123,6 +124,135 @@ class TestSignalConnectCleanup:
         mock_release.assert_called_once_with("signal-phone", "+15551234567")
         assert adapter.client is None
         assert adapter._platform_lock_identity is None
+
+
+class TestSignalHealthCheckEndpoint:
+    """This file targets native ``signal-cli --http`` throughout (SSE receive at
+    ``/api/v1/events``, JSON-RPC send at ``/api/v1/rpc``), per the signal-cli
+    0.14.6 manual. ``/api/v1/check`` (200 OK) is that same native daemon's
+    documented health endpoint — it is not the bbernhard/signal-cli-rest-api
+    contract, which this file does not implement (see #53696).
+
+    Also covers the reconnect-ordering fix: a stale SSE stream means the
+    receive path is dead regardless of daemon process health, so
+    ``_health_monitor()`` must force a reconnect before running its
+    diagnostic probe, and that probe must never refresh
+    ``_last_sse_activity`` (#40199 blind spot)."""
+
+    @pytest.mark.asyncio
+    async def test_connect_treats_200_as_healthy(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=MagicMock(status_code=200))
+
+        with patch("gateway.platforms.signal.httpx.AsyncClient", return_value=mock_client), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("gateway.status.release_scoped_lock"), \
+             patch.object(adapter, "_sse_listener", return_value=None), \
+             patch.object(adapter, "_health_monitor", return_value=None):
+            result = await adapter.connect()
+
+        assert result is True
+        mock_client.get.assert_awaited_once_with(
+            "http://localhost:8080/api/v1/check", timeout=10.0
+        )
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [404, 500])
+    async def test_connect_fails_on_unhealthy_status(self, monkeypatch, status_code):
+        adapter = _make_signal_adapter(monkeypatch)
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=MagicMock(status_code=status_code))
+        mock_client.aclose = AsyncMock()
+
+        with patch("gateway.platforms.signal.httpx.AsyncClient", return_value=mock_client), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("gateway.status.release_scoped_lock"):
+            result = await adapter.connect()
+
+        assert result is False
+        mock_client.get.assert_awaited_once_with(
+            "http://localhost:8080/api/v1/check", timeout=10.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_connect_fails_when_request_raises(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+        mock_client.aclose = AsyncMock()
+
+        with patch("gateway.platforms.signal.httpx.AsyncClient", return_value=mock_client), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("gateway.status.release_scoped_lock"):
+            # Must not raise — the exception is caught and connect() returns False.
+            result = await adapter.connect()
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_health_monitor_reconnects_before_probe_on_stale_sse(self, monkeypatch):
+        """Stale SSE must force a reconnect regardless of what the diagnostic
+        probe (still healthy at 200) returns, and in that order."""
+        import time as time_module
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(return_value=MagicMock(status_code=200))
+        adapter._running = True
+        adapter._last_sse_activity = time_module.time() - 200  # stale, past threshold
+
+        call_order = []
+        adapter.client.get.side_effect = lambda *a, **k: (
+            call_order.append("probe"), MagicMock(status_code=200)
+        )[1]
+
+        sleep_calls = {"n": 0}
+
+        async def fake_sleep(_):
+            sleep_calls["n"] += 1
+            if sleep_calls["n"] >= 2:
+                adapter._running = False
+
+        def record_reconnect():
+            call_order.append("reconnect")
+
+        with patch("gateway.platforms.signal.asyncio.sleep", fake_sleep), \
+             patch.object(adapter, "_force_reconnect", side_effect=record_reconnect) as mock_reconnect:
+            stale_activity = adapter._last_sse_activity
+            await adapter._health_monitor()
+
+        mock_reconnect.assert_called_once()
+        assert call_order == ["reconnect", "probe"]
+        # A healthy probe after a forced reconnect must not mask staleness.
+        assert adapter._last_sse_activity == stale_activity
+
+    @pytest.mark.asyncio
+    async def test_health_monitor_forces_reconnect_on_unhealthy_status(self, monkeypatch):
+        import time as time_module
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(return_value=MagicMock(status_code=500))
+        adapter._running = True
+        adapter._last_sse_activity = time_module.time() - 200
+
+        sleep_calls = {"n": 0}
+
+        async def fake_sleep(_):
+            sleep_calls["n"] += 1
+            if sleep_calls["n"] >= 2:
+                adapter._running = False
+
+        with patch("gateway.platforms.signal.asyncio.sleep", fake_sleep), \
+             patch.object(adapter, "_force_reconnect") as mock_reconnect:
+            await adapter._health_monitor()
+
+        mock_reconnect.assert_called_once()
 
 
 class TestSignalHelpers:
