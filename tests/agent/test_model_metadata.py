@@ -121,6 +121,94 @@ class TestEstimateMessagesTokensRough:
         assert result < 5000
 
 
+class TestAnthropicInterleavedThinkingDedup:
+    """anthropic_content_blocks (Anthropic's interleaved-thinking replay
+    channel) duplicates the same thinking text into content/reasoning/
+    reasoning_content/reasoning_details on the stored message, but
+    _convert_assistant_message (agent/anthropic_adapter.py) reads
+    anthropic_content_blocks alone on replay and never touches the other
+    four. Counting all of them inflated a single thinking block's token
+    cost by up to ~4-5x -- the dominant driver of a preflight/compaction
+    estimate running far ahead of the real provider prompt_tokens on any
+    session with interleaved thinking enabled.
+    """
+
+    def _thinking_msg(self, text: str) -> dict:
+        return {
+            "role": "assistant",
+            "content": text,
+            "anthropic_content_blocks": [{"type": "thinking", "thinking": text}],
+            "reasoning": text,
+            "reasoning_content": text,
+            "reasoning_details": [{"type": "reasoning.text", "text": text}],
+        }
+
+    def test_blocks_present_counts_thinking_text_once(self):
+        """With anthropic_content_blocks present, content/reasoning/
+        reasoning_content/reasoning_details duplicates must not inflate
+        the estimate -- only the blocks copy (plus small dict overhead)
+        should count.
+        """
+        text = "x" * 4000
+        msg = self._thinking_msg(text)
+        result = estimate_messages_tokens_rough([msg])
+        once_only_estimate = (len(text) + 3) // 4
+        # Allow headroom for dict-repr overhead (keys, braces, role, the
+        # blocks list wrapper) without allowing anywhere near a 2x+ multiple
+        # of the once-only estimate, which is what the bug produced.
+        assert result < once_only_estimate * 1.5
+
+    def test_blocks_absent_still_counts_reasoning_fields_in_full(self):
+        """Non-Anthropic providers (no anthropic_content_blocks) must be
+        unaffected -- reasoning fields are their only copy and must still
+        be counted, not silently dropped.
+        """
+        msg = {
+            "role": "assistant",
+            "content": "hello",
+            "reasoning_content": "thinking about it at length " * 20,
+        }
+        with_reasoning = estimate_messages_tokens_rough([msg])
+        without_reasoning = estimate_messages_tokens_rough(
+            [{"role": "assistant", "content": "hello"}]
+        )
+        assert with_reasoning > without_reasoning
+
+    def test_blocks_present_without_reasoning_fields_unaffected(self):
+        """A message with only content + blocks (no reasoning fields at
+        all) must still dedupe content against blocks -- this path existed
+        before reasoning-field dedup was added and must not regress.
+        """
+        text = "y" * 4000
+        msg = {
+            "role": "assistant",
+            "content": text,
+            "anthropic_content_blocks": [{"type": "thinking", "thinking": text}],
+        }
+        result = estimate_messages_tokens_rough([msg])
+        once_only_estimate = (len(text) + 3) // 4
+        assert result < once_only_estimate * 1.5
+
+    def test_quadruple_counting_regression_guard(self):
+        """End-to-end: the old unstripped behavior would count the same
+        thinking text 4 times over (content + 3 reasoning fields + the
+        blocks copy itself). Confirm the fixed estimate is meaningfully
+        smaller than that old behavior would have produced, not just
+        smaller than some arbitrary bound.
+        """
+        text = "z" * 4000
+        msg = self._thinking_msg(text)
+        fixed_result = estimate_messages_tokens_rough([msg])
+
+        # Reconstruct what the old (buggy) shadow would have produced:
+        # every field walked in full, nothing deduped against blocks.
+        old_shadow = dict(msg)
+        old_str_len = len(str(old_shadow))
+        old_buggy_estimate = (old_str_len + 3) // 4
+
+        assert fixed_result < old_buggy_estimate / 2
+
+
 class TestEstimateRequestTokensRough:
     def test_caches_tools_estimate(self):
         messages = [{"role": "user", "content": "hello"}]
