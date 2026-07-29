@@ -83,7 +83,15 @@ _MAX_MESSAGE_LENGTH = 8000
 _DEDUP_MAX_SIZE = 4000
 _DEDUP_WINDOW_SECONDS = 48 * 3600
 
+_FFFC_WAIT_SECONDS = 15.0  # Timeout for waiting on an attachment after a U+FFFC placeholder.
+
 _SIDECAR_DIR = Path(__file__).parent / "sidecar"
+
+# Cap on a self-heal `npm ci`/`npm install` of the sidecar deps. A cold
+# install of the pinned spectrum-ts tree normally takes well under a minute;
+# a wedged npm (dead registry, network blackhole) must not stall the photon
+# connect path indefinitely.
+_NPM_REINSTALL_TIMEOUT = 600
 
 # Photon / Envoy / spectrum-ts error substrings that indicate a transient
 # upstream overload rather than a permanent failure.  These are not in the
@@ -135,6 +143,83 @@ def check_requirements() -> bool:
         # surfaces the missing-deps state in `hermes setup` / status.
         return False
     return True
+
+
+def _sidecar_deps_stale() -> bool:
+    """True when node_modules exists but is older than the committed lockfile.
+
+    `hermes update` rewrites ``package-lock.json`` when the spectrum-ts pin is
+    bumped, but does not reinstall ``node_modules``. npm records the state of
+    the last install in ``node_modules/.package-lock.json``; when the top-level
+    lockfile is newer than that marker, the install is out of date. This is the
+    same signal ``npm ci`` uses. Returns False (do nothing) if either file is
+    missing or unreadable, so a first-run or odd filesystem never blocks start.
+    """
+    lockfile = _SIDECAR_DIR / "package-lock.json"
+    marker = _SIDECAR_DIR / "node_modules" / ".package-lock.json"
+    try:
+        return lockfile.stat().st_mtime > marker.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _reinstall_sidecar_deps() -> None:
+    """Reinstall the sidecar's node_modules from the lockfile (blocking).
+
+    Mirrors ``hermes photon install-sidecar``: ``npm ci`` for an exact,
+    reproducible install, falling back to ``npm install`` if the lockfile is
+    missing or drifted. Runs the postinstall patch as part of the install.
+    Best-effort — a failure here just leaves the (stale) deps in place and the
+    normal ``_start_sidecar`` readiness check reports the real error.
+    """
+    npm = shutil.which("npm")
+    if not npm:
+        logger.warning("[photon] cannot reinstall stale sidecar deps: npm not on PATH")
+        return
+    # Windows: suppress the console flash these short-lived npm runs would
+    # otherwise pop (0 elsewhere). Same helper as the sidecar spawn below.
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    try:
+        result = subprocess.run(  # noqa: S603
+            [npm, "ci"],
+            cwd=str(_SIDECAR_DIR),
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            check=False,
+            timeout=_NPM_REINSTALL_TIMEOUT,
+            creationflags=windows_hide_flags(),
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "[photon] sidecar `npm ci` failed; falling back to `npm install`"
+            )
+            result = subprocess.run(  # noqa: S603
+                [npm, "install"],
+                cwd=str(_SIDECAR_DIR),
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                check=False,
+                timeout=_NPM_REINSTALL_TIMEOUT,
+                creationflags=windows_hide_flags(),
+            )
+    except subprocess.TimeoutExpired:
+        # A wedged npm (dead registry, network blackhole) must not stall the
+        # photon connect forever — give up, leave the stale deps in place, and
+        # let the readiness check report the real error. Retried on the next
+        # reconnect tick.
+        logger.error(
+            "[photon] sidecar dependency reinstall timed out after %ss",
+            _NPM_REINSTALL_TIMEOUT,
+        )
+        return
+    if result.returncode != 0:
+        logger.error(
+            "[photon] sidecar dependency reinstall failed: %s",
+            (result.stderr or result.stdout or "").strip(),
+        )
+    else:
+        logger.info("[photon] sidecar dependencies reinstalled from lockfile")
 
 
 def validate_config(cfg: PlatformConfig) -> bool:
@@ -256,6 +341,8 @@ class PhotonAdapter(BasePlatformAdapter):
         self._last_inbound_by_chat: Dict[str, str] = {}
         # Last time we sent a typing indicator per chat, for cooldown gating.
         self._typing_last_sent: Dict[str, float] = {}
+
+        self._pending_fffc: Dict[str, tuple[float, Any]] = {}  # chat_key → (timestamp, asyncio.Task)
 
         # Group-chat mention gating (parity with BlueBubbles). When enabled,
         # group messages are ignored unless they match a wake word; DMs are
@@ -409,6 +496,11 @@ class PhotonAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             self._inbound_task = None
+        # Cancel any pending U+FFFC placeholder tasks.
+        for chat_key, (_, fffc_task) in list(self._pending_fffc.items()):
+            if fffc_task and not fffc_task.done():
+                fffc_task.cancel()
+        self._pending_fffc.clear()
         await self._stop_sidecar()
         if self._http_client is not None:
             try:
@@ -534,6 +626,14 @@ class PhotonAdapter(BasePlatformAdapter):
                 del seen[old]
         return False
 
+    async def _fffc_timeout_handler(self, chat_key: str, message_id: str) -> None:
+        await asyncio.sleep(_FFFC_WAIT_SECONDS)
+        if self._pending_fffc.pop(chat_key, None):
+            logger.warning(
+                "[photon] wait for attachment was too long, can't retrieve attachment data "
+                "(message %s, chat %s)", message_id, chat_key,
+            )
+
     async def _dispatch_inbound(self, event: Dict[str, Any]) -> None:
         """Normalize a sidecar inbound event and dispatch it to the gateway.
 
@@ -594,6 +694,11 @@ class PhotonAdapter(BasePlatformAdapter):
             is_voice = payload.get("type") == "voice"
             name = payload.get("name") or ("voice" if is_voice else "(unnamed)")
             mime = payload.get("mimeType") or ""
+            # Promote CAF attachments to VOICE (iMessage voice notes use CAF).
+            # Check both filename and MIME: the sidecar may send "(unnamed)"
+            # when no name is supplied, so the MIME type is the reliable signal.
+            if not is_voice and (name.lower().endswith(".caf") or mime == "audio/x-caf"):
+                is_voice = True
             mtype = MessageType.VOICE if is_voice else _attachment_message_type(mime)
             cached = _cache_inbound_attachment(
                 payload, name, mime, force_audio=is_voice
@@ -664,6 +769,28 @@ class PhotonAdapter(BasePlatformAdapter):
                 )
             )
             return
+        # U+FFFC placeholder — wait for the real attachment instead of
+        # dispatching. Detected before _record_last_inbound so the placeholder
+        # is not recorded as the reaction target — the real attachment will be.
+        if ctype == "text" and (content.get("text") or "").strip() == "\ufffc":
+            chat_key = space_id
+            prev = self._pending_fffc.pop(chat_key, None)
+            if prev and prev[1] and not prev[1].done():
+                prev[1].cancel()
+            task = asyncio.create_task(
+                self._fffc_timeout_handler(chat_key, event.get("messageId") or "")
+            )
+            self._pending_fffc[chat_key] = (time.monotonic(), task)
+            logger.debug("[photon] U+FFFC placeholder received — waiting for attachment")
+            return
+
+        # Cancel any pending U+FFFC timeout — the real message arrived.
+        if ctype in {"attachment", "voice"}:
+            prev = self._pending_fffc.pop(space_id, None)
+            if prev and prev[1] and not prev[1].done():
+                prev[1].cancel()
+                logger.debug("[photon] attachment arrived — cancelling U+FFFC timeout")
+
         # Anything past here is a real (reactable) message — remember it as
         # the chat's latest inbound so `add_reaction` can target it when the
         # caller doesn't pass an explicit message id. Recorded before the
@@ -751,7 +878,7 @@ class PhotonAdapter(BasePlatformAdapter):
         try:
             out = subprocess.run(  # noqa: S603, S607
                 ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
-                capture_output=True, text=True, timeout=5.0, check=False,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5.0, check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             return []
@@ -763,7 +890,7 @@ class PhotonAdapter(BasePlatformAdapter):
         try:
             out = subprocess.run(  # noqa: S603, S607
                 ["ps", "-p", str(pid), "-o", "command="],
-                capture_output=True, text=True, timeout=5.0, check=False,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5.0, check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
@@ -841,6 +968,19 @@ class PhotonAdapter(BasePlatformAdapter):
                 f"Photon sidecar deps not installed. Run: "
                 f"cd {_SIDECAR_DIR} && npm install   (or `hermes photon setup`)"
             )
+        # A `hermes update` that bumps the spectrum-ts pin rewrites
+        # package-lock.json but never reinstalls node_modules, so the sidecar
+        # spawns against stale deps and dies on every reconnect (the v8 patch
+        # script can't find @spectrum-ts/imessage/dist that only v8 ships).
+        # Self-heal by reinstalling when the lockfile is newer than npm's
+        # install marker. Runs off the event loop so a cold install can't
+        # freeze every other platform's traffic.
+        if _sidecar_deps_stale():
+            logger.warning(
+                "[photon] sidecar deps are stale (lockfile newer than install); "
+                "reinstalling before start"
+            )
+            await asyncio.to_thread(_reinstall_sidecar_deps)
         await self._reap_stale_sidecar()
 
         env = os.environ.copy()
@@ -854,6 +994,10 @@ class PhotonAdapter(BasePlatformAdapter):
         # never runs — can't leave it orphaned on the port.
         env["PHOTON_SIDECAR_WATCH_STDIN"] = "1"
 
+        # Windows: hide the child console (0 elsewhere). Same helper the
+        # discord/whatsapp adapters use for their sidecar spawns.
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
         try:
             patch = subprocess.run(  # noqa: S603
                 [
@@ -862,9 +1006,12 @@ class PhotonAdapter(BasePlatformAdapter):
                     str(_SIDECAR_DIR),
                 ],
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=10,
                 check=False,
+                # Windows: suppress the brief console flash this short-lived
+                # node patch run would otherwise pop on every sidecar start.
+                creationflags=windows_hide_flags(),
             )
             if patch.returncode != 0:
                 raise RuntimeError((patch.stderr or patch.stdout or "").strip())
@@ -883,6 +1030,10 @@ class PhotonAdapter(BasePlatformAdapter):
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=(sys.platform != "win32"),
+            # Windows: run the persistent sidecar headless so it does not open
+            # (or leave) a visible console window. CREATE_NO_WINDOW only (no
+            # DETACHED_PROCESS) so the stdin/stdout pipes above stay usable.
+            creationflags=windows_hide_flags(),
         )
 
         # Pump sidecar stderr/stdout into our logger so users see crashes.
@@ -1503,7 +1654,7 @@ _AUDIO_EXT_BY_MIME = {
     "audio/mpeg": ".mp3",
     "audio/ogg": ".ogg",
     "audio/wav": ".wav",
-    "audio/x-caf": ".mp3",
+    "audio/x-caf": ".caf",
     "audio/mp4": ".m4a",
     "audio/aac": ".m4a",
 }
