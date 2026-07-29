@@ -6121,11 +6121,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    # PTB may hand the next update through more than one scheduling hop before
-    # its callback starts. Yield a small fixed number of loop turns — never a
-    # wall-clock sleep — so standalone-photo registration can catch up without
-    # adding perceptible latency to ordinary text-only messages.
-    _TELEGRAM_STARTUP_IMAGE_REGISTRATION_YIELDS = 8
+    # PTB can start the standalone-photo callback a few milliseconds after the
+    # text batch reaches the runner. Give that callback one small wall-clock
+    # registration window before taking the text-only fast path. Once concrete
+    # work is observed, the longer download grace below applies.
+    _TELEGRAM_STARTUP_IMAGE_REGISTRATION_GRACE_SECONDS = 0.01
+    _TELEGRAM_STARTUP_IMAGE_REGISTRATION_POLL_SECONDS = 0.002
     _TELEGRAM_STARTUP_IMAGE_DOWNLOAD_GRACE_SECONDS = 1.0
 
     @staticmethod
@@ -6169,7 +6170,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         loop = asyncio.get_running_loop()
         deadline: float | None = None
-        registration_yields = self._TELEGRAM_STARTUP_IMAGE_REGISTRATION_YIELDS
+        registration_deadline = (
+            loop.time() + self._TELEGRAM_STARTUP_IMAGE_REGISTRATION_GRACE_SECONDS
+        )
         while True:
             incoming = pop_image(session_key)
             if incoming is not None:
@@ -6194,10 +6197,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
                 continue
 
-            if registration_yields <= 0:
+            if loop.time() >= registration_deadline:
                 break
-            registration_yields -= 1
-            await asyncio.sleep(0)
+            await asyncio.sleep(
+                min(
+                    self._TELEGRAM_STARTUP_IMAGE_REGISTRATION_POLL_SECONDS,
+                    max(0.0, registration_deadline - loop.time()),
+                )
+            )
         return event
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:

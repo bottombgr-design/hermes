@@ -90,53 +90,48 @@ async def test_startup_text_yields_for_photo_registration_then_merges_downloaded
 
 
 @pytest.mark.asyncio
-async def test_startup_text_without_photo_only_uses_bounded_zero_delay_yields(monkeypatch):
+async def test_startup_text_without_photo_uses_bounded_registration_grace():
     source = _source()
     session_key = build_session_key(source)
     adapter = _make_adapter()
     runner = _make_runner(adapter)
-    real_sleep = asyncio.sleep
-    delays: list[float] = []
+    loop = asyncio.get_running_loop()
 
-    async def recording_sleep(delay: float) -> None:
-        delays.append(delay)
-        await real_sleep(0)
-
-    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
-
+    started = loop.time()
     event = await runner._merge_telegram_startup_image_followups(
-        _text_event(source),
-        source,
-        session_key,
+        _text_event(source), source, session_key
     )
+    elapsed = loop.time() - started
 
     assert event.text == "Is this a real study?"
     assert event.media_urls == []
-    assert delays == [0] * 8
+    assert 0.008 <= elapsed < 0.05
 
 
 @pytest.mark.asyncio
-async def test_startup_text_tolerates_multiple_registration_scheduling_hops():
+async def test_startup_text_waits_for_photo_registration_after_real_timer_gap():
     source = _source()
     session_key = build_session_key(source)
     adapter = _make_adapter()
     runner = _make_runner(adapter)
 
-    async def register_after_four_hops() -> None:
-        for _ in range(4):
-            await asyncio.sleep(0)
+    async def register_after_timer_gap() -> None:
+        await asyncio.sleep(0.005)
         adapter._media_downloads_in_progress_by_session[session_key] = 1
         await asyncio.sleep(0.01)
-        adapter._pending_photo_batches[f"{session_key}:photo-burst"] = _photo_event(source)
+        adapter._pending_photo_batches[f"{session_key}:photo-burst"] = _photo_event(
+            source, "/tmp/timer-gap.jpg"
+        )
         adapter._media_downloads_in_progress_by_session.pop(session_key, None)
 
-    producer = asyncio.create_task(register_after_four_hops())
+    producer = asyncio.create_task(register_after_timer_gap())
     event = await runner._merge_telegram_startup_image_followups(
         _text_event(source), source, session_key
     )
     await producer
 
-    assert event.media_urls == ["/tmp/late-photo.jpg"]
+    assert event.media_urls == ["/tmp/timer-gap.jpg"]
+    assert adapter._pending_photo_batches == {}
 
 
 @pytest.mark.asyncio
