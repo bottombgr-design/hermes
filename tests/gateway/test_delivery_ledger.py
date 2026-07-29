@@ -174,6 +174,39 @@ class TestPrune:
         dl._prune()
         assert _row("ob-1") is not None
 
+    def test_undelivered_rows_survive_max_row_cap(self, monkeypatch):
+        """Row-count pressure must not hard-delete owed replies.
+
+        Time retention already scopes to delivered/abandoned; the max-row
+        path must do the same. Otherwise a backlog of pending/attempting/
+        failed obligations silently drops the oldest owed finals.
+        """
+        monkeypatch.setattr(dl, "_MAX_ROWS", 3)
+        for i in range(5):
+            _record(oid=f"ob-{i}", content=f"reply-{i}")
+        for i in range(5):
+            assert _row(f"ob-{i}") is not None
+
+    def test_max_row_cap_deletes_terminal_not_owed(self, monkeypatch):
+        """When mixed, excess deletes delivered/abandoned only."""
+        monkeypatch.setattr(dl, "_MAX_ROWS", 3)
+        for i in range(2):
+            _record(oid=f"del-{i}", content=f"done-{i}")
+            dl.mark_delivered(f"del-{i}")
+        _record(oid="abd-0", content="gave-up")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET state='abandoned' "
+                "WHERE obligation_id='abd-0'"
+            )
+        for i in range(3):
+            _record(oid=f"pend-{i}", content=f"owed-{i}")
+        for i in range(3):
+            assert _row(f"pend-{i}") is not None
+        assert _row("del-0") is None
+        assert _row("del-1") is None
+        assert _row("abd-0") is None
+
 
 class TestLedgerEnabled:
     def test_default_on(self):

@@ -61,7 +61,8 @@ _DB_LOCK = threading.Lock()
 MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
-_MAX_ROWS = 500
+_MAX_ROWS = 500  # soft cap: count pressure only deletes delivered/abandoned;
+                 # owed rows may exceed this until delivered or sweep→abandoned
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -321,14 +322,19 @@ def _prune(now: Optional[float] = None) -> None:
             ).fetchone()[0]
             excess = max(0, total - _MAX_ROWS)
             if excess:
+                # Only terminal rows may be dropped for the count cap.
+                # pending/attempting/failed are still owed to the platform —
+                # deleting them under backlog pressure permanently loses
+                # finals that sweep_recoverable would otherwise redeliver.
+                # Poison/stale undelivered rows transition to abandoned in
+                # sweep_recoverable (dead owner + attempts/STALE_AFTER_SECONDS),
+                # not via this count DELETE.
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
-                         ORDER BY CASE state
-                                    WHEN 'delivered' THEN 0
-                                    WHEN 'abandoned' THEN 1
-                                    ELSE 2
-                                  END, updated_at ASC
+                         WHERE state IN ('delivered', 'abandoned')
+                         ORDER BY CASE state WHEN 'delivered' THEN 0 ELSE 1 END,
+                                  updated_at ASC
                          LIMIT ?)""",
                     (excess,),
                 )
