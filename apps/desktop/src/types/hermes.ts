@@ -1371,3 +1371,11 @@ export interface ModelAssignmentResponse {
   stale_aux?: StaleAuxAssignment[]
   tasks?: string[]
 }
+
+export interface DelegateModelResponse {
+  model: null | string
+  provider: null | string
+  /** True when neither delegation.model nor delegation.provider is set —
+   *  subagents inherit the parent model. */
+  inherits_parent: boolean
+}

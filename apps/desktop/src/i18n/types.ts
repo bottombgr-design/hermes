@@ -697,6 +697,10 @@ export interface Translations {
       reasoning: string
       reasoningOff: string
       defaultsFailed: string
+      delegateTitle: string
+      delegateReset: string
+      delegateDesc: string
+      delegateInheritsParent: string
       auxiliaryTitle: string
       resetAllToMain: string
       auxiliaryDesc: string
