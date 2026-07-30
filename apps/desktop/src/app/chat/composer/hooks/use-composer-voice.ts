@@ -19,6 +19,7 @@ import type { ChatBarProps } from '../types'
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
+import { useEndVoiceOnSessionSwitch, useStopVoicePlaybackOnUnmount } from './use-voice-session-reset'
 
 interface UseComposerVoiceArgs {
   busy: boolean
@@ -149,6 +150,17 @@ export function useComposerVoice({
     // to finish releasing the capture device (see wakePauseBarrierRef).
     beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
   })
+
+  const endVoiceRef = useRef(conversation.end)
+  endVoiceRef.current = conversation.end
+
+  const resetVoiceForSessionSwitch = useCallback(() => {
+    setVoiceConversationActive(false)
+    void endVoiceRef.current()
+  }, [])
+
+  useEndVoiceOnSessionSwitch(sessionId, resetVoiceForSessionSwitch)
+  useStopVoicePlaybackOnUnmount()
 
   // The `composer.voice` hotkey (Ctrl+B) toggles the conversation. Starting
   // with STT unconfigured lets the conversation surface its own "configure
