@@ -28,7 +28,8 @@ from typing import Any, FrozenSet, Iterable, List, Mapping, Optional, Sequence
 
 from gateway.slash_access import (
     SlashAccessPolicy,
-    policy_for_source,
+    _platform_extra,
+    _scope_for_chat_type,
     policy_from_extra,
 )
 
@@ -148,7 +149,14 @@ def policy_for_tier(
     """
     if platform_config is not None and source is not None:
         try:
-            return policy_for_source(source, platform_config)
+            # Resolve directly from the live PlatformConfig. We avoid
+            # slash_access.policy_for_source here because its signature is
+            # policy_for_source(gateway_config, source) and it re-derives the
+            # PlatformConfig from gateway_config.platforms; callers on the
+            # gateway path already hand us the resolved PlatformConfig.
+            extra = _platform_extra(platform_config)
+            scope = _scope_for_chat_type(getattr(source, "chat_type", None))
+            return policy_from_extra(extra, scope)
         except Exception:
             pass
     if user_config is None or source is None:
@@ -225,6 +233,16 @@ def resolve_user_tier(
         elif plat is not None:
             platform_key = str(plat)
     extra = _platform_extra_from_config(user_config or {}, platform_key) if user_config else {}
+    # On the live gateway path only ``platform_config`` is supplied (no
+    # ``user_config`` fallback dict), so also read the tier knobs from the
+    # live PlatformConfig's ``extra``. This keeps user_toolsets / iteration
+    # clamp working in production, not just in the unit-test fallback.
+    if platform_config is not None:
+        plat_extra = _platform_extra(platform_config)
+        if plat_extra:
+            merged_extra = dict(plat_extra)
+            merged_extra.update(extra)  # explicit user_config wins if both set
+            extra = merged_extra
     user_toolsets_cfg = extra.get("user_toolsets", extra.get("user_tools"))
     user_max = _coerce_optional_int(extra.get("user_max_iterations"))
 

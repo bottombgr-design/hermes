@@ -108,3 +108,63 @@ class TestResolveUserTier:
     def test_default_user_toolsets_subset(self):
         assert "web" in _DEFAULT_USER_TOOLSETS
         assert "memory" not in _DEFAULT_USER_TOOLSETS
+
+
+def _live_platform_config(admin_ids=None, user_toolsets=None, user_max=None):
+    """Mimic a live PlatformConfig: an object exposing an ``.extra`` dict.
+
+    This is the production shape the gateway hands to ``policy_for_tier`` /
+    ``resolve_user_tier`` via ``platform_config=`` — distinct from the
+    ``user_config`` fallback dict used by the unit tests above.
+    """
+    extra = {}
+    if admin_ids is not None:
+        extra["allow_admin_from"] = admin_ids
+    if user_toolsets is not None:
+        extra["user_toolsets"] = user_toolsets
+    if user_max is not None:
+        extra["user_max_iterations"] = user_max
+    return SimpleNamespace(extra=extra)
+
+
+class TestResolveUserTierLivePlatformConfig:
+    """Regression tests for the live gateway branch (#67898 review).
+
+    Previously ``policy_for_tier`` called ``policy_for_source(source,
+    platform_config)`` with swapped arguments, so on the real gateway turn
+    the policy resolved to a disabled/no-op state and neither the non-admin
+    toolset filter nor the iteration cap applied. These tests pass a live
+    ``PlatformConfig``-shaped object (``.extra``) and assert the restriction
+    and clamp actually take effect.
+    """
+
+    def test_non_admin_restricted_via_live_platform_config(self):
+        src = _source("999")
+        d = resolve_user_tier(
+            source=src,
+            enabled_toolsets=["web", "memory", "skills", "browser"],
+            max_iterations=40,
+            platform_config=_live_platform_config(
+                admin_ids=["111"], user_max=6
+            ),
+        )
+        assert d.is_admin is False
+        assert d.tier_gating_enabled is True
+        assert "memory" not in d.enabled_toolsets
+        assert "skills" not in d.enabled_toolsets
+        assert "web" in d.enabled_toolsets
+        assert d.max_iterations == 6
+
+    def test_admin_unrestricted_via_live_platform_config(self):
+        src = _source("111")
+        d = resolve_user_tier(
+            source=src,
+            enabled_toolsets=["web", "memory", "skills", "cronjob"],
+            max_iterations=40,
+            platform_config=_live_platform_config(
+                admin_ids=["111"], user_max=6
+            ),
+        )
+        assert d.is_admin is True
+        assert "memory" in d.enabled_toolsets
+        assert d.max_iterations == 40
