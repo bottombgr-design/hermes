@@ -1,0 +1,34 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: nessie
+description: >-
+  Nessie is the context layer for AI-native work - search and read your
+  own and your team's AI conversation history, notes, and shared sources
+  from Hermes via the hosted Nessie MCP server.
+source: https://nessielabs.com/docs/
+
+# Hosted Streamable HTTP endpoint. Auth is a per-user API key sent as a
+# bearer Authorization header - the same header template that
+# `hermes mcp add nessie --auth header` produces manually today.
+transport:
+  type: http
+  url: https://mcp.nessielabs.com/mcp
+
+auth:
+  type: api_key
+  env:
+    - name: MCP_NESSIE_API_KEY
+      prompt: "Nessie API key (create one in the Nessie app under Settings -> API Keys)"
+      secret: true
+
+# Tool selection: the server exposes a coreutil-style read surface (ls,
+# grep, cat, ...) plus context-library write tools. `default_enabled` is
+# left unset so the install-time checklist starts all-on and users prune.
+
+post_install: |
+  Create an API key in the Nessie app (Settings -> API Keys) and paste it
+  at the prompt above. Verify the connection with:
+    hermes mcp test nessie
+  Then start a fresh session (/new) so the Nessie tools load.

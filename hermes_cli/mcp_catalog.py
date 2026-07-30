@@ -506,6 +506,16 @@ def _build_server_config(
         cfg["url"] = t.url
         if entry.auth.type == "oauth":
             cfg["auth"] = "oauth"
+        elif entry.auth.type == "api_key":
+            # Hosted servers with API-key auth: persist the same
+            # `Authorization: Bearer ${MCP_<NAME>_API_KEY}` template that
+            # `hermes mcp add --auth header` writes, so the key the user
+            # was prompted for (saved to .env by auth.env above) is
+            # actually sent. Without this, an http+api_key entry installs
+            # into an unauthenticated config and every connect 401s.
+            from hermes_cli.mcp_config import _bearer_auth_headers
+
+            cfg["headers"] = _bearer_auth_headers(entry.name)
     return cfg
 
 
