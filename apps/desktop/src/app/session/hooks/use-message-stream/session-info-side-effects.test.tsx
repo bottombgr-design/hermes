@@ -6,7 +6,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
-import { setCurrentModel, setCurrentProvider } from '@/store/session'
+
+// Only mock @/store/projects — @/store/session is imported for real so
+// $currentCwd is a proper nanostores atom with .get() / .set() / .subscribe().
+const mocks = vi.hoisted(() => ({
+  cwdFollowMock: vi.fn<(_: string) => Promise<void>>(async () => undefined)
+}))
+
+vi.mock('@/store/projects', async () => {
+  const actual = await vi.importActual('@/store/projects')
+
+  return {
+    ...actual,
+    followActiveSessionCwd: mocks.cwdFollowMock
+  }
+})
+
+import { $currentCwd, setCurrentModel, setCurrentProvider } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
 
 import { useMessageStream } from './index'
@@ -154,5 +170,36 @@ describe('message.complete sidebar refresh coalescing', () => {
     })
 
     expect(refreshSessions).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('session.info cwd-follow guard', () => {
+  beforeEach(() => {
+    mocks.cwdFollowMock.mockReset()
+    $currentCwd.set('')
+  })
+
+  it('does not follow the cwd on the first session.info after reconnect (initial learn)', async () => {
+    await mountStream()
+
+    // Initial payload — cwd goes from '' to a real path. Must NOT follow.
+    await sessionInfo(ACTIVE_SID, { cwd: '/Users/test/projects/foo' })
+
+    expect(mocks.cwdFollowMock).not.toHaveBeenCalled()
+  })
+
+  it('follows the cwd on a genuine move (non-empty → different non-empty)', async () => {
+    $currentCwd.set('/Users/test/projects/foo')
+
+    await mountStream()
+
+    // Prime lastCwdInfoSessionRef with an initial session.info — on a genuine
+    // move the ref was already set by a prior event establishing the session.
+    await sessionInfo(ACTIVE_SID, { cwd: '/Users/test/projects/foo' })
+
+    // Genuine move — cwd changes from one non-empty path to another. Must follow.
+    await sessionInfo(ACTIVE_SID, { cwd: '/Users/test/projects/bar' })
+
+    expect(mocks.cwdFollowMock).toHaveBeenCalledWith('/Users/test/projects/bar')
   })
 })
