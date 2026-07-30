@@ -18,6 +18,7 @@ import { branchGroupForUser, type ChatMessage, chatMessageText, textPart } from 
 import {
   appendText,
   isSessionBusyError,
+  isSessionNotFoundError,
   visibleUserIndexAtOrdinal,
   visibleUserOrdinal,
   withSessionBusyRetry
@@ -54,7 +55,8 @@ export async function runRewindSubmit(
   sessionId: string,
   text: string,
   truncateOrdinal: number | undefined,
-  interruptFirst: boolean
+  interruptFirst: boolean,
+  storedSessionId?: string | null
 ): Promise<void> {
   const interrupt = async () => {
     try {
@@ -82,6 +84,29 @@ export async function runRewindSubmit(
   try {
     await submit()
   } catch (err) {
+    // Session-not-found recovery: after cancelRun + edit, the gateway may
+    // have dropped the in-memory session. Resume the stored session and
+    // retry, mirroring the pattern in submitPromptText (#70077).
+    if (isSessionNotFoundError(err) && storedSessionId) {
+      const resumed = await requestGateway<{ session_id: string }>('session.resume', {
+        session_id: storedSessionId,
+        source: 'desktop'
+      })
+
+      if (resumed?.session_id) {
+        await requestGateway(
+          'prompt.submit',
+          {
+            session_id: resumed.session_id,
+            text,
+            ...(truncateOrdinal !== undefined && { truncate_before_user_ordinal: truncateOrdinal })
+          },
+          PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+        )
+        return
+      }
+    }
+
     if (!isSessionBusyError(err)) {
       throw err
     }
