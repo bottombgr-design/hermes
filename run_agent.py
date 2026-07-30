@@ -1839,24 +1839,34 @@ class AIAgent:
 
         persist_lock = getattr(self, "_session_persist_lock", None)
 
-        def _persist_and_drain() -> None:
+        def _persist_and_drain() -> bool:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            flush_ok = self._flush_messages_to_session_db(messages, conversation_history)
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
-            note_turn_persisted(self)
+            # Only clear the in-flight turn marker when the canonical SQLite
+            # flush did not fail.  _flush_messages_to_session_db returns False
+            # on exception (e.g. SQLite contention), True on success, and None
+            # when persist is disabled or no session DB exists — both of those
+            # are consistent states that should still note the turn as persisted.
+            # Skipping note_turn_persisted on failure preserves the evidence
+            # that the previous turn never completed its persist, so the turn
+            # overlap tripwire can still catch a real boundary failure.
+            if flush_ok is not False:
+                note_turn_persisted(self)
+                return True
+            return False
 
         if persist_lock is None:
-            _persist_and_drain()
-            return
+            return _persist_and_drain()
 
         with persist_lock:
-            _persist_and_drain()
+            return _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
