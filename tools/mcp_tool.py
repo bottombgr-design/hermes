@@ -2320,7 +2320,11 @@ class MCPServerTask:
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
-                    t.cancel()
+                    try:
+                        t.cancel()
+                    except RuntimeError:
+                        # Event loop already closed (GC finalisation).
+                        break
                     try:
                         await t
                     except (asyncio.CancelledError, Exception):
@@ -2364,7 +2368,11 @@ class MCPServerTask:
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
-                    t.cancel()
+                    try:
+                        t.cancel()
+                    except RuntimeError:
+                        # Event loop already closed (GC finalisation).
+                        break
                     try:
                         await t
                     except (asyncio.CancelledError, Exception):
