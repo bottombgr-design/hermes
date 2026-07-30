@@ -2226,6 +2226,13 @@ class MCPServerTask:
                     self.name,
                 )
 
+    def _safe_ready_set(self) -> None:
+        """Set _ready safely, ignoring RuntimeError if the event loop is closed during shutdown."""
+        try:
+            self._ready.set()
+        except RuntimeError:
+            pass
+
     async def _wait_for_lifecycle_event(self) -> str:
         """Block until either _shutdown_event or _reconnect_event fires.
 
@@ -2318,13 +2325,15 @@ class MCPServerTask:
                     # Clear the rapid-drop budget (#62212).
                     self._mark_session_proven()
         finally:
-            for t in (shutdown_task, reconnect_task):
-                if not t.done():
-                    t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+            if not loop.is_closed():
+                for t in (shutdown_task, reconnect_task):
+                    if not t.done():
+                        t.cancel()
+                        try:
+                            await t
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
         if self._shutdown_event.is_set():
             return "shutdown"
@@ -2362,13 +2371,15 @@ class MCPServerTask:
                 timeout=timeout,
             )
         finally:
-            for t in (shutdown_task, reconnect_task):
-                if not t.done():
-                    t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+            if not loop.is_closed():
+                for t in (shutdown_task, reconnect_task):
+                    if not t.done():
+                        t.cancel()
+                        try:
+                            await t
+                        except (asyncio.CancelledError, Exception):
+                            pass
         if self._shutdown_event.is_set():
             return "shutdown"
         self._reconnect_event.clear()
@@ -2527,7 +2538,7 @@ class MCPServerTask:
                     self.session = session
                     self._mark_lifecycle_started()
                     await self._discover_tools()
-                    self._ready.set()
+                    self._safe_ready_set()
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
                     # gated on a stale consecutive-failure count (#16788).
@@ -2869,7 +2880,7 @@ class MCPServerTask:
                         )
                         self.session = session
                         await self._discover_tools()
-                        self._ready.set()
+                        self._safe_ready_set()
                         # Session is live again: clear any breaker state from a
                         # prior outage so the first call after recovery isn't
                         # gated on a stale consecutive-failure count (#16788).
@@ -2932,7 +2943,7 @@ class MCPServerTask:
                             )
                             self.session = session
                             await self._discover_tools()
-                            self._ready.set()
+                            self._safe_ready_set()
                             # Session is live again: clear any breaker state from
                             # a prior outage so the first call after recovery
                             # isn't gated on a stale failure count (#16788).
@@ -2970,7 +2981,7 @@ class MCPServerTask:
                         )
                         self.session = session
                         await self._discover_tools()
-                        self._ready.set()
+                        self._safe_ready_set()
                         # Session is live again: clear any breaker state from a
                         # prior outage so the first call after recovery isn't
                         # gated on a stale consecutive-failure count (#16788).
@@ -3098,7 +3109,7 @@ class MCPServerTask:
             except InvalidMcpUrlError as exc:
                 logger.warning("%s", exc)
                 self._error = exc
-                self._ready.set()
+                self._safe_ready_set()
                 return
 
             # Pre-flight content-type probe (Streamable HTTP only; SSE is
@@ -3125,7 +3136,7 @@ class MCPServerTask:
                 except NonMcpEndpointError as exc:
                     logger.warning("%s", exc)
                     self._error = exc
-                    self._ready.set()
+                    self._safe_ready_set()
                     return
 
         self._reconnect_retries = 0
@@ -3257,7 +3268,7 @@ class MCPServerTask:
                             self.name, type(root).__name__, root,
                         )
                         self._error = exc
-                        self._ready.set()
+                        self._safe_ready_set()
                         return
 
                     if failure_class == "permanent":
@@ -3272,7 +3283,7 @@ class MCPServerTask:
                             self.name, type(root).__name__, root,
                         )
                         self._error = exc
-                        self._ready.set()
+                        self._safe_ready_set()
                         self._was_parked = True
                         self._deregister_tools()
                         self._reconnect_event.clear()
@@ -3304,7 +3315,7 @@ class MCPServerTask:
                             type(root).__name__, root,
                         )
                         self._error = exc
-                        self._ready.set()
+                        self._safe_ready_set()
                         self._was_parked = True
                         self._deregister_tools()
                         self._reconnect_event.clear()
@@ -3339,7 +3350,7 @@ class MCPServerTask:
                     # Check if shutdown was requested during the sleep
                     if self._shutdown_event.is_set():
                         self._error = exc
-                        self._ready.set()
+                        self._safe_ready_set()
                         return
                     continue
 
