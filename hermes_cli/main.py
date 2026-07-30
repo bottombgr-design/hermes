@@ -437,6 +437,7 @@ from hermes_cli.subcommands.sync import build_sync_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
 from hermes_cli.subcommands.model import build_model_parser
+from hermes_cli.subcommands.subagent import build_subagent_parser
 from hermes_cli.subcommands.setup import build_setup_parser
 
 from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
@@ -3010,13 +3011,23 @@ def _is_profile_api_key_provider(provider_id: str) -> bool:
         return False
 
 
-def select_provider_and_model(args=None):
+def select_provider_and_model(
+    args=None,
+    *,
+    initial_model=None,
+    initial_provider=None,
+):
     """Core provider selection + model picking logic.
 
     Shared by ``cmd_model`` (``hermes model``) and the setup wizard
     (``setup_model_provider`` in setup.py).  Handles the full flow:
     provider picker, credential prompting, model selection, and config
     persistence.
+
+    ``initial_model`` / ``initial_provider`` affect only the displayed current
+    selection and picker cursors. Persistence still uses the normal main-model
+    setup flows. Callers selecting for another target can therefore reuse the
+    complete picker without making the active primary route the UI default.
     """
     from hermes_cli.auth import (
         resolve_provider,
@@ -3031,16 +3042,18 @@ def select_provider_and_model(args=None):
     from hermes_cli.providers import resolve_provider_full
 
     config = load_config()
-    current_model = config.get("model")
-    if isinstance(current_model, dict):
-        current_model = current_model.get("default", "")
-    current_model = current_model or "(not set)"
+    initial_model_cursor = str(initial_model or "").strip()
+    configured_model = config.get("model")
+    if isinstance(configured_model, dict):
+        configured_model = configured_model.get("default", "")
+    current_model = initial_model_cursor or configured_model or "(not set)"
 
-    # Read effective provider the same way the CLI does at startup:
-    # config.yaml model.provider > env var > auto-detect
-    config_provider = None
+    # Read effective provider the same way the CLI does at startup, unless a
+    # secondary target supplied its own initial cursor:
+    # initial provider > config.yaml model.provider > env var > auto-detect
+    config_provider = str(initial_provider or "").strip() or None
     model_cfg = config.get("model")
-    if isinstance(model_cfg, dict):
+    if config_provider is None and isinstance(model_cfg, dict):
         config_provider = model_cfg.get("provider")
 
     effective_provider = (
@@ -3310,6 +3323,8 @@ def select_provider_and_model(args=None):
         base_url = provider_info["base_url"]
         short_url = base_url.replace("https://", "").replace("http://", "").rstrip("/")
         saved_model = provider_info.get("model", "")
+        if initial_model_cursor and active and key == active:
+            saved_model = initial_model_cursor
         model_hint = f" — {saved_model}" if saved_model else ""
         label = f"{name} ({short_url}){model_hint}"
         if active and key == active:
@@ -3397,6 +3412,9 @@ def select_provider_and_model(args=None):
                 "It may have been removed from config.yaml. No change."
             )
             return
+        if initial_model_cursor and selected_provider == active:
+            provider_info = dict(provider_info)
+            provider_info["model"] = initial_model_cursor
         _model_flow_named_custom(config, provider_info)
     elif selected_provider == "remove-custom":
         _remove_custom_provider(config)
@@ -4528,6 +4546,76 @@ def cmd_status(args):
     from hermes_cli.status import show_status
 
     show_status(args)
+
+
+def cmd_subagent(args):
+    """Inspect or pin the subagent model.
+
+    Dispatches on ``args.subagent_command``:
+
+        hermes subagent                     # status
+        hermes subagent model               # interactive picker
+        hermes subagent model <model>       # validated direct selection
+        hermes subagent model reset         # inherit parent
+        hermes subagent model --reset       # inherit parent (flag form)
+    """
+    from hermes_cli.subagent_model import (
+        get_subagent_model_status,
+        reset_subagent_model,
+        select_subagent_model_interactively,
+        set_subagent_model,
+    )
+
+    sub = getattr(args, "subagent_command", None)
+    if sub in {None, ""}:
+        _print_subagent_status(get_subagent_model_status())
+        return
+    if sub == "model":
+        model_arg = getattr(args, "model", None)
+        positional_reset = (
+            isinstance(model_arg, str) and model_arg.strip().lower() == "reset"
+        )
+        if getattr(args, "reset", False) or positional_reset:
+            _print_subagent_status(reset_subagent_model(), action="Reset")
+            return
+        if model_arg:
+            status = set_subagent_model(
+                model_arg,
+                provider=getattr(args, "provider", None) or None,
+            )
+            _print_subagent_status(status, action="Pinned")
+            return
+        _require_tty("subagent model")
+        status = select_subagent_model_interactively(
+            refresh=bool(getattr(args, "refresh", False))
+        )
+        if status is None:
+            print("  Subagent model selection cancelled.")
+            return
+        _print_subagent_status(status, action="Selected")
+        return
+
+    print("usage: hermes subagent [model [<model>|--reset|--refresh]]")
+
+
+def _print_subagent_status(status, action=None):
+    """Render a SubagentModelStatus to stdout.
+
+    `action` is a one-word prefix shown only on mutating operations
+    (e.g. "Pinned", "Reset") so the user sees what just happened.
+    Status display uses no prefix.
+    """
+    if status.inherits_parent:
+        label = "inherits parent"
+    else:
+        label = status.model or "(none)"
+        if status.provider:
+            label = f"{label} (provider: {status.provider})"
+
+    if action:
+        print(f"  {action} subagent model: {label}")
+    else:
+        print(f"  Subagent model: {label}")
 
 
 def cmd_cron(args):
@@ -11064,6 +11152,11 @@ def main():
     # model command  (parser built in hermes_cli/subcommands/model.py)
     # =========================================================================
     build_model_parser(subparsers, cmd_model=cmd_model)
+
+    # =========================================================================
+    # subagent command — inspect/pin the subagent model
+    # =========================================================================
+    build_subagent_parser(subparsers, cmd_subagent=cmd_subagent)
 
     from hermes_cli.moa_cmd import cmd_moa
 
