@@ -609,7 +609,12 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
                   busy={bulkBusy}
                   enabled={skill.enabled}
                   key={skill.name}
-                  meta={usageOf(skill) > 0 ? `×${compactNumber(usageOf(skill))}` : undefined}
+                  meta={usageOf(skill) > 0 ? `${compactNumber(usageOf(skill))} uses` : undefined}
+                  metaTitle={
+                    usageOf(skill) > 0
+                      ? `${compactNumber(usageOf(skill))} uses — Times this skill has been loaded across all sessions`
+                      : undefined
+                  }
                   onSelect={() => setSelectedSkill(skill.name)}
                   onToggle={enabled => void handleToggleSkill(skill, enabled)}
                   subtitle={skillSubtitle(skill)}
@@ -748,6 +753,12 @@ function SkillDetail({ onArchive, onEdit, skill }: { onArchive: () => void; onEd
         }
         title={skill.name}
       />
+      {typeof skill.usage === 'number' && skill.usage > 0 && (
+        <div className="flex items-center gap-2 border-t border-(--ui-border-subtle) pt-2.5 text-[0.72rem]">
+          <span className="text-(--ui-text-tertiary)">{t.skills.useCount}</span>
+          <span className="tabular-nums text-(--ui-text-secondary)">{compactNumber(skill.usage)}</span>
+        </div>
+      )}
       {editable && (
         <div className="flex items-center gap-2">
           <Button onClick={onEdit} size="xs" variant="text">
