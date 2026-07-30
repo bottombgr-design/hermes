@@ -1781,6 +1781,13 @@ def compress_context(
                     engine_name,
                 )
 
+        if hasattr(agent, "context_compressor") and agent.context_compressor:
+            cc = agent.context_compressor
+            cc.api_key = getattr(agent, "api_key", "")
+            cc.base_url = getattr(agent, "base_url", "")
+            cc.provider = getattr(agent, "provider", "")
+            cc.api_mode = getattr(agent, "api_mode", "")
+
         messages_before_compression = copy.deepcopy(messages)
         _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
         # Publish forward progress to the commit fence while the summary LLM
