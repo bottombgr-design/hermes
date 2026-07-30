@@ -14,16 +14,14 @@ import { ExpandableBlock } from '@/components/chat/expandable-block'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
 import { ZoomableImage } from '@/components/chat/zoomable-image'
+import { useOpenMediaFile } from '@/hooks/use-open-media-file'
 import { detectArtifact } from '@/lib/artifact-detect'
-import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
+import { normalizeExternalUrl, PrettyLink } from '@/lib/external-link'
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { parseMarkdownIntoBlocksCached } from '@/lib/markdown-blocks'
 import { preprocessMarkdown } from '@/lib/markdown-preprocess'
 import {
-  downloadGatewayMediaFile,
   isInlineMediaSrc,
-  isRemoteGateway,
-  mediaExternalUrl,
   mediaKind,
   mediaName,
   mediaPathFromMarkdownHref,
@@ -98,31 +96,12 @@ function preprocessWithTailRepair(text: string): string {
   }
 }
 
-function useOpenMediaFile(path: string) {
-  const [openFailed, setOpenFailed] = useState(false)
-
-  const open = () => {
-    if (window.hermesDesktop && isRemoteGateway()) {
-      setOpenFailed(false)
-      void downloadGatewayMediaFile(path).catch(() => setOpenFailed(true))
-    } else {
-      openExternalLink(mediaExternalUrl(path))
-    }
-  }
-
-  return { open, openFailed }
-}
-
 function OpenMediaFailedNote({ name }: { name: string }) {
-  return (
-    <span className="mt-1 block text-xs text-muted-foreground">
-      Couldn&apos;t fetch {name} from the gateway (missing, unreadable, or too large).
-    </span>
-  )
+  return <span className="mt-1 block text-xs text-muted-foreground">Couldn&apos;t open or download {name}.</span>
 }
 
 function OpenMediaButton({ kind, path }: { kind: 'audio' | 'video'; path: string }) {
-  const { open, openFailed } = useOpenMediaFile(path)
+  const { downloadsRemoteFile, open, openFailed } = useOpenMediaFile(path)
 
   return (
     <span className="block">
@@ -131,7 +110,7 @@ function OpenMediaButton({ kind, path }: { kind: 'audio' | 'video'; path: string
         onClick={open}
         type="button"
       >
-        Open {kind} file
+        {downloadsRemoteFile ? 'Download' : 'Open'} {kind} file
       </button>
       {openFailed && <OpenMediaFailedNote name={mediaName(path)} />}
     </span>
@@ -141,7 +120,7 @@ function OpenMediaButton({ kind, path }: { kind: 'audio' | 'video'; path: string
 function MediaAttachment({ path }: { path: string }) {
   const [src, setSrc] = useState('')
   const [failed, setFailed] = useState(false)
-  const { open, openFailed } = useOpenMediaFile(path)
+  const { downloadsRemoteFile, open, openFailed } = useOpenMediaFile(path)
   const kind = mediaKind(path)
   const name = mediaName(path)
 
@@ -190,7 +169,15 @@ function MediaAttachment({ path }: { path: string }) {
   if (kind === 'image' && src) {
     return (
       <span className="block">
-        <MarkdownImage alt={name} src={src} />
+        <MarkdownImage alt={name} downloadName={name} src={src} />
+        <button
+          className="mt-1 block bg-transparent text-xs font-medium text-muted-foreground underline underline-offset-4 decoration-current/20 hover:text-foreground"
+          onClick={open}
+          type="button"
+        >
+          {downloadsRemoteFile ? 'Download' : 'Open'} full file
+        </button>
+        {openFailed && <OpenMediaFailedNote name={name} />}
       </span>
     )
   }
@@ -314,7 +301,7 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
 // This is split from the image path because that path is built on hooks: a
 // conditional return inside it would have to sit after every hook call, which
 // would still fire an image resolve for media we never render as an image.
-export function MarkdownImage(props: ComponentProps<'img'>) {
+export function MarkdownImage(props: ComponentProps<'img'> & { downloadName?: string }) {
   const rawSrc = typeof props.src === 'string' ? props.src : ''
   const kind = rawSrc ? mediaKind(rawSrc) : 'file'
 
@@ -325,7 +312,13 @@ export function MarkdownImage(props: ComponentProps<'img'>) {
   return <MarkdownImageContent {...props} />
 }
 
-function MarkdownImageContent({ className, src, alt, ...props }: ComponentProps<'img'>) {
+function MarkdownImageContent({
+  className,
+  downloadName,
+  src,
+  alt,
+  ...props
+}: ComponentProps<'img'> & { downloadName?: string }) {
   const rawSrc = typeof src === 'string' ? src : ''
   const [resolvedSrc, setResolvedSrc] = useState(() => (rawSrc && isInlineMediaSrc(rawSrc) ? rawSrc : ''))
   const [failed, setFailed] = useState(false)
@@ -397,6 +390,7 @@ function MarkdownImageContent({ className, src, alt, ...props }: ComponentProps<
         className
       )}
       containerClassName="my-2 block w-fit max-w-[min(100%,var(--image-preview-max-width))]"
+      downloadName={downloadName}
       slot="aui_markdown-image"
       src={resolvedSrc}
       {...props}

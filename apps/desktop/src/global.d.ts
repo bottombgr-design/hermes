@@ -125,7 +125,7 @@ declare global {
       selectPaths: (options?: HermesSelectPathsOptions) => Promise<string[]>
       writeClipboard: (text: string) => Promise<boolean>
       readClipboard: () => Promise<string>
-      saveImageFromUrl: (url: string) => Promise<boolean>
+      saveImageFromUrl: (url: string, suggestedFilename?: string) => Promise<boolean>
       saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string) => Promise<string>
       saveClipboardImage: () => Promise<string>
       getPathForFile: (file: File) => string
