@@ -363,4 +363,3 @@ def test_adopt_rejects_empty_name(skills_home):
     from tools.skill_usage import adopt_skill
 
     assert adopt_skill("")[0] is False
-

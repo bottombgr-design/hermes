@@ -1,8 +1,8 @@
 # Relatório técnico — Issue #69678 e PRs relacionados
 
-**Data da análise:** 22 de julho de 2026  
-**Repositório:** `NousResearch/hermes-agent`  
-**Issue principal:** [#69678 — SQLite connections leaked in delivery, async delegation, and verification evidence ledgers](https://github.com/NousResearch/hermes-agent/issues/69678)  
+**Data da análise:** 22 de julho de 2026
+**Repositório:** `NousResearch/hermes-agent`
+**Issue principal:** [#69678 — SQLite connections leaked in delivery, async delegation, and verification evidence ledgers](https://github.com/NousResearch/hermes-agent/issues/69678)
 **PR principal:** [#69681 — fix(gateway,tools,agent): close leaked SQLite connections in delivery](https://github.com/NousResearch/hermes-agent/pull/69681)
 
 ## Resumo executivo
@@ -215,4 +215,3 @@ Evitar mudança mecânica global: alguns componentes podem manter conexão delib
 ## 📊 Infográfico: Vazamento de FDs e Correção
 
 ![Infográfico de Correção de SQLite Leaks](sqlite_leak_fix.png)
-

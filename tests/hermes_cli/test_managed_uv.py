@@ -983,4 +983,3 @@ class TestDefaultLiveVenv:
         assert _default_live_venv(root) == root / "venv"
         result = repair_vulnerable_runtime("uv", project_root=root)
         assert result.status == "not-applicable"
-
