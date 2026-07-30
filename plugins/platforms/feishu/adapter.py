@@ -97,6 +97,7 @@ try:
         CreateMessageRequestBody,
         GetChatRequest,
         GetMessageRequest,
+        ListMessageRequest,
         GetMessageResourceRequest,
         P2ImMessageMessageReadV1,
         ReplyMessageRequest,
@@ -2410,6 +2411,133 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Failed to get chat info for %s", chat_id, exc_info=True)
             return fallback
 
+    # =========================================================================
+    # History backfill (modeled on Discord adapter pattern)
+    # =========================================================================
+
+    def _feishu_history_backfill(self) -> bool:
+        """Return whether history backfill is enabled when @mentioned."""
+        _config = getattr(self, "config", None)
+        if _config is None:
+            return True  # default
+        configured = _config.extra.get("history_backfill")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off"}
+            return bool(configured)
+        return True  # default on, matching Discord
+
+    def _feishu_history_backfill_limit(self) -> int:
+        """Return max messages to scan backwards for context."""
+        _config = getattr(self, "config", None)
+        if _config is None:
+            return 50  # default
+        configured = _config.extra.get("history_backfill_limit")
+        if configured is not None:
+            try:
+                return int(configured)
+            except (ValueError, TypeError):
+                pass
+        return 50  # default 50, matching Discord
+
+    async def _fetch_feishu_channel_context(
+        self, chat_id: str, before_message_id: str,
+    ) -> str:
+        """Fetch recent chat messages for conversational context.
+
+        Scans backwards from *before_message_id* and collects messages until
+        it hits a message sent by this bot (the natural partition point between
+        bot turns) or reaches the backfill limit.
+
+        Returns a formatted block::
+
+            [Recent channel messages]
+            [sender1] message content
+            [sender2] message content
+
+        Returns empty string if no context available.
+        """
+        limit = self._feishu_history_backfill_limit()
+        if limit <= 0:
+            return ""
+
+        try:
+            request = (
+                ListMessageRequest.builder()
+                .container_id_type("chat")
+                .container_id(chat_id)
+                .page_size(min(limit, 50))
+                .sort_type("ByCreateTimeDesc")
+                .build()
+            )
+            response = await self._run_blocking(self._client.im.v1.message.list, request)
+            if not response or not getattr(response, "success", lambda: False)():
+                return ""
+
+            data = getattr(response, "data", None)
+            if not data:
+                return ""
+            items = getattr(data, "items", None) or []
+            if not items:
+                return ""
+
+            collected: List[str] = []
+            for msg in items:
+                msg_id = str(getattr(msg, "message_id", "") or "")
+                if not msg_id or msg_id == before_message_id:
+                    continue
+
+                # Stop at our own message — partition point.
+                sender = getattr(msg, "sender", None)
+                sender_type = str(getattr(sender, "sender_type", "") or "")
+                sender_id = str(getattr(sender, "id", "") or "")
+                if sender_type == "app" and sender_id == self._app_id:
+                    break
+
+                # Extract text content.
+                msg_type = str(getattr(msg, "msg_type", "") or "")
+                body = getattr(msg, "body", None)
+                raw_content = str(getattr(body, "content", "") or "")
+                if not raw_content:
+                    continue
+                if msg_type == "text":
+                    try:
+                        parsed = json.loads(raw_content)
+                        raw_content = str(parsed.get("text", raw_content))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                elif msg_type in ("image", "file", "audio", "video"):
+                    raw_content = f"({msg_type})"
+                elif msg_type == "post":
+                    raw_content = "(rich text)"
+                else:
+                    continue
+
+                # Skip self-mention placeholder suffix like @_user_123.
+                raw_content = _MENTION_RE.sub("", raw_content).strip()
+                if not raw_content:
+                    # Only media with no caption.
+                    if msg_type in ("image", "file", "audio", "video"):
+                        raw_content = f"({msg_type})"
+                    else:
+                        continue
+
+                # Format sender name.
+                sender_display = sender_id.split("_")[-1][:8] if "_" in sender_id else sender_id[:12]
+                collected.append(f"[{sender_display}] {raw_content}")
+
+            if not collected:
+                return ""
+
+            # Reverse to chronological order (API returned newest-first).
+            collected.reverse()
+            context = "[Recent channel messages]\n" + "\n".join(collected)
+            return context
+
+        except Exception:
+            logger.debug("[Feishu] Failed to fetch channel context", exc_info=True)
+            return ""
+
     def format_message(self, content: str) -> str:
         """Feishu text messages are plain text by default."""
         return content.strip()
@@ -3335,9 +3463,16 @@ class FeishuAdapter(BasePlatformAdapter):
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
             thread_id=thread_id,
-            user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
+            user_id_alt=sender_profile["user_id_alt"],
         )
+
+        # ── History backfill: when @mentioned in a group, fetch recent context ──
+        if chat_type != "p2p" and mentions and self._feishu_history_backfill():
+            _backfill = await self._fetch_feishu_channel_context(chat_id, message_id)
+            if _backfill:
+                text = f"{_backfill}\n\n{text}"
+
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,

@@ -2301,6 +2301,168 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         self.assertNotIn("[Mentioned:", event.text)
         self.assertTrue(event.text.startswith("/model"))
 
+    def test_mid_text_self_mention_preserved(self):
+        adapter = self._build_adapter()
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "stop pinging @_user_1 please"}),
+            message_type="text",
+            message_id="m4",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="m4",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertEqual(event.text, "stop pinging @Hermes please")
+
+    def test_pure_self_mention_message_is_ignored(self):
+        """A message containing only '@Bot' (no body, no media) must not dispatch.
+
+        Regression guard: the rendered '@Hermes' slips past the pre-strip empty
+        guard; the post-strip guard must catch it.
+        """
+        adapter = self._build_adapter()
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "@_user_1"}),
+            message_type="text",
+            message_id="m5",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message, message=message, sender_id=None,
+                chat_type="group", message_id="m5",
+            )
+        )
+        adapter._dispatch_inbound_event.assert_not_called()
+
+    # ── History backfill tests ──────────────────────────────────────────────
+
+    def test_backfill_fetches_context_when_mentioned_in_group(self):
+        """When @mentioned in a group with backfill default, context is prepended."""
+        adapter = self._build_adapter()
+        adapter._fetch_feishu_channel_context = AsyncMock(
+            return_value="[Recent channel messages]\n[Alice] hello\n[Bob] world"
+        )
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "@_user_1 what do you think?"}),
+            message_type="text",
+            message_id="m_b1",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+            root_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="m_b1",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertIn("[Recent channel messages]", event.text)
+        self.assertIn("[Alice] hello", event.text)
+        self.assertIn("what do you think?", event.text)
+        self.assertLess(
+            event.text.index("[Recent channel messages]"),
+            event.text.index("what do you think?"),
+        )
+
+    def test_backfill_skipped_for_p2p_messages(self):
+        """Backfill must not run for direct messages (p2p)."""
+        adapter = self._build_adapter()
+        adapter._fetch_feishu_channel_context = AsyncMock(return_value="[Recent channel messages]\ndata")
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "hi"}),
+            message_type="text",
+            message_id="m_b2",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+            root_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="p2p",
+                message_id="m_b2",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertEqual(event.text, "hi")
+        adapter._fetch_feishu_channel_context.assert_not_called()
+
+    def test_backfill_skipped_when_no_mentions(self):
+        """Backfill must not run for messages without @mentions."""
+        adapter = self._build_adapter()
+        adapter._fetch_feishu_channel_context = AsyncMock(return_value="[Recent channel messages]\ndata")
+        message = SimpleNamespace(
+            content=json.dumps({"text": "hello everyone"}),
+            message_type="text",
+            message_id="m_b3",
+            mentions=[],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+            root_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="m_b3",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertEqual(event.text, "hello everyone")
+        adapter._fetch_feishu_channel_context.assert_not_called()
+
 
 class TestFeishuFetchMessageText(unittest.TestCase):
     def _build_adapter(self):
