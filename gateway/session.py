@@ -1356,8 +1356,45 @@ class SessionStore:
                 row = db.get_session(entry.session_id)
                 # row is None        -> not in DB (legacy / pre-SQLite) — keep
                 # end_reason is None  -> session alive — keep
-                # end_reason not None -> session ended — prune
+                # end_reason not None -> session ended — maybe prune
                 if row is not None and row.get("end_reason") is not None:
+                    end_reason = row["end_reason"]
+                    # Keep crash-interrupted entries for /resume recovery.
+                    if end_reason == "crash_interrupted":
+                        continue
+                    # Belt-and-braces: a session_reset ended within the crash
+                    # window (5 min before this boot) was almost certainly killed
+                    # by the same SIGTERM/fsfreeze chain that crash_interrupted
+                    # catches, but never received the marker because the gateway
+                    # was killed mid-drain before suspend_recently_active() ran.
+                    # Preserve it for /resume recovery rather than pruning.
+                    if end_reason == "session_reset":
+                        ended_at_raw = row.get("ended_at") or row.get("updated_at")
+                        if ended_at_raw is not None:
+                            try:
+                                from datetime import timedelta as _td
+                                ended_at = None
+                                if isinstance(ended_at_raw, (int, float)):
+                                    ended_at = datetime.fromtimestamp(float(ended_at_raw))
+                                elif isinstance(ended_at_raw, str):
+                                    _parsed = datetime.fromisoformat(
+                                        ended_at_raw.replace("Z", "+00:00")
+                                    )
+                                    # Normalize to naive local time for comparison
+                                    # with _now() which is also naive.
+                                    if _parsed.tzinfo is not None:
+                                        _parsed = _parsed.replace(tzinfo=None)
+                                    ended_at = _parsed
+                                if ended_at is not None and (_now() - ended_at) < _td(minutes=5):
+                                    logger.info(
+                                        "gateway.session: preserving session_reset entry "
+                                        "%r -> %s (ended %ss ago, within crash window)",
+                                        key, entry.session_id,
+                                        int((_now() - ended_at).total_seconds()),
+                                    )
+                                    continue
+                            except Exception:
+                                pass  # parsing failed — fall through to normal prune logic
                     recovered_entry = None
                     recovery_lookup_failed = False
                     if entry.origin is not None:
@@ -2304,6 +2341,7 @@ class SessionStore:
         auto_reset_reason = None
         reset_had_activity = False
         prev_session_id: Optional[str] = None
+        superseded_resume_reason: Optional[str] = None
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -2339,6 +2377,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        superseded_resume_reason = entry.resume_reason
                     entry = None
                     _needs_recover = True
                 elif entry.session_id != _stale_session_id:
@@ -2354,6 +2393,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        superseded_resume_reason = entry.resume_reason
                         self._entries.pop(session_key, None)
                         entry = None
                         _needs_recover = True
@@ -2433,7 +2473,10 @@ class SessionStore:
             # Use the specific reset reason so state.db is auditable (e.g.
             # "resume_pending_expired" is distinguishable from a normal
             # "session_reset" caused by idle/daily expiry).
-            _db_end_reason = auto_reset_reason if auto_reset_reason else "session_reset"
+            if superseded_resume_reason == "restart_interrupted":
+                _db_end_reason = "crash_interrupted"
+            else:
+                _db_end_reason = auto_reset_reason if auto_reset_reason else "session_reset"
             try:
                 # promote_to_session_reset, not end_session: the row may
                 # already be ended with a recoverable accidental reason
