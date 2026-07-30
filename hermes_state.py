@@ -227,6 +227,7 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
             f"WHERE parent_session_id IN ({ph})",
             ids,
         )
+        conn.execute(f"DELETE FROM session_topics WHERE session_id IN ({ph})", ids)
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
     return ids
 
@@ -4481,6 +4482,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if ids:
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
+                    f"DELETE FROM session_topics WHERE session_id IN ({placeholders})", ids
+                )
+                conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
                 )
             return ids
@@ -4736,6 +4740,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         :meth:`set_session_title`.
         """
         return self._set_session_title(session_id, title, only_if_empty=True)
+
+    def set_topic_session_title(self, session_id: str) -> Optional[str]:
+        """Set session title from the first topic name + optional count suffix.
+
+        Format: '<first_topic>' or '<first_topic> (+N topics)'.
+        Returns the title string or None if no topics exist.
+        """
+        topics = self.get_topics(session_id)
+        if not topics:
+            return None
+
+        first = topics[0]["title"]
+        total = len(topics)
+        title = first if total == 1 else f"{first} (+{total - 1} topics)"
+        self.set_session_title(session_id, title)
+        return title
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -5817,7 +5837,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.fetchone() is not None
 
     def archive_and_compact(
-        self, session_id: str, compacted_messages: List[Dict[str, Any]]
+        self, session_id: str, compacted_messages: List[Dict[str, Any]],
+        topic_id: Optional[int] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -5844,16 +5865,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
 
         def _do(conn):
-            # Soft-archive the live turns: active=0 hides them from the live
-            # context load, compacted=1 marks them as "summarized away" (vs
-            # rewind/undo's active=0+compacted=0, which means "user took it
-            # back"). search_messages includes compacted=1 rows by default so
-            # the pre-compaction transcript stays discoverable; live-context
-            # loads (active=1 only) still exclude them.
+            # Soft-archive the live turns for this topic (or all if topic_id=None).
+            where = "session_id = ? AND active = 1"
+            params: list = [session_id]
+            if topic_id is not None:
+                where += " AND topic_id = ?"
+                params.append(topic_id)
             conn.execute(
-                "UPDATE messages SET active = 0, compacted = 1 "
-                "WHERE session_id = ? AND active = 1",
-                (session_id,),
+                f"UPDATE messages SET active = 0, compacted = 1 WHERE {where}",
+                params,
             )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages
@@ -6827,6 +6847,116 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    # ── Topic Management ───────────────────────────────────────────────
+
+    def create_topic(
+        self,
+        session_id: str,
+        title: str,
+        summary: Optional[str] = None,
+    ) -> int:
+        """Create a new topic in a session. Returns the topic row ID."""
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO session_topics
+                   (session_id, title, summary, state, created_at, last_active_at)
+                   VALUES (?, ?, ?, 'active', ?, ?)""",
+                (session_id, title, summary, now, now),
+            )
+            return cursor.lastrowid
+
+        return self._execute_write(_do)
+
+    def get_topics(self, session_id: str) -> List[Dict[str, Any]]:
+        """Return all topics for a session, most recently active first."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, title, summary, message_count, state,
+                          created_at, last_active_at
+                   FROM session_topics
+                   WHERE session_id = ?
+                   ORDER BY last_active_at DESC""",
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_active_topic(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the currently active topic, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT id, title, summary, message_count, state,
+                          created_at, last_active_at
+                   FROM session_topics
+                   WHERE session_id = ? AND state = 'active'
+                   ORDER BY last_active_at DESC LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_active_topic(self, session_id: str, topic_id: int) -> bool:
+        """Set the active topic for a session. Archives the previous active."""
+        now = time.time()
+
+        def _do(conn):
+            # Archive current active topic
+            conn.execute(
+                """UPDATE session_topics
+                   SET state = 'warm', last_active_at = ?
+                   WHERE session_id = ? AND state = 'active'""",
+                (now, session_id),
+            )
+            # Activate the target topic
+            cursor = conn.execute(
+                """UPDATE session_topics
+                   SET state = 'active', last_active_at = ?
+                   WHERE id = ? AND session_id = ?""",
+                (now, topic_id, session_id),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def update_topic_message_count(self, topic_id: int, count_delta: int = 1) -> None:
+        """Increment or decrement message count for a topic."""
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE session_topics
+                   SET message_count = message_count + ?,
+                       last_active_at = ?
+                   WHERE id = ?""",
+                (count_delta, time.time(), topic_id),
+            )
+
+        self._execute_write(_do)
+
+    def get_topic_messages(
+        self,
+        session_id: str,
+        topic_id: int,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Load all messages for a specific topic, active=1 only by default."""
+        active_clause = "" if include_inactive else " AND active = 1"
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT * FROM messages
+                    WHERE session_id = ? AND topic_id = ?{active_clause}
+                    ORDER BY id""",
+                (session_id, topic_id),
+            ).fetchall()
+        result = []
+        for row in rows:
+            msg = dict(row)
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            result.append(msg)
+        return result
+
+    # ── End Topic Management ───────────────────────────────────────────
+
     @staticmethod
     def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
         """Remove on-disk transcript files for a session.
@@ -6919,6 +7049,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM session_topics WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return True
 
@@ -6951,7 +7082,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _do(conn):
             cursor = conn.execute(
                 """
-                DELETE FROM sessions
+                SELECT 1 FROM sessions
                 WHERE id = ?
                   AND title IS NULL
                   AND NOT EXISTS (
@@ -6964,7 +7095,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """,
                 (session_id,),
             )
-            return cursor.rowcount > 0
+            if cursor.fetchone() is None:
+                return False
+            conn.execute("DELETE FROM session_topics WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            return True
 
         deleted = self._execute_write(_do)
         if deleted:
@@ -7038,6 +7173,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             conn.execute(
                 f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
+                existing,
+            )
+            conn.execute(
+                f"DELETE FROM session_topics WHERE session_id IN ({existing_placeholders})",
                 existing,
             )
             conn.execute(
@@ -7136,6 +7275,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # real row count, we still leave a clean FK state.
                 conn.execute(
                     "DELETE FROM messages WHERE session_id = ?", (sid,)
+                )
+                conn.execute(
+                    "DELETE FROM session_topics WHERE session_id = ?", (sid,)
                 )
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
@@ -7475,6 +7617,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM session_topics WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             return len(session_ids)
