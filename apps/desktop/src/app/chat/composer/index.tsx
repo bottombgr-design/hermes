@@ -1028,6 +1028,11 @@ export function ChatBar({
               : 'absolute bottom-0 left-1/2 w-[min(var(--composer-width),calc(100%-2rem))] max-w-full -translate-x-1/2 pt-2 pb-[var(--composer-shell-pad-block-end)]',
             dragging && 'cursor-grabbing select-none touch-none'
           )}
+          // Text eligibility is read directly from the editor by preload at
+          // gesture time. React's derived `hasText` can lag the final DOM
+          // keystroke, so using it here would silently drop fast-Enter
+          // provenance even though submitDraft correctly sends that text.
+          data-direct-action-eligible={!busy && attachments.length === 0 ? 'true' : undefined}
           data-drag-active={dragActive ? '' : undefined}
           data-popped-out={poppedOut ? '' : undefined}
           data-slot="composer-root"

@@ -1,10 +1,62 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
+import { installDirectActionGestureCapture } from '../shared/direct-action-gesture'
+
+interface DirectActionGestureClaim {
+  eventId: string
+  gestureToken: string
+}
+
+let pendingDirectActionGesture: Promise<DirectActionGestureClaim | null> | null =
+  null
+
+// The isolated preload observes only OS-trusted composer-submit gestures.
+// Renderer code cannot synthesize ``isTrusted`` or obtain the opaque gesture
+// token. Canonical text is captured before any asynchronous session work.
+installDirectActionGestureCapture(window, canonicalText => {
+  pendingDirectActionGesture = ipcRenderer
+    .invoke('hermes:direct-action:begin', { text: canonicalText })
+    .catch(() => null)
+})
+
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  getDirectActionIdentity: profile => ipcRenderer.invoke('hermes:direct-action:identity', profile),
+  mintDirectActionPrompt: async request => {
+    const claim = await pendingDirectActionGesture
+
+    if (!claim) {
+      return null
+    }
+
+    return ipcRenderer.invoke('hermes:direct-action:mint-prompt', {
+      gestureToken: claim.gestureToken,
+      text: request?.text
+    })
+  },
+  retireDirectActionPrompt: async eventId => {
+    const claim = await pendingDirectActionGesture
+
+    if (!claim || claim.eventId !== eventId) {
+      return false
+    }
+
+    const retired = await ipcRenderer
+      .invoke('hermes:direct-action:retire', {
+        eventId,
+        gestureToken: claim.gestureToken
+      })
+      .catch(() => false)
+
+    if (retired) {
+      pendingDirectActionGesture = null
+    }
+
+    return Boolean(retired)
+  },
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),

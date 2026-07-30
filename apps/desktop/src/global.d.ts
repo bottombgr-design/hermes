@@ -28,6 +28,11 @@ declare global {
       // reaper spares it while its chat is active.
       touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
       getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
+      getDirectActionIdentity: (profile?: null | string) => Promise<DesktopDirectActionIdentity | null>
+      mintDirectActionPrompt: (request: {
+        text: string
+      }) => Promise<DesktopDirectActionProvenance | null>
+      retireDirectActionPrompt: (eventId: string) => Promise<boolean>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
       // with an error code when the sessionId is empty/invalid. `watch` opens
@@ -495,6 +500,35 @@ export interface DesktopActiveProfile {
   // The desktop's stored profile preference, or null when unset (legacy launch
   // that defers to the sticky active_profile / default).
   profile: string | null
+}
+
+export interface DesktopDirectActionIdentity {
+  version: 1
+  surface: 'desktop'
+  surfaceAccount: string
+  surfacePrincipal: string
+  chatOrWindow: string
+  appIdentity: string
+  profile: string
+  publicKeyFingerprint: string
+  publicKeyPath: string
+  publicKeyPem: string
+}
+
+export interface DesktopDirectActionProvenance {
+  payload: {
+    version: 2
+    event_id: string
+    observed_at: string
+    installation_id: string
+    os_account: string
+    app_identity: string
+    app_instance_id: string
+    window_id: string
+    text_hash: string
+  }
+  public_key_fingerprint: string
+  signature: string
 }
 
 export interface DesktopConnectionConfig {
