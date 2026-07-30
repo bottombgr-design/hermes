@@ -384,30 +384,33 @@ def _cwd_marker(session_id: str) -> str:
 
 # Per-session variables that the gateway bridges freshly onto every command's
 # process environment (via tools/environments/local._inject_session_context_env,
-# reading gateway.session_context._VAR_MAP). They must NEVER be persisted into
-# the shared bash session snapshot: a single long-lived backend serves many
-# concurrent sessions (the messaging gateway, TUI, desktop/web dashboard all
-# collapse the terminal to one "default" environment), so ``export -p`` dumping
-# the FIRST session's HERMES_SESSION_ID into the snapshot makes every LATER
-# session ``source`` that stale value and see a FOREIGN session's identity —
-# overriding the correct per-command Popen env (issue: cross-session
-# HERMES_SESSION_ID leak via the shared snapshot). Stripping them from the
-# snapshot is safe because they are re-injected on every command; a snapshot
-# should only carry the user's own shell state (PATH, functions, exports they
-# set), not Hermes' per-turn session identity.
+# reading gateway.session_context._VAR_MAP) must NEVER be persisted into the
+# shared bash session snapshot.
 #
 # Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
-# with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
-# as the Python-side contract for the exclusion set; the dump path unsets by
-# name/prefix instead of grepping declare lines (see below / issue #71296).
+# with one of these prefixes (or is HERMES_UI_SESSION_ID). Structural
+# HOME/HERMES_HOME filtering is enabled separately by LocalEnvironment, the
+# backend that injects authoritative HOME/HERMES_HOME/HERMES_REAL_HOME values
+# and process/profile baseline on every spawned command. Remote/init-only
+# backends must retain legitimate bootstrap values in their snapshot.
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
 )
+_LOCAL_SNAPSHOT_EXCLUDED_ENV_REGEX = (
+    "^declare -x (HOME=|HERMES_HOME=|HERMES_REAL_HOME=|HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+)
 
+def _export_dump_excluding_session_vars(
+    tmp_path: str,
+    *,
+    exclude_structural_home: bool = False,
+) -> str:
+    """Dump exported shell state while removing cross-session identity vars.
 
-def _export_dump_excluding_session_vars(tmp_path: str) -> str:
-    """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
-    per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``).
+    Session-routing variables are supplied fresh by the command environment and
+    must not survive in the shared snapshot. LocalEnvironment also asks this
+    helper to remove structural home variables because it supplies their
+    authoritative values on every process spawn.
 
     Unset the bridged vars in a subshell *before* ``export -p``. A line-based
     ``grep -vE`` filter is unsafe: bash 3.2 prints a value containing a newline
@@ -418,20 +421,18 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     means ``export -p`` never emits those vars — including any continuation
     lines. ``|| true`` keeps the success contract for callers that chain on it.
 
-    The dump MUST be wrapped in a brace group with the redirection applied to
-    the group. *tmp_path* typically embeds ``$BASHPID`` for concurrency-safe
-    temp names; a redirection attached to a pipeline segment would expand
-    ``$BASHPID`` inside that segment's subshell (a different PID than the
-    parent that expands the follow-up ``mv``), silently orphaning the dump.
-    The brace-group redirect is expanded in the current shell, keeping both
-    expansions consistent.
+    The dump is wrapped in a brace group with the redirection applied to the
+    group so callers' quoted runtime path from ``mktemp`` is used unchanged.
     """
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
+    structural_names = (
+        "HOME HERMES_HOME HERMES_REAL_HOME " if exclude_structural_home else ""
+    )
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "HERMES_UI_SESSION_ID 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID {structural_names}2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
@@ -456,6 +457,12 @@ class BaseEnvironment(ABC):
 
     # Snapshot creation timeout (override for slow cold-starts).
     _snapshot_timeout: int = 30
+
+    # Remote and container backends may forward environment only at bootstrap,
+    # then rely on the snapshot for later commands. Keep their legitimate
+    # structural-home values; LocalEnvironment overrides this with the stricter
+    # policy because it reapplies authoritative values on every process spawn.
+    _snapshot_exclude_structural_home: bool = False
 
     def get_temp_dir(self) -> str:
         """Return the backend temp directory used for session artifacts.
@@ -542,19 +549,16 @@ class BaseEnvironment(ABC):
         # source() either sees the old complete snapshot or the new complete
         # one — never a partial/truncated file.
         #
-        # The temp name MUST be unique per concurrent writer.  ``$$`` is the
-        # bash PID, but in ``&``-launched subshells (how concurrent terminal
-        # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
-        # writers would pick the SAME temp name, clobber each other's temp
-        # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
-        # static path is shell-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # Allocate a unique file atomically for every writer. macOS ships Bash
+        # 3.2, where BASHPID is unset; PID-derived names therefore collapse to
+        # one shared path under concurrent writers. mktemp is available on all
+        # supported Bash backends (including Git Bash) and closes that race.
+        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXX")
+        _snap_tmp = '"$__hermes_snap_tmp"'
         bootstrap = (
             f"umask 077\n"
-            f"{_export_dump_excluding_session_vars(_snap_tmp)}\n"
+            f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
+            f"{_export_dump_excluding_session_vars(_snap_tmp, exclude_structural_home=self._snapshot_exclude_structural_home)}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -662,11 +666,11 @@ class BaseEnvironment(ABC):
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
-        # writers never share a temp name and clobber each other before the mv.
-        # Static path shell-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # truncated/half-written file. Use mktemp rather than PID-derived names:
+        # Bash 3.2 (the macOS system shell) leaves BASHPID unset, while ``$$``
+        # stays the parent PID in ``&``-launched subshells.
+        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXX")
+        _snap_tmp = '"$__hermes_snap_tmp"'
 
         parts = []
 
@@ -698,14 +702,16 @@ class BaseEnvironment(ABC):
         # Chain mv on the export succeeding so a failed/partial dump never
         # replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
-        # NOTE: the redirection must be attached to a brace group — ``_snap_tmp``
-        # embeds ``$BASHPID``, and a redirect on a pipeline segment expands
-        # inside that segment's subshell (a different PID than the parent that
-        # expands the ``mv`` operand), silently orphaning the dump. See
+        # NOTE: the redirection must remain attached to the dump's brace group.
+        # Moving it can change expansion or pipeline semantics. See
         # _export_dump_excluding_session_vars.
         if self._snapshot_ready:
             parts.append(
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp)} "
+                f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || __hermes_snap_tmp=''"
+            )
+            parts.append(
+                f"[ -n \"$__hermes_snap_tmp\" ] && {{ "
+                f"{_export_dump_excluding_session_vars(_snap_tmp, exclude_structural_home=self._snapshot_exclude_structural_home)} "
                 f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
             )
