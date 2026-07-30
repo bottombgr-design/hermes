@@ -2716,6 +2716,10 @@ def terminal_tool(
                 from tools.interrupt import clear_current_thread_interrupt
                 clear_current_thread_interrupt()
 
+            # Capture the env's cwd before the command so a per-command
+            # workdir= override can be fully reverted afterward (#73683).
+            _pre_command_env_cwd = getattr(env, "cwd", None) if workdir else None
+
             while retry_count <= max_retries:
                 try:
                     command_cwd = _resolve_command_cwd(
@@ -2763,13 +2767,21 @@ def terminal_tool(
                 # Got a result
                 break
 
-            # Dual-write (cwd rearch step 1): the env's post-command tracking
-            # (marker parse / local sync) has just updated env.cwd with the
-            # directory this command finished in. That cwd belongs to THIS
-            # session — record it under the session key so the durable record
-            # never depends on the shared env surviving or on who drives the
-            # env next.
-            record_session_cwd(session_key, getattr(env, "cwd", None))
+            # Per-command workdir= override: the env's post-command tracking
+            # has updated env.cwd to the command's end directory, but that was
+            # a one-off override — it must not mutate session-scoped state.
+            # Restore the env's pre-command cwd (so the shared env doesn't
+            # leak the workdir to other sessions) and skip the durable
+            # session-record write so subsequent commands and the desktop
+            # session-folder UI keep pointing at the session's real cwd
+            # (#73683).
+            if workdir:
+                if _pre_command_env_cwd is not None:
+                    env.cwd = _pre_command_env_cwd
+            else:
+                # Normal command: record the env's post-command cwd so the
+                # durable record tracks the session's `cd` state.
+                record_session_cwd(session_key, getattr(env, "cwd", None))
 
             # Extract output
             output = result.get("output", "")
