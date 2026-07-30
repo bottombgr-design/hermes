@@ -7961,19 +7961,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
-        self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
-        )
         # /new is a full conversation boundary: session-scoped runtime
         # overrides (/model --session, /fast, one-turn restores) do not carry
         # forward.  Re-derive model/provider and service tier from config.yaml
         # so a session-only switch never leaks into the next session (#48055,
         # #23131).
+        #
+        # Read fresh from disk via load_cli_config() instead of the module-level
+        # CLI_CONFIG snapshot — the latter is loaded once at import time and
+        # never refreshed, so edits to config.yaml made after the CLI started
+        # (e.g. `hermes config set model.default ...`) would be invisible to
+        # /new and silently reset the model to the stale import-time value
+        # (#71188).  The same staleness applies to the agent-scoped settings
+        # re-derived below; re-read them from the fresh config too.
+        _fresh_config = load_cli_config()
+        self.reasoning_config = _parse_reasoning_config(
+            _fresh_config["agent"].get("reasoning_effort", "")
+        )
         self._pending_one_turn_model_restore = None
         self.service_tier = _parse_service_tier_config(
-            CLI_CONFIG["agent"].get("service_tier", "")
+            _fresh_config["agent"].get("service_tier", "")
         )
-        _model_config = CLI_CONFIG.get("model", {})
+        _model_config = _fresh_config.get("model", {})
         _config_model = (
             (_model_config.get("default") or _model_config.get("model") or "")
             if isinstance(_model_config, dict)
