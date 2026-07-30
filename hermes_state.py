@@ -31,6 +31,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
+from agent.persistence_markers import _DB_MESSAGE_ROW_ID
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
     SKILL_SCAFFOLD_SQL_LIKE,
@@ -5623,6 +5624,90 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return bool(self._execute_write(_do))
 
+    def update_tool_message_content(
+        self,
+        message_row_id: Optional[int],
+        content: Any,
+        session_id: str,
+        *,
+        tool_call_id: Optional[str] = None,
+        compression_lock_holder: Optional[str] = None,
+    ) -> Optional[int]:
+        """Update an intentionally mutated active tool row and return its id.
+
+        ``message_row_id`` is exact for rows inserted by the live agent or
+        loaded for live replay. ``tool_call_id`` is a fallback for an atomic
+        transcript rewrite that replaced the SQLite row id, and is accepted
+        only when it resolves uniquely. FTS update triggers keep search indexes
+        in sync.
+        """
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            active_lock = conn.execute(
+                "SELECT holder FROM compression_locks "
+                "WHERE session_id = ? AND expires_at > ?",
+                (session_id, time.time()),
+            ).fetchone()
+            if (
+                active_lock is not None
+                and active_lock["holder"] != compression_lock_holder
+            ):
+                raise CompressionSessionBusyError(
+                    f"Session {session_id!r} is being compressed by another writer"
+                )
+            session = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if (
+                session is not None
+                and session["ended_at"] is not None
+                and session["end_reason"] == "compression"
+            ):
+                raise CompressionSessionClosedError(session_id)
+
+            row = None
+            if message_row_id is not None:
+                row = conn.execute(
+                    "SELECT id FROM messages "
+                    "WHERE id = ? AND session_id = ? "
+                    "AND role = 'tool' AND active = 1",
+                    (message_row_id, session_id),
+                ).fetchone()
+            if row is None and tool_call_id:
+                matches = conn.execute(
+                    "SELECT id FROM messages "
+                    "WHERE session_id = ? AND role = 'tool' "
+                    "AND tool_call_id = ? AND active = 1 "
+                    "ORDER BY id LIMIT 2",
+                    (session_id, tool_call_id),
+                ).fetchall()
+                # Durable transcripts may contain retry/crash duplicates that
+                # live replay repairs by keeping only the first. Never guess
+                # which duplicate a metadata-free message represents.
+                if len(matches) == 1:
+                    row = matches[0]
+            if row is None:
+                return None
+            resolved_row_id = int(row["id"])
+            conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ?",
+                (stored_content, resolved_row_id),
+            )
+            return resolved_row_id
+
+        updated_row_id = self._execute_write(_do)
+        if updated_row_id is None:
+            logger.warning(
+                "update_tool_message_content matched no active row "
+                "(id=%s session_id=%s tool_call_id=%s)",
+                message_row_id,
+                session_id,
+                tool_call_id,
+            )
+        return updated_row_id
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
@@ -6119,8 +6204,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         otherwise re-triggers the pre-request defensive repair on every
         single request for the rest of the session's life — the repair
         mutates only the per-request list, never the stored transcript.
-        Inspection/export consumers keep the default and see the transcript
-        verbatim.
+        Live tool rows also carry a private SQLite row id so intentional
+        post-load mutations can update the exact durable row. Inspection/export
+        consumers keep the default and see the transcript verbatim.
         """
         session_ids = [session_id]
         if include_ancestors:
@@ -6130,7 +6216,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+                "SELECT id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
                 "api_content, display_kind, display_metadata "
@@ -6158,7 +6244,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # get_messages_as_conversation and get_resume_conversations so a single
     # SELECT can feed both the model-fed and display views.
     _CONVERSATION_ROW_COLUMNS = (
-        "role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+        "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
         "api_content, display_kind, display_metadata"
@@ -6185,6 +6271,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            if repair_alternation and row["role"] == "tool":
+                msg[_DB_MESSAGE_ROW_ID] = int(row["id"])
             # api_content is the byte-fidelity sidecar: the exact string sent
             # to the API when it differed from the clean content. Returned
             # VERBATIM — no sanitize_context, no strip — because the replay

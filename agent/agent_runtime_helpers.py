@@ -33,6 +33,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
+from agent.persistence_markers import (
+    _DB_CONTENT_UPDATE_PENDING,
+    _STEER_BUDGET_PROTECTED_SUFFIX,
+)
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -3643,7 +3647,13 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
 
 
 
-def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
+def apply_pending_steer_to_tool_results(
+    agent,
+    messages: list,
+    num_tool_msgs: int,
+    *,
+    protect_from_budget: bool = False,
+) -> None:
     """Append any pending /steer text to the last tool result in this turn.
 
     Called at the end of a tool-call batch, before the next API call.
@@ -3656,6 +3666,8 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         messages: The running messages list.
         num_tool_msgs: Number of tool results appended in this batch;
             used to locate the tail slice safely.
+        protect_from_budget: Preserve the exact appended suffix across the
+            aggregate tool-result budget that follows a per-tool drain.
     """
     if num_tool_msgs <= 0 or not messages:
         return
@@ -3700,6 +3712,17 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             messages[target_idx]["content"] = f"{existing_content}{marker}"
     else:
         messages[target_idx]["content"] = existing_content + marker
+        if protect_from_budget:
+            prior_suffix = messages[target_idx].get(
+                _STEER_BUDGET_PROTECTED_SUFFIX, ""
+            )
+            messages[target_idx][_STEER_BUDGET_PROTECTED_SUFFIX] = (
+                prior_suffix + marker if isinstance(prior_suffix, str) else marker
+            )
+    # The result may already have been incrementally flushed. Mark only this
+    # intentional mutation for an in-place durable update; generic content
+    # drift can also come from sequence repair and must not rewrite other rows.
+    messages[target_idx][_DB_CONTENT_UPDATE_PENDING] = True
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

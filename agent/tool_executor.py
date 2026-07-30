@@ -1297,7 +1297,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # ── Per-tool /steer drain ───────────────────────────────────
         # Same as the sequential path: drain between each collected
         # result so the steer lands as early as possible.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
+        agent._apply_pending_steer_to_tool_results(
+            messages, 1, protect_from_budget=True
+        )
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools = len(parsed_calls)
@@ -1368,7 +1370,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 stage=f"invalid tool arguments {function_name}",
             ):
                 return
-            agent._apply_pending_steer_to_tool_results(messages, 1)
+            agent._apply_pending_steer_to_tool_results(
+                messages, 1, protect_from_budget=True
+            )
             continue
 
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
@@ -1949,7 +1953,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Drain pending steer BETWEEN individual tool calls so the
         # injection lands as soon as a tool finishes — not after the
         # entire batch.  The model sees it on the next API iteration.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
+        agent._apply_pending_steer_to_tool_results(
+            messages, 1, protect_from_budget=True
+        )
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:
