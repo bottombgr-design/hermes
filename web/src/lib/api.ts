@@ -2570,7 +2570,9 @@ export interface HubAgentPluginRow {
   dashboard_manifest: PluginManifestResponse | null;
   path: string;
   can_remove: boolean;
+  can_update: boolean;
   can_update_git: boolean;
+  update_mode: "managed" | "git" | "";
   auth_required: boolean;
   auth_command: string;
   user_hidden: boolean;
@@ -2610,6 +2612,9 @@ export interface AgentPluginUpdateResponse {
   name?: string;
   output?: string;
   unchanged?: boolean;
+  update_mode?: "managed" | "git";
+  version?: string;
+  source_commit?: string;
   error?: string;
 }
 

@@ -268,11 +268,33 @@ hermes plugins list                          # table: enabled / disabled / not e
 hermes plugins install user/repo             # install from Git, then prompt Enable? [y/N]
 hermes plugins install user/repo --enable    # install AND enable (no prompt)
 hermes plugins install user/repo --no-enable # install but leave disabled (no prompt)
-hermes plugins update my-plugin              # pull latest
+hermes plugins update my-plugin              # update (Git pull unless managed)
 hermes plugins remove my-plugin              # uninstall
 hermes plugins enable my-plugin              # add to allow-list
 hermes plugins disable my-plugin             # remove from allow-list + add to disabled
 ```
+
+For ordinary Git plugins, **Update** remains `git pull --ff-only`. A plugin
+that declares a managed product update has one Update operation instead: its
+plugin source, native runtime, service activation, health proof, and mounted
+dashboard backend advance or roll back together. Hermes does not offer a
+separate source-only Git update for that plugin.
+
+Managed Update requires a matching profile's dashboard or desktop backend host
+to be running with the plugin enabled and mounted. If it is unavailable, the
+CLI and dashboard fail before source, runtime, or service cutover and tell you
+to start or restart a backend host. A successful response means requests after
+the update are reaching the newly loaded backend implementation, not merely
+rescanned metadata.
+
+This also applies to plugins installed before they adopted managed Update.
+Their next Update safely inspects and stages the fetched target first; if that
+target declares managed Update, Hermes migrates source, runtime, service, and
+mounted backend together without an intermediate source-only checkout. The
+legacy plugin tab's Update endpoint is redirected into the same transaction
+when that route does not declare additional plugin-specific dependencies.
+Local checkout changes or an unavailable backend host stop the migration before
+source cutover.
 
 ### Interactive UI
 

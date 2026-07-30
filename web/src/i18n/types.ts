@@ -355,6 +355,9 @@ export interface Translations {
     authRequired: string;
     authRequiredHint: string;
     updateGit: string;
+    updateManaged?: string;
+    managedUpdated?: string;
+    pluginUpdated?: string;
     versionBadge: string;
     showInSidebar: string;
     hideFromSidebar: string;

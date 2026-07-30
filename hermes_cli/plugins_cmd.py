@@ -67,6 +67,10 @@ class PluginOperationError(Exception):
     """Recoverable plugin install/update failure (CLI exits; HTTP maps to 4xx)."""
 
 
+class NoManagedUpdateCandidate(Exception):
+    """The fetched target remains an ordinary unmanaged plugin."""
+
+
 # Minimum manifest version this installer understands.
 # Plugins may declare ``manifest_version: 1`` in plugin.yaml;
 # future breaking changes to the manifest schema bump this.
@@ -637,7 +641,7 @@ def cmd_install(
 
 
 def cmd_update(name: str) -> None:
-    """Update an installed plugin by pulling latest from its git remote."""
+    """Run the plugin's managed Update or pull an unmanaged Git plugin."""
     from rich.console import Console
 
     console = Console()
@@ -657,28 +661,27 @@ def cmd_update(name: str) -> None:
         sys.exit(1)
 
     console.print(f"[dim]Updating {name}...[/dim]")
-
-    ok, output = _git_pull_plugin_dir(target)
-    if not ok:
-        console.print(f"[red]Error:[/red] {output}")
+    try:
+        result = _update_user_plugin(name, target)
+    except PluginOperationError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
-    # Same stale-bytecode class as the main checkout (#6207/#60242): the
-    # pull just changed .py files under this plugin dir, so drop any
-    # __pycache__ compiled from the previous revision.
-    _clear_plugin_bytecode(target)
-
-    # Copy any new .example files
-    _copy_example_files(target, console)
-
-    out = output.strip()
-    if "Already up to date" in out:
+    if result.get("update_mode") == "managed":
+        version = result.get("version")
+        suffix = f" to product version [bold]{version}[/bold]" if version else ""
+        console.print(
+            f"[green]✓[/green] Plugin [bold]{name}[/bold] and its native "
+            f"runtime updated together{suffix}."
+        )
+    elif result.get("unchanged"):
         console.print(
             f"[green]✓[/green] Plugin [bold]{name}[/bold] is already up to date."
         )
     else:
         console.print(f"[green]✓[/green] Plugin [bold]{name}[/bold] updated.")
-        console.print(f"[dim]{out}[/dim]")
+        if result.get("output"):
+            console.print(f"[dim]{str(result['output']).strip()}[/dim]")
 
 
 def cmd_remove(name: str) -> None:
@@ -1943,8 +1946,94 @@ def _user_installed_plugin_dir(name: str) -> Optional[Path]:
     return target if target.is_dir() else None
 
 
+def _update_user_plugin(
+    name: str,
+    target: Path,
+    *,
+    managed_candidate_only: bool = False,
+) -> dict[str, Any]:
+    """Shared CLI/dashboard update dispatch with no managed-to-Git fallback."""
+    from hermes_cli.managed_plugin_update import (
+        ManagedPluginUpdateError,
+        abort_managed_update_bootstrap,
+        begin_managed_update_bootstrap,
+        finalize_managed_update_bootstrap,
+        get_managed_update_spec,
+        plugin_update_lock,
+        run_managed_update,
+        stage_managed_update_candidate,
+    )
+
+    try:
+        with plugin_update_lock(target):
+            spec = get_managed_update_spec(target, strict=True)
+            if spec is not None:
+                result = run_managed_update(name, target, spec)
+                return {
+                    **result,
+                    "ok": True,
+                    "name": name,
+                    "update_mode": "managed",
+                }
+
+            with stage_managed_update_candidate(name, target) as staged:
+                candidate, fetched_commit = staged
+                if candidate is not None:
+                    try:
+                        begin_managed_update_bootstrap(name, target, candidate)
+                        result = run_managed_update(
+                            name,
+                            target,
+                            candidate.spec,
+                            implementation_root=candidate.staged_root,
+                            bootstrap=candidate,
+                        )
+                    except ManagedPluginUpdateError as exc:
+                        try:
+                            abort_managed_update_bootstrap(
+                                name, target, candidate
+                            )
+                        except ManagedPluginUpdateError as abort_exc:
+                            raise ManagedPluginUpdateError(
+                                f"{exc}; bootstrap recovery: {abort_exc}"
+                            ) from exc
+                        raise
+                    # The product transaction is coherent now. Finalization
+                    # only releases host route gates; it must not trigger a
+                    # product rollback if one host needs a retry.
+                    finalize_managed_update_bootstrap(name, target, candidate)
+                    return {
+                        **result,
+                        "ok": True,
+                        "name": name,
+                        "update_mode": "managed",
+                    }
+
+            if managed_candidate_only:
+                raise NoManagedUpdateCandidate
+            # Advance only to the source we classified as unmanaged.  The
+            # remote may move to a managed commit after inspection.
+            ok, output = _git_pull_plugin_dir(target, fetched_commit)
+            if not ok:
+                raise PluginOperationError(output)
+            _clear_plugin_bytecode(target)
+
+            from rich.console import Console
+
+            _copy_example_files(target, Console())
+            return {
+                "ok": True,
+                "name": name,
+                "output": output,
+                "unchanged": "Already up to date" in output,
+                "update_mode": "git",
+            }
+    except ManagedPluginUpdateError as exc:
+        raise PluginOperationError(str(exc)) from exc
+
+
 def dashboard_update_user_plugin(name: str) -> dict[str, Any]:
-    """``git pull`` inside ``~/.hermes/plugins/<name>``."""
+    """Run the same managed-or-Git update dispatch as the CLI."""
     target = _user_installed_plugin_dir(name)
     if target is None:
         return {
@@ -1958,19 +2047,10 @@ def dashboard_update_user_plugin(name: str) -> dict[str, Any]:
             "error": f"Plugin '{name}' is not a git checkout; cannot pull updates.",
         }
 
-    ok, msg = _git_pull_plugin_dir(target)
-    if not ok:
-        return {"ok": False, "error": msg}
-
-    # Sibling of the CLI ``hermes plugins update`` path: drop bytecode
-    # compiled from the pre-pull plugin revision.
-    _clear_plugin_bytecode(target)
-
-    from rich.console import Console
-
-    _copy_example_files(target, Console())
-    unchanged = "Already up to date" in msg
-    return {"ok": True, "name": name, "output": msg, "unchanged": unchanged}
+    try:
+        return _update_user_plugin(name, target)
+    except PluginOperationError as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def _clear_plugin_bytecode(target: Path) -> int:
@@ -1997,13 +2077,18 @@ def _clear_plugin_bytecode(target: Path) -> int:
     return removed
 
 
-def _git_pull_plugin_dir(target: Path) -> tuple[bool, str]:
+def _git_pull_plugin_dir(
+    target: Path, commit: str | None = None
+) -> tuple[bool, str]:
     git_exe = _resolve_git_executable()
     if not git_exe:
         return False, "git is not installed or not in PATH."
+    command = [git_exe, "pull", "--ff-only"]
+    if commit is not None:
+        command.extend([".", commit])
     try:
         result = subprocess.run(
-            [git_exe, "pull", "--ff-only"],
+            command,
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=60,
