@@ -1887,7 +1887,10 @@ def register(ctx) -> None:
         allow_update_command=True,
     )
 
-    from plugins.platforms.wecom.callback_adapter import check_wecom_callback_requirements
+    from plugins.platforms.wecom.callback_adapter import (
+        check_wecom_callback_requirements,
+        standalone_send as _callback_standalone_send,
+    )
     ctx.register_platform(
         name="wecom_callback",
         label="WeCom Callback (self-built apps)",
@@ -1899,6 +1902,7 @@ def register(ctx) -> None:
         install_hint="Run `hermes setup` to install WeCom support.",
         allowed_users_env="WECOM_CALLBACK_ALLOWED_USERS",
         allow_all_env="WECOM_CALLBACK_ALLOW_ALL_USERS",
+        standalone_sender_fn=_callback_standalone_send,
         emoji="💼",
         allow_update_command=True,
     )
