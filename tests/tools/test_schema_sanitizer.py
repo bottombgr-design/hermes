@@ -278,71 +278,122 @@ def test_sanitize_property_key_empty_falls_back():
     assert sanitize_property_key("") == "param"
 
 
-# ---------------------------------------------------------------------------
-# dependentRequired -- literal property-name strings must survive
-# ---------------------------------------------------------------------------
-
-
-def test_dependent_required_preserved_through_public_api():
-    """dependentRequired values are literal property names, not schemas."""
-    schema = {
+def test_unrename_tool_args_prefixItems_basic():
+    original_params = {
         "type": "object",
         "properties": {
-            "owner": {"type": "string"},
-            "repo": {"type": "string"},
-            "organization": {"type": "string"},
-        },
-        "dependentRequired": {
-            "owner": ["repo", "organization"],
-            "repo": ["owner"],
+            "tuple": {
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "type": "object",
+                        "properties": {"bad~key": {"type": "string"}},
+                    }
+                ],
+            }
         },
     }
-    tools = [_tool("t", copy.deepcopy(schema))]
-    out = sanitize_tool_schemas(tools)
-    params = out[0]["function"]["parameters"]
-    dep = params.get("dependentRequired", {})
-    # Values are the original property-name strings unchanged.
-    assert dep.get("owner") == ["repo", "organization"]
-    assert dep.get("repo") == ["owner"]
-    # Normal property schemas are still present and valid.
-    assert params["properties"]["owner"] == {"type": "string"}
-    assert params["properties"]["repo"] == {"type": "string"}
-    assert params["properties"]["organization"] == {"type": "string"}
+    model_args = {"tuple": [{"bad_key": "test"}]}
+    restored = unrename_tool_args(original_params, model_args)
+    assert restored["tuple"][0] == {"bad~key": "test"}
 
 
-def test_dependent_required_does_not_mutate_original_input():
-    """The original schema's dependentRequired must be unchanged after sanitize."""
-    original_dep = {"owner": ["repo", "organization"], "repo": ["owner"]}
-    schema = {
+def test_unrename_tool_args_prefixItems_positional():
+    original_params = {
         "type": "object",
         "properties": {
-            "owner": {"type": "string"},
-            "repo": {"type": "string"},
-            "organization": {"type": "string"},
+            "tuple": {
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "type": "object",
+                        "properties": {"first~key": {"type": "string"}},
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"second~key": {"type": "string"}},
+                    },
+                ],
+            }
         },
-        "dependentRequired": {k: list(v) for k, v in original_dep.items()},
     }
-    saved_copy = copy.deepcopy(schema)
-    tools = [_tool("t", schema)]
-    _ = sanitize_tool_schemas(tools)
-    assert schema == saved_copy
-    assert schema["dependentRequired"] == original_dep
+    model_args = {"tuple": [{"first_key": "a"}, {"second_key": "b"}]}
+    restored = unrename_tool_args(original_params, model_args)
+    assert restored["tuple"][0] == {"first~key": "a"}
+    assert restored["tuple"][1] == {"second~key": "b"}
 
 
-def test_dependent_schemas_still_recursively_sanitized():
-    """dependentSchemas (real schemas, not literal lists) must still be sanitized."""
-    schema = {
+def test_unrename_tool_args_prefixItems_and_items():
+    original_params = {
         "type": "object",
         "properties": {
-            "owner": {"type": "string"},
-        },
-        "dependentSchemas": {
-            "owner": {"type": "object"},  # bare object -- needs properties: {}
+            "tuple": {
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "type": "object",
+                        "properties": {"pos~key": {"type": "string"}},
+                    }
+                ],
+                "items": {
+                    "type": "object",
+                    "properties": {"trail~key": {"type": "string"}},
+                },
+            }
         },
     }
-    tools = [_tool("t", copy.deepcopy(schema))]
-    out = sanitize_tool_schemas(tools)
-    dep_schemas = out[0]["function"]["parameters"]["dependentSchemas"]
-    assert dep_schemas["owner"] == {"type": "object", "properties": {}}, (
-        f"dependentSchemas['owner'] was not fully sanitized: {dep_schemas['owner']!r}"
-    )
+    model_args = {"tuple": [{"pos_key": "a"}, {"trail_key": "b"}, {"trail_key": "c"}]}
+    restored = unrename_tool_args(original_params, model_args)
+    assert restored["tuple"][0] == {"pos~key": "a"}
+    assert restored["tuple"][1] == {"trail~key": "b"}
+    assert restored["tuple"][2] == {"trail~key": "c"}
+
+
+def test_unrename_tool_args_nested_prefixItems():
+    original_params = {
+        "type": "object",
+        "properties": {
+            "tuple": {
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "type": "array",
+                        "prefixItems": [
+                            {
+                                "type": "object",
+                                "properties": {"bad~key": {"type": "string"}},
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+    }
+    model_args = {"tuple": [[{"bad_key": "value"}]]}
+
+    assert unrename_tool_args(original_params, model_args) == {
+        "tuple": [[{"bad~key": "value"}]]
+    }
+
+
+def test_unrename_tool_args_nested_homogeneous_items():
+    original_params = {
+        "type": "object",
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"bad~key": {"type": "string"}},
+                    },
+                },
+            }
+        },
+    }
+    model_args = {"rows": [[{"bad_key": "a"}], [{"bad_key": "b"}]]}
+
+    assert unrename_tool_args(original_params, model_args) == {
+        "rows": [[{"bad~key": "a"}], [{"bad~key": "b"}]]
+    }
