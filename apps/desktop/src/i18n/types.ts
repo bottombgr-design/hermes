@@ -696,6 +696,7 @@ export interface Translations {
       defaultsLabel: string
       reasoning: string
       reasoningOff: string
+      localReasoningOff: string
       defaultsFailed: string
       auxiliaryTitle: string
       resetAllToMain: string
