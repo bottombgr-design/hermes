@@ -13,6 +13,7 @@
 //      re-selected forever instead of falling through to bootstrap.
 
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import path from 'node:path'
 
 import { test } from 'vitest'
@@ -211,4 +212,88 @@ test('getVenvSitePackagesEntries: returns empty for a falsy venvRoot', () => {
   assert.deepEqual(getVenvSitePackagesEntries('', { isWindows: true, directoryExists: () => true }), [])
   assert.deepEqual(getVenvSitePackagesEntries(null, { isWindows: true, directoryExists: () => true }), [])
   assert.deepEqual(getVenvSitePackagesEntries(undefined, { isWindows: true, directoryExists: () => true }), [])
+})
+
+// ── Regression guards for #62792: resolveBasePythonFromVenvCfg + ensureRuntime ──
+
+function readMain() {
+  return fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8').replace(/\r\n/g, '\n')
+}
+
+test('main.ts defines resolveBasePythonFromVenvCfg to read pyvenv.cfg home key (#62792 L1)', () => {
+  const source = readMain()
+  assert.ok(
+    source.includes('function resolveBasePythonFromVenvCfg'),
+    'resolveBasePythonFromVenvCfg must exist in main.ts'
+  )
+  // Must parse the `home` key from pyvenv.cfg.
+  assert.ok(
+    source.includes('cfg.match(/^home\\s*=\\s*(.+)$/im)'),
+    'must parse the pyvenv.cfg home key'
+  )
+  // Must resolve base Python from the home directory.
+  assert.ok(
+    source.includes("path.join(baseDir, 'python.exe')"),
+    'must resolve base Python from home directory'
+  )
+  // Must fail closed — return null on any error so the venv fallback is always preserved.
+  assert.ok(
+    source.includes('catch') && source.includes('return null'),
+    'must fail closed on any error'
+  )
+  // Must gate on IS_WINDOWS only.
+  assert.ok(
+    source.includes('!IS_WINDOWS'),
+    'must be gated to Windows only'
+  )
+})
+
+test('main.ts resolveBasePythonFromVenvCfg verifies resolved interpreter exists (#62792 L1)', () => {
+  const fnStart = readMain().indexOf('function resolveBasePythonFromVenvCfg')
+  assert.notEqual(fnStart, -1, 'resolveBasePythonFromVenvCfg must exist')
+  const source = readMain()
+  const fnEnd = source.indexOf('\nfunction ', fnStart + 1)
+  const body = source.slice(fnStart, fnEnd === -1 ? undefined : fnEnd)
+
+  assert.ok(
+    body.includes('fileExists(basePython)'),
+    'must verify the resolved python.exe exists on disk before trusting it'
+  )
+})
+
+test('ensureRuntime reads pyvenv.cfg base Python on Windows, falls back to venv (#62792 L2)', () => {
+  const source = readMain()
+  const fnStart = source.indexOf('async function ensureRuntime(')
+  assert.notEqual(fnStart, -1, 'ensureRuntime must exist')
+  const fnEnd = source.indexOf('\nfunction ', fnStart + 1)
+  const body = source.slice(fnStart, fnEnd === -1 ? undefined : fnEnd)
+
+  assert.match(
+    body,
+    /const basePython = IS_WINDOWS \? resolveBasePythonFromVenvCfg\(VENV_ROOT\) : null/,
+    'ensureRuntime must resolve base Python from pyvenv.cfg on Windows'
+  )
+  assert.match(
+    body,
+    /backend\.command = basePython \|\| venvPython/,
+    'ensureRuntime must prefer basePython, falling back to venvPython'
+  )
+  // The old unconditional overwrite that causes #62792 must NOT be present.
+  assert.doesNotMatch(
+    body,
+    /backend\.command = getVenvPython\(VENV_ROOT\)/,
+    'ensureRuntime must not unconditionally overwrite backend.command with the venv launcher'
+  )
+})
+
+test('primary-backend-startup.ts passes the backend through ensureLocalRuntime (#62792 L6)', () => {
+  const srcPath = path.join(__dirname, 'primary-backend-startup.ts')
+  assert.ok(fs.existsSync(srcPath), 'primary-backend-startup.ts must exist')
+  const source = fs.readFileSync(srcPath, 'utf8').replace(/\r\n/g, '\n')
+
+  assert.match(
+    source,
+    /return \{ kind: 'local', backend: await ensureLocalRuntime\(backend\) \}/,
+    'the active backend must pass through ensureRuntime before the process is spawned'
+  )
 })
