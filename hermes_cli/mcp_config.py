@@ -196,6 +196,65 @@ def _save_bearer_auth_token(name: str, token: str) -> Dict[str, str]:
     return _bearer_auth_headers(name)
 
 
+def _trailing_env_in_args(cmd_args: List[str]) -> bool:
+    """True when the last ``--env`` is followed only by ``KEY=VALUE`` tokens.
+
+    ``--args`` uses ``nargs=argparse.REMAINDER`` so a ``--env`` typed *after*
+    it is captured into the child argv instead of populating the server's env
+    (issue #68944).  A container runtime's own ``--env`` (e.g.
+    ``docker run --env FOO=bar <image>``) is legitimate, so key on the
+    specific footgun shape: a trailing ``--env`` followed only by
+    ``KEY=VALUE`` tokens.  For ``docker`` the image name (no ``=``) trails the
+    env pair, so it stays quiet.
+    """
+    if "--env" not in cmd_args:
+        return False
+    last = len(cmd_args) - 1 - cmd_args[::-1].index("--env")
+    tail = cmd_args[last + 1:]
+    return bool(tail) and all("=" in token for token in tail)
+
+
+def _rescue_env_from_args(
+    cmd_args: List[str],
+) -> tuple[List[str], List[str]]:
+    """Pull trailing ``--env KEY=VALUE`` tokens out of a stdio argv list.
+
+    ``hermes mcp add --args ... --env KEY=VALUE`` silently swallows the
+    ``--env`` flag into ``cmd_args`` because ``--args`` uses
+    ``nargs=argparse.REMAINDER``.  The user almost certainly meant the
+    env vars to populate the server's ``env:`` block, so we rescue the
+    trailing ``KEY=VALUE`` pairs and leave the rest of the argv intact.
+
+    Only **trailing** ``--env`` blocks are rescued (see
+    ``_trailing_env_in_args``).  A child process may carry its own
+    ``--env`` flags (e.g. ``docker run --env FOO=bar <image>``); those
+    are followed by a non-assignment token and must stay in argv.
+
+    Returns the cleaned argv list and the rescued ``KEY=VALUE`` strings
+    in argv order (see issue #68944).
+    """
+    if not cmd_args or not _trailing_env_in_args(cmd_args):
+        return cmd_args, []
+    cleaned: List[str] = []
+    rescued: List[str] = []
+    i = 0
+    while i < len(cmd_args):
+        token = cmd_args[i]
+        if token == "--env" and i + 1 < len(cmd_args):
+            # ``--env KEY=VALUE`` form: take the next token as the value.
+            rescued.append(cmd_args[i + 1])
+            i += 2
+            continue
+        # ``--env=KEY=VALUE`` form (rare, but argparse honours ``=``).
+        if token.startswith("--env="):
+            rescued.append(token[len("--env="):])
+            i += 1
+            continue
+        cleaned.append(token)
+        i += 1
+    return cleaned, rescued
+
+
 def _parse_env_assignments(raw_env: Optional[List[str]]) -> Dict[str, str]:
     """Parse ``KEY=VALUE`` strings from CLI args into an env dict."""
     parsed: Dict[str, str] = {}
@@ -420,13 +479,31 @@ def cmd_mcp_add(args):
     # mcp_add_p.add_argument("--command", dest="mcp_command", ...) in
     # hermes_cli/main.py for why the dest is renamed.
     command = getattr(args, "mcp_command", None)
-    cmd_args = getattr(args, "args", None) or []
+    cmd_args = list(getattr(args, "args", None) or [])
     if cmd_args and cmd_args[0] == "--":
         cmd_args = cmd_args[1:]
     auth_type = getattr(args, "auth", None)
     preset_name = getattr(args, "preset", None)
-    raw_env = getattr(args, "env", None)
+    raw_env = list(getattr(args, "env", None) or [])
     raw_connect_timeout = getattr(args, "connect_timeout", None)
+
+    # Rescue ``--env KEY=VALUE`` tokens that were silently swallowed by the
+    # greedy ``--args`` REMAINDER flag. ``--args`` uses
+    # ``nargs=argparse.REMAINDER`` which captures every following token as
+    # stdio argv, so when the user writes ``--args -y pkg --env KEY=VALUE``
+    # the ``--env KEY=VALUE`` portion ends up in ``cmd_args`` instead of
+    # being parsed as the ``--env`` flag. Without this rescue, the stdio
+    # subprocess receives ``--env`` and ``KEY=VALUE`` as literal argv
+    # tokens and the env var never reaches the subprocess — a silent
+    # credential-filing bug (see issue #68944).
+    cmd_args, rescued_env = _rescue_env_from_args(cmd_args)
+    if rescued_env:
+        raw_env.extend(rescued_env)
+        _warning(
+            "--env must be placed BEFORE --args so it parses as a flag; "
+            f"rescued {len(rescued_env)} misrouted --env value(s) from "
+            "--args. Reorder your flags to avoid the warning."
+        )
 
     server_config: Dict[str, Any] = {}
     try:

@@ -747,3 +747,297 @@ class TestMcpReauth:
         cmd_mcp_reauth(_make_args(name="ghost", all=False))
         out = capsys.readouterr().out
         assert "not found" in out
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: hermes mcp add parser — issue #68944
+#
+# Bug: ``hermes mcp add --command CMD --args -y pkg-name --env KEY=VALUE``
+# silently absorbs ``--env KEY=VALUE`` into ``args:`` (as literal argv tokens
+# consumed by argparse.REMAINDER) instead of populating ``env:`` in
+# config.yaml. The stdio subprocess then receives ``--env`` and ``KEY=VALUE``
+# as argv tokens, never as environment variables — a silent credential
+# footgun.
+#
+# The fix is in two parts:
+#   1. Parser (``hermes_cli/subcommands/mcp.py``): declare ``--env`` BEFORE
+#      ``--args`` so the user can write ``--env KEY=VALUE --args ...``.
+#   2. Handler (``hermes_cli/mcp_config.py``): when ``--env KEY=VALUE``
+#      appears AFTER ``--args`` and is therefore swallowed by the greedy
+#      REMAINDER, rescue those tokens from ``cmd_args`` and emit a warning
+#      telling the user to reorder their flags.
+# ---------------------------------------------------------------------------
+
+
+def _build_real_mcp_add_parser():
+    """Build the real ``hermes mcp add`` parser via ``build_mcp_parser``.
+
+    Mirrors the replica pattern in ``test_mcp_add_command_dest.py`` so we
+    exercise the production parser instead of an approximation.
+    """
+    from hermes_cli.subcommands.mcp import build_mcp_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    # `cmd_mcp` is unused by the parser itself; pass a stub.
+    build_mcp_parser(subparsers, cmd_mcp=lambda args: None)
+    return parser
+
+
+class TestRescueEnvFromArgs:
+    """Unit tests for the post-parse rescue helper."""
+
+    def test_empty_list_returns_empty(self):
+        from hermes_cli.mcp_config import _rescue_env_from_args
+
+        cleaned, rescued = _rescue_env_from_args([])
+        assert cleaned == []
+        assert rescued == []
+
+    def test_no_env_tokens_returns_unchanged(self):
+        from hermes_cli.mcp_config import _rescue_env_from_args
+
+        cleaned, rescued = _rescue_env_from_args(["-y", "pkg", "--rm"])
+        assert cleaned == ["-y", "pkg", "--rm"]
+        assert rescued == []
+
+    def test_rescues_single_env_after_args(self):
+        from hermes_cli.mcp_config import _rescue_env_from_args
+
+        cleaned, rescued = _rescue_env_from_args(
+            ["-y", "pkg", "--env", "K=V"]
+        )
+        assert cleaned == ["-y", "pkg"]
+        assert rescued == ["K=V"]
+
+    def test_rescues_multiple_env_flags(self):
+        from hermes_cli.mcp_config import _rescue_env_from_args
+
+        cleaned, rescued = _rescue_env_from_args(
+            ["-y", "pkg", "--env", "K1=V1", "--env", "K2=V2"]
+        )
+        assert cleaned == ["-y", "pkg"]
+        assert rescued == ["K1=V1", "K2=V2"]
+
+    def test_env_equals_form_not_rescued_by_trailing_guard(self):
+        """The ``--env=KEY=VALUE`` form is conservatively NOT rescued.
+
+        The trailing guard keys on exact ``--env`` tokens (the reported
+        bug shape).  ``--env=K=V`` is a different token, and rescuing it
+        risks misinterpreting a child-process flag, so it stays in argv.
+        """
+        from hermes_cli.mcp_config import _rescue_env_from_args
+
+        cleaned, rescued = _rescue_env_from_args(
+            ["-y", "pkg", "--env=K=V"]
+        )
+        assert cleaned == ["-y", "pkg", "--env=K=V"]
+        assert rescued == []
+
+    def test_non_trailing_env_not_rescued(self):
+        """A non-trailing ``--env`` is likely a child-process flag.
+
+        ``--env K=V -y pkg`` has a non-assignment token (``-y``) after
+        the last ``--env``, so the trailing guard correctly leaves it in
+        argv — this is the pattern a container runtime like docker uses.
+        """
+        from hermes_cli.mcp_config import _rescue_env_from_args
+
+        cleaned, rescued = _rescue_env_from_args(
+            ["--env", "K=V", "-y", "pkg"]
+        )
+        assert cleaned == ["--env", "K=V", "-y", "pkg"]
+        assert rescued == []
+
+    def test_docker_env_with_image_not_rescued(self):
+        """A container runtime's own ``--env`` must stay in argv.
+
+        ``docker run --env FOO=bar <image>`` legitimately carries ``--env``
+        inside the passthrough argv, followed by the image name (no ``=``).
+        The trailing guard must not rescue it (see #68944).
+        """
+        from hermes_cli.mcp_config import _rescue_env_from_args
+
+        docker_argv = ["run", "-i", "--rm", "--env", "FOO=bar", "some/image"]
+        cleaned, rescued = _rescue_env_from_args(docker_argv)
+        assert cleaned == docker_argv
+        assert rescued == []
+
+
+class TestMcpAddParserEnvOrdering:
+    """``--env`` must parse correctly when placed BEFORE ``--args``."""
+
+    def test_env_before_args_populates_env(self):
+        """The parser order fix: declare ``--env`` before ``--args`` so the
+        ``--env`` flag is parseable when the user puts it before ``--args``
+        in argv (the documented ordering).
+        """
+        parser = _build_real_mcp_add_parser()
+        secret = "GITHUB_PERSONAL_ACCESS_TOKEN=ghp_AAAABBBBCCCCDDDD"
+        args = parser.parse_args([
+            "mcp", "add", "github",
+            "--command", "npx",
+            "--env", secret,
+            "--args", "-y", "@modelcontextprotocol/server-github",
+        ])
+        assert args.env == [secret]
+        assert args.args == ["-y", "@modelcontextprotocol/server-github"]
+
+    def test_env_after_args_is_swallowed_by_remainder(self):
+        """Sanity check: the parser alone does NOT fix the bug for the
+        ``--env``-after-``--args`` ordering — that's the handler's rescue
+        path's job. The handler-side rescue tests below verify the fix.
+        """
+        parser = _build_real_mcp_add_parser()
+        secret = "GITHUB_PERSONAL_ACCESS_TOKEN=ghp_AAAABBBBCCCCDDDD"
+        args = parser.parse_args([
+            "mcp", "add", "github",
+            "--command", "npx",
+            "--args", "-y", "@modelcontextprotocol/server-github",
+            "--env", secret,
+        ])
+        # ``--env`` is absorbed by ``--args`` REMAINDER — that's the bug.
+        assert args.env == []
+        assert "--env" in args.args
+        assert any("=" in str(a) for a in args.args)
+
+
+class TestMcpAddEnvAfterArgsRescue:
+    """End-to-end: ``cmd_mcp_add`` rescues ``--env`` placed after ``--args``."""
+
+    def test_env_after_args_is_rescued_into_env_block(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The exact reproducer from issue #68944.
+
+        Without the rescue, the stdio subprocess would receive
+        ``--env`` and ``KEY=VALUE`` as literal argv tokens and the env var
+        would never reach the subprocess. The fix rescues them into the
+        ``env:`` config block AND emits a warning telling the user to
+        reorder their flags so the parser handles them directly.
+        """
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        fake_tools = [FakeTool("search", "Search repos")]
+
+        def mock_probe(name, config, **kw):
+            assert config.get("env") == {"MY_API_KEY": "secret123"}, (
+                f"env not propagated as env block: {config!r}"
+            )
+            assert "--env" not in config.get("args", []), (
+                f"--env leaked into args: {config!r}"
+            )
+            assert "MY_API_KEY=secret123" not in config.get("args", []), (
+                f"KEY=VALUE leaked into args: {config!r}"
+            )
+            return [(t.name, t.description) for t in fake_tools]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "")
+
+        # Buggy argv: --env after --args. The handler must rescue.
+        cmd_mcp_add(_make_args(
+            name="github",
+            mcp_command="npx",
+            args=["-y", "@modelcontextprotocol/server-github",
+                  "--env", "MY_API_KEY=secret123"],
+            env=[],
+        ))
+
+        out = capsys.readouterr().out
+        assert "rescued" in out, (
+            f"expected rescue warning, got: {out!r}"
+        )
+
+        # Verify saved config.
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        srv = config["mcp_servers"]["github"]
+        assert srv["env"] == {"MY_API_KEY": "secret123"}
+        assert srv["args"] == ["-y", "@modelcontextprotocol/server-github"]
+
+    def test_env_before_args_does_not_emit_rescue_warning(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The recommended ordering (``--env`` before ``--args``) must not
+        trigger the rescue warning — the parser handles it directly.
+        """
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        fake_tools = [FakeTool("search", "Search repos")]
+
+        def mock_probe(name, config, **kw):
+            return [(t.name, t.description) for t in fake_tools]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "")
+
+        cmd_mcp_add(_make_args(
+            name="github",
+            mcp_command="npx",
+            args=["-y", "@modelcontextprotocol/server-github"],
+            env=["MY_API_KEY=secret123"],
+        ))
+
+        out = capsys.readouterr().out
+        assert "rescued" not in out, (
+            f"unexpected rescue warning for parser-handled env: {out!r}"
+        )
+
+    def test_multiple_env_after_args_are_all_rescued(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Multiple ``--env`` flags after ``--args`` must all be rescued."""
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        fake_tools = [FakeTool("search", "Search repos")]
+
+        def mock_probe(name, config, **kw):
+            assert config.get("env") == {
+                "API_KEY": "secret",
+                "DEBUG": "true",
+            }, f"env not fully propagated: {config!r}"
+            return [(t.name, t.description) for t in fake_tools]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "")
+
+        cmd_mcp_add(_make_args(
+            name="github",
+            mcp_command="npx",
+            args=["-y", "pkg", "--env", "API_KEY=secret",
+                  "--env", "DEBUG=true"],
+            env=[],
+        ))
+
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        srv = config["mcp_servers"]["github"]
+        assert srv["env"] == {"API_KEY": "secret", "DEBUG": "true"}
+        assert srv["args"] == ["-y", "pkg"]
+
+    def test_handler_rejects_invalid_env_name_after_rescue(self, capsys):
+        """Invalid env var names must still be rejected by the handler.
+
+        Regression coverage for the validation path that runs after rescue —
+        proves the fix does not silently bypass the existing
+        ``_parse_env_assignments`` validation.
+        """
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(
+            name="github",
+            mcp_command="npx",
+            args=["-y", "pkg", "--env", "BAD-NAME=value"],
+            env=[],
+        ))
+        out = capsys.readouterr().out
+        assert "Invalid --env variable name" in out
