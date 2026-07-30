@@ -86,8 +86,9 @@ def test_provider_overload_does_not_increment_failure_or_block_recurrence(kanban
         assert task.block_recurrences == 0
 
 
+@pytest.mark.parametrize("status", ["ready", "review"])
 def test_launcher_transport_does_not_increment_failure_or_block_recurrence(
-    kanban_home, monkeypatch
+    kanban_home, monkeypatch, status
 ):
     import hermes_cli.profiles as profiles
 
@@ -95,6 +96,9 @@ def test_launcher_transport_does_not_increment_failure_or_block_recurrence(
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="transport", assignee="worker")
+        if status == "review":
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+            conn.commit()
         result = kb.dispatch_once(
             conn,
             spawn_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -109,6 +113,11 @@ def test_launcher_transport_does_not_increment_failure_or_block_recurrence(
         assert task.block_recurrences == 0
         assert task_id not in result.auto_blocked
         assert result.runtime_outcomes[0]["kind"] == "launcher_transport_failure"
+        run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert run["outcome"] == "launcher_transport_failure"
 
 
 @pytest.mark.parametrize("status", ["ready", "review"])
@@ -164,6 +173,13 @@ def test_clean_exit_protocol_violation_is_counting_outcome(kanban_home, monkeypa
         assert '"kind": "code_failure"' in event["payload"]
         outcome = kb.detect_crashed_workers._last_runtime_outcomes[-1]
         assert outcome["kind"] == "code_failure"
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert run["outcome"] == "crashed"
+        assert '"kind": "code_failure"' in run["metadata"]
 
 
 def test_ex_tempfail_is_transient_worker_exit():
