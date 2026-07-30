@@ -407,8 +407,13 @@ describe('FindBar', () => {
     openFindBar()
     renderFindBar()
 
-    const input = await screen.findByRole('textbox', { name: /find in page/i })
+    const input = await screen.findByRole('searchbox', { name: /find in page/i })
     expect(input).toBeTruthy()
+    expect(input.getAttribute('type')).toBe('password')
+    expect(input.className).toContain('[-webkit-text-security:none]')
+    expect(screen.getByRole('search').className).toContain(
+      'top-[calc(var(--titlebar-height,34px)+0.5rem)]'
+    )
     expect(screen.getByRole('button', { name: /close/i })).toBeTruthy()
     expect(screen.getByRole('button', { name: /next match/i })).toBeTruthy()
     expect(screen.getByRole('button', { name: /previous match/i })).toBeTruthy()
@@ -423,7 +428,7 @@ describe('FindBar', () => {
     openFindBar()
     renderFindBar()
 
-    const input = await screen.findByRole('textbox', { name: /find in page/i })
+    const input = await screen.findByRole('searchbox', { name: /find in page/i })
     // eslint-disable-next-line no-restricted-globals -- asserting real focus requires the live document
     await waitFor(() => expect(document.activeElement).toBe(input))
   })
@@ -435,7 +440,7 @@ describe('FindBar', () => {
       openFindBar()
       renderFindBar()
 
-      const input = screen.getByRole('textbox', { name: /find in page/i })
+      const input = screen.getByRole('searchbox', { name: /find in page/i })
       fireEvent.change(input, { target: { value: 'n' } })
       fireEvent.change(input, { target: { value: 'ne' } })
       fireEvent.change(input, { target: { value: 'nee' } })
@@ -461,7 +466,7 @@ describe('FindBar', () => {
       openFindBar()
       renderFindBar()
 
-      fireEvent.change(screen.getByRole('textbox', { name: /find in page/i }), {
+      fireEvent.change(screen.getByRole('searchbox', { name: /find in page/i }), {
         target: { value: 'needle' }
       })
 
@@ -478,7 +483,7 @@ describe('FindBar', () => {
     $findInPage.set({ active: true, query: 'needle', matchOrdinal: 1, matchCount: 4 })
     renderFindBar()
 
-    const input = screen.getByRole('textbox', { name: /find in page/i })
+    const input = screen.getByRole('searchbox', { name: /find in page/i })
 
     fireEvent.keyDown(input, { key: 'Enter' })
     expect(bridge.findInPage).toHaveBeenLastCalledWith('needle', { forward: true, findNext: true })

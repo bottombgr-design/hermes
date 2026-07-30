@@ -159,19 +159,27 @@ export function FindBar() {
   return (
     <div
       className={cn(
-        'pointer-events-auto fixed right-4 top-[calc(var(--titlebar-height,0px)+0.5rem)] z-50',
+        // FindBar lives in the global overlay set, outside the shell subtree
+        // that defines this custom property. Keep the real titlebar clearance
+        // when the variable is therefore unavailable.
+        'pointer-events-auto fixed right-4 top-[calc(var(--titlebar-height,34px)+0.5rem)] z-50',
         'flex items-center gap-1 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) px-2 py-1 shadow-md'
       )}
       role="search"
     >
       <input
         aria-label={t.keybinds.actions['view.findInPage'] ?? 'Find in page'}
-        className="h-6 w-40 bg-transparent text-xs text-(--ui-text-primary) outline-none placeholder:text-(--ui-text-tertiary)"
+        autoComplete="off"
+        className="h-6 w-40 bg-transparent text-xs text-(--ui-text-primary) outline-none [-webkit-text-security:none] placeholder:text-(--ui-text-tertiary)"
         onChange={onInput}
         onKeyDown={onKeyDown}
         placeholder={t.keybinds.actions['view.findInPage'] ?? 'Find in page'}
         ref={inputRef}
-        type="text"
+        // Chromium includes ordinary text-input values in findInPage results.
+        // A password control is excluded from that native search index; the
+        // text-security override keeps this search field visibly plain text.
+        role="searchbox"
+        type="password"
         value={localQuery}
       />
 
