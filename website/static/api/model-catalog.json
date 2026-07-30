@@ -138,6 +138,10 @@
           "description": ""
         },
         {
+          "id": "thinkingmachines/inkling",
+          "description": ""
+        },
+        {
           "id": "openrouter/pareto-code",
           "description": "auto-routes to cheapest coder meeting openrouter.min_coding_score"
         },
@@ -260,6 +264,9 @@
         },
         {
           "id": "sakana/fugu-ultra"
+        },
+        {
+          "id": "thinkingmachines/inkling"
         }
       ]
     }
