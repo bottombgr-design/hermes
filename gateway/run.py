@@ -8270,6 +8270,92 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    # PTB can start the standalone-photo callback a few milliseconds after the
+    # text batch reaches the runner. Give that callback one small wall-clock
+    # registration window before taking the text-only fast path. Once concrete
+    # work is observed, the longer download grace below applies.
+    _TELEGRAM_STARTUP_IMAGE_REGISTRATION_GRACE_SECONDS = 0.01
+    _TELEGRAM_STARTUP_IMAGE_REGISTRATION_POLL_SECONDS = 0.002
+    _TELEGRAM_STARTUP_IMAGE_DOWNLOAD_GRACE_SECONDS = 1.0
+
+    @staticmethod
+    def _adapter_declared_method(adapter: Any, name: str) -> Optional[Callable[..., Any]]:
+        """Return only methods explicitly implemented by an adapter class."""
+        try:
+            inspect.getattr_static(adapter, name)
+        except AttributeError:
+            return None
+        method = getattr(adapter, name, None)
+        return method if callable(method) else None
+
+    async def _merge_telegram_startup_image_followups(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+    ) -> MessageEvent:
+        """Coalesce a starting Telegram text with its immediately-following images.
+
+        Telegram text and media are handled by separate PTB callbacks. A short
+        text batch can therefore start a turn before the photo callback has even
+        registered its download. Yield a bounded number of event-loop turns to
+        close that registration gap, then wait only while the adapter reports
+        concrete same-session image work.
+        """
+        if (
+            source.platform != Platform.TELEGRAM
+            or event.message_type != MessageType.TEXT
+            or bool(getattr(event, "media_urls", None))
+        ):
+            return event
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return event
+        pop_image = self._adapter_declared_method(adapter, "pop_startup_image_event")
+        has_pending = self._adapter_declared_method(adapter, "has_startup_image_pending")
+        if pop_image is None or has_pending is None:
+            return event
+
+        loop = asyncio.get_running_loop()
+        deadline: float | None = None
+        registration_deadline = (
+            loop.time() + self._TELEGRAM_STARTUP_IMAGE_REGISTRATION_GRACE_SECONDS
+        )
+        while True:
+            incoming = pop_image(session_key)
+            if incoming is not None:
+                slot = {session_key: event}
+                merge_pending_message_event(slot, session_key, incoming, merge_text=True)
+                event = slot[session_key]
+                continue
+
+            try:
+                pending = bool(has_pending(session_key))
+            except Exception:
+                logger.debug("Telegram startup image pending check failed", exc_info=True)
+                break
+            if pending:
+                if deadline is None:
+                    deadline = (
+                        loop.time()
+                        + self._TELEGRAM_STARTUP_IMAGE_DOWNLOAD_GRACE_SECONDS
+                    )
+                if loop.time() >= deadline:
+                    break
+                await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
+                continue
+
+            if loop.time() >= registration_deadline:
+                break
+            await asyncio.sleep(
+                min(
+                    self._TELEGRAM_STARTUP_IMAGE_REGISTRATION_POLL_SECONDS,
+                    max(0.0, registration_deadline - loop.time()),
+                )
+            )
+        return event
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
@@ -12647,6 +12733,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        adapter._gateway_profile_name = profile_name
+        adapter._session_key_profile = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -16573,6 +16661,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
+        event = await self._merge_telegram_startup_image_followups(
+            event,
+            source,
+            session_key,
+        )
         message_text = await self._prepare_profile_scoped_inbound_message_text(
             event=event,
             source=source,

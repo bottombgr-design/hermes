@@ -5555,6 +5555,10 @@ class BasePlatformAdapter(ABC):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=(
+                event.source.profile
+                or getattr(self, "_session_key_profile", None)
+            ),
         )
 
         # On-entry self-heal: if the adapter still has an _active_sessions

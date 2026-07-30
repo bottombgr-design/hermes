@@ -273,6 +273,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_video_from_bytes,
     cache_document_from_bytes,
+    merge_pending_message_event,
     resolve_proxy_url,
     SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES,
@@ -722,6 +723,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
         self._media_group_events: Dict[str, MessageEvent] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
+        # Coordinate Telegram's independently dispatched text and photo
+        # handlers during cold-turn startup. PTB may schedule the text handler
+        # before the photo handler has registered its download, so the runner
+        # needs both an in-progress counter and access to buffered photo events.
+        self._media_downloads_in_progress_by_session: Dict[str, int] = {}
         # Buffer rapid text messages so Telegram client-side splits of long
         # messages are aggregated into a single MessageEvent.  Lower defaults
         # (0.3s / 1.0s instead of 0.6s / 2.0s) let short replies stream
@@ -8779,20 +8785,59 @@ class TelegramAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _text_batch_key(self, event: MessageEvent) -> str:
-        """Session-scoped key for text message batching.
-
-        Applies the installed topic-recovery hook first so DM-topic batches
-        coalesce on (and dispatch to) the recovered lane rather than the
-        raw inbound ``message_thread_id`` Telegram may have attached.
-        """
+        """Return the recovered, profile-aware key used by inbound batching."""
         from gateway.session import build_session_key
+
         self._apply_topic_recovery(event)
+        profile = event.source.profile or getattr(self, "_gateway_profile_name", None)
+        if profile and not event.source.profile:
+            event.source.profile = profile
         return build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=profile,
         )
+
+    def _media_session_key(self, event: MessageEvent) -> str:
+        """Use the same recovered/profile-aware key as Telegram text batching."""
+        return self._text_batch_key(event)
+
+    def _track_media_download_start(self, event: MessageEvent) -> str:
+        session_key = self._media_session_key(event)
+        counts = self._media_downloads_in_progress_by_session
+        counts[session_key] = counts.get(session_key, 0) + 1
+        return session_key
+
+    def _track_media_download_done(self, session_key: str | None) -> None:
+        if not session_key:
+            return
+        remaining = self._media_downloads_in_progress_by_session.get(session_key, 0) - 1
+        if remaining > 0:
+            self._media_downloads_in_progress_by_session[session_key] = remaining
+        else:
+            self._media_downloads_in_progress_by_session.pop(session_key, None)
+
+    def has_startup_image_pending(self, session_key: str) -> bool:
+        if not session_key:
+            return False
+        if self._media_downloads_in_progress_by_session.get(session_key, 0) > 0:
+            return True
+        return f"{session_key}:photo-burst" in self._pending_photo_batches
+
+    def pop_startup_image_event(self, session_key: str) -> MessageEvent | None:
+        """Atomically remove buffered same-session images for a starting turn."""
+        if not session_key:
+            return None
+        merged: Dict[str, MessageEvent] = {}
+        key = f"{session_key}:photo-burst"
+        event = self._pending_photo_batches.pop(key, None)
+        task = self._pending_photo_batch_tasks.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+        if event is not None and event.media_urls:
+            merge_pending_message_event(merged, session_key, event)
+        return merged.get(session_key)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
@@ -8883,12 +8928,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
         """Return a batching key for Telegram photos/albums."""
-        from gateway.session import build_session_key
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        session_key = self._media_session_key(event)
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             return f"{session_key}:album:{media_group_id}"
@@ -8980,6 +9020,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Download photo to local image cache so the vision tool can access it
         # even after Telegram's ephemeral file URLs expire (~1 hour).
         if msg.photo:
+            download_session_key = (
+                self._track_media_download_start(event)
+                if not getattr(msg, "media_group_id", None)
+                else None
+            )
             try:
                 # msg.photo is a list of PhotoSize sorted by size; take the largest
                 photo = msg.photo[-1]
@@ -9009,6 +9054,8 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache photo: %s", _redact_telegram_error_text(e), exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "photo", e)
+            finally:
+                self._track_media_download_done(download_session_key)
 
         # Download voice/audio messages to cache for STT transcription
         if msg.voice:
@@ -9108,32 +9155,40 @@ class TelegramAdapter(BasePlatformAdapter):
                 # payload is actually an image, route it through the image cache
                 # and batching path instead of rejecting it as a document.
                 if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
-                    file_obj = await doc.get_file()
-                    image_bytes = await file_obj.download_as_bytearray()
-                    image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
+                    download_session_key = (
+                        self._track_media_download_start(event)
+                        if not getattr(msg, "media_group_id", None)
+                        else None
+                    )
                     try:
-                        cached_path = cache_image_from_bytes(bytes(image_bytes), ext=image_ext)
-                    except ValueError as e:
-                        logger.warning("[Telegram] Failed to cache image document: %s", _redact_telegram_error_text(e), exc_info=True)
-                        event.text = (
-                            f"Image document '{original_filename or doc_mime or ext or 'unknown'}' "
-                            "could not be read as an image."
-                        )
-                        await self.handle_message(event)
+                        file_obj = await doc.get_file()
+                        image_bytes = await file_obj.download_as_bytearray()
+                        image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
+                        try:
+                            cached_path = cache_image_from_bytes(bytes(image_bytes), ext=image_ext)
+                        except ValueError as e:
+                            logger.warning("[Telegram] Failed to cache image document: %s", _redact_telegram_error_text(e), exc_info=True)
+                            event.text = (
+                                f"Image document '{original_filename or doc_mime or ext or 'unknown'}' "
+                                "could not be read as an image."
+                            )
+                            await self.handle_message(event)
+                            return
+
+                        event.message_type = MessageType.PHOTO
+                        event.media_urls = [cached_path]
+                        event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
+                        logger.info("[Telegram] Cached user image-document at %s", cached_path)
+
+                        media_group_id = getattr(msg, "media_group_id", None)
+                        if media_group_id:
+                            await self._queue_media_group_event(str(media_group_id), event)
+                        else:
+                            batch_key = self._photo_batch_key(event, msg)
+                            self._enqueue_photo_event(batch_key, event)
                         return
-
-                    event.message_type = MessageType.PHOTO
-                    event.media_urls = [cached_path]
-                    event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
-                    logger.info("[Telegram] Cached user image-document at %s", cached_path)
-
-                    media_group_id = getattr(msg, "media_group_id", None)
-                    if media_group_id:
-                        await self._queue_media_group_event(str(media_group_id), event)
-                    else:
-                        batch_key = self._photo_batch_key(event, msg)
-                        self._enqueue_photo_event(batch_key, event)
-                    return
+                    finally:
+                        self._track_media_download_done(download_session_key)
 
                 if not ext and doc.mime_type:
                     video_mime_to_ext = {v: k for k, v in SUPPORTED_VIDEO_TYPES.items()}
