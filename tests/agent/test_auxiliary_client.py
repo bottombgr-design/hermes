@@ -368,6 +368,46 @@ class TestBuildCallKwargsMaxTokens:
     """
 
 
+    def test_explicit_cap_can_be_preserved_for_openai_compatible(self):
+        kwargs = _build_call_kwargs(
+            provider="custom",
+            model="qwen",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=500,
+            preserve_max_tokens=True,
+            base_url="http://localhost:8080/v1",
+            task="vision",
+        )
+
+        assert kwargs["max_tokens"] == 500
+
+    @pytest.mark.asyncio
+    async def test_explicit_vision_cap_reaches_custom_client_request(self):
+        client = MagicMock()
+        client.base_url = "http://localhost:8080/v1"
+        response = MagicMock()
+        response.choices = [
+            MagicMock(message=MagicMock(content="A concise description."))
+        ]
+        client.chat.completions.create = AsyncMock(return_value=response)
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "qwen", client.base_url, "test-key", None),
+        ), patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            return_value=("custom", client, "qwen"),
+        ):
+            result = await async_call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "describe"}],
+                max_tokens=500,
+                preserve_max_tokens=True,
+            )
+
+        assert result is response
+        assert client.chat.completions.create.await_args.kwargs["max_tokens"] == 500
+
     @pytest.mark.parametrize(
         "provider,model,base_url",
         [
