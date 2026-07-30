@@ -22203,7 +22203,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     from gateway.approval_delegation import (
                         is_delegation_enabled, is_admin_user, get_admins,
-                        register_delegation, clear_delegation,
+                        register_delegation,
                     )
                     if is_delegation_enabled():
                         _src_plat = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -22228,18 +22228,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     continue
 
                                 _admin_chat_id = _admin["chat_id"]
-
-                                # Register delegation state
-                                register_delegation(
-                                    admin_platform=_admin["platform"],
-                                    admin_chat_id=_admin_chat_id,
-                                    session_key=_approval_session_key,
-                                    user_platform=_src_plat,
-                                    user_chat_id=str(source.chat_id or ""),
-                                    user_chat_meta=_status_thread_metadata,
-                                    command=cmd,
-                                    description=desc,
-                                )
 
                                 # Send approval to admin — prefer button-based
                                 # (send_exec_approval) when the adapter supports
@@ -22303,14 +22291,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         logger.warning("[approval-delegation] Text send also failed: %s", _txt_err)
 
                                 if _sent:
+                                    register_delegation(
+                                        admin_platform=_admin["platform"],
+                                        admin_chat_id=_admin_chat_id,
+                                        session_key=_approval_session_key,
+                                        user_platform=_src_plat,
+                                        user_chat_id=str(source.chat_id or ""),
+                                        user_chat_meta=_status_thread_metadata,
+                                        command=cmd,
+                                        description=desc,
+                                    )
                                     logger.info(
                                         "[approval-delegation] Redirected approval to admin %s:%s",
                                         _admin["platform"], _admin_chat_id,
                                     )
                                     return  # Successfully sent to admin
                                 else:
-                                    # Clean up the delegation entry for this failed admin
-                                    clear_delegation(_admin["platform"], _admin_chat_id, session_key=_approval_session_key)
                                     logger.warning("[approval-delegation] Failed to send to admin %s:%s", _admin["platform"], _admin_chat_id)
                                     continue  # Try next admin
 
