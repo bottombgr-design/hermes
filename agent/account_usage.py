@@ -881,6 +881,141 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     )
 
 
+def _normalize_endpoint(url: Optional[str]) -> Optional[tuple[str, str, str]]:
+    if not url:
+        return None
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        return (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"))
+    except Exception:
+        return None
+
+
+def _fetch_custom_account_usage(
+    provider: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> Optional[AccountUsageSnapshot]:
+    if not base_url or not api_key:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            custom_list = cfg.get("custom_providers") or []
+
+            provider_slug = ""
+            if provider and ":" in provider:
+                provider_slug = provider.split(":", 1)[1].strip().lower()
+            elif provider and provider.strip().lower() != "custom":
+                provider_slug = provider.strip().lower()
+
+            target_cp = None
+
+            # 1. Prefer explicit provider name/slug match (e.g. "custom:antigravity-proxy")
+            if provider_slug:
+                for cp in custom_list:
+                    cp_name = str(cp.get("name") or "").strip().lower()
+                    if cp_name == provider_slug:
+                        target_cp = cp
+                        break
+
+            # 2. Match by normalized base_url / origin (scheme + host:port + path prefix)
+            if not target_cp and base_url:
+                norm_base = _normalize_endpoint(base_url)
+                if norm_base:
+                    for cp in custom_list:
+                        norm_cp = _normalize_endpoint(cp.get("base_url"))
+                        if norm_cp and norm_base[0] == norm_cp[0] and norm_base[1] == norm_cp[1]:
+                            if not norm_cp[2] or norm_base[2].startswith(norm_cp[2]) or norm_cp[2].startswith(norm_base[2]):
+                                target_cp = cp
+                                break
+
+            if target_cp:
+                if not base_url and target_cp.get("base_url"):
+                    base_url = target_cp.get("base_url")
+                if not api_key and target_cp.get("api_key"):
+                    api_key = target_cp.get("api_key")
+
+            # 3. Global model fallback if still unpopulated
+            if not api_key or not base_url:
+                model_cfg = cfg.get("model") or {}
+                if not api_key:
+                    api_key = model_cfg.get("api_key")
+                if not base_url:
+                    base_url = model_cfg.get("base_url")
+        except Exception:
+            pass
+
+    if not base_url:
+        return None
+    try:
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(base_url)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        usage_url = urlunparse((parsed.scheme, parsed.netloc, "/v1/usage", "", "", ""))
+        headers = {}
+        if api_key:
+            headers["x-api-key"] = api_key
+            headers["Authorization"] = f"Bearer {api_key}"
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(usage_url, headers=headers)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if not isinstance(data, dict):
+                return None
+
+            provider_name = str(data.get("provider") or "custom-proxy")
+            windows_raw = data.get("windows", [])
+            windows: list[AccountUsageWindow] = []
+            if isinstance(windows_raw, list):
+                for w in windows_raw:
+                    if isinstance(w, dict):
+                        label = str(w.get("label") or "Quota")
+                        used_pct = w.get("used_percent")
+                        rem_frac = w.get("remaining_fraction")
+                        if used_pct is None and isinstance(rem_frac, (int, float)):
+                            used_pct = (1.0 - float(rem_frac)) * 100.0
+                        reset_at = _parse_dt(w.get("reset_at"))
+                        windows.append(
+                            AccountUsageWindow(
+                                label=label,
+                                used_percent=float(used_pct) if isinstance(used_pct, (int, float)) else None,
+                                reset_at=reset_at,
+                            )
+                        )
+
+            details: list[str] = []
+            models_raw = data.get("models", [])
+            if isinstance(models_raw, list) and not windows:
+                for m in models_raw:
+                    if isinstance(m, dict):
+                        name = str(m.get("display_name") or m.get("id") or "Model")
+                        used = m.get("used_percent")
+                        if isinstance(used, (int, float)):
+                            details.append(f"{name}: {100.0 - float(used):.0f}% remaining ({float(used):.0f}% used)")
+
+            if not windows and not details:
+                return None
+
+            return AccountUsageSnapshot(
+                provider=provider_name,
+                source=str(data.get("source") or "custom-api"),
+                fetched_at=_utc_now(),
+                title="Account limits",
+                windows=tuple(windows),
+                details=tuple(details),
+            )
+    except Exception:
+        return None
+
+
 def fetch_account_usage(
     provider: Optional[str],
     *,
@@ -888,7 +1023,7 @@ def fetch_account_usage(
     api_key: Optional[str] = None,
 ) -> Optional[AccountUsageSnapshot]:
     normalized = str(provider or "").strip().lower()
-    if normalized in {"", "auto", "custom"}:
+    if normalized in {"", "auto"}:
         return None
     try:
         if normalized == "openai-codex":
@@ -897,6 +1032,8 @@ def fetch_account_usage(
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
+        if normalized == "custom" or normalized.startswith("custom:"):
+            return _fetch_custom_account_usage(provider=provider, base_url=base_url, api_key=api_key)
     except Exception:
         return None
     return None
