@@ -3446,6 +3446,7 @@ _FALLBACK_COMMENT = """
 # fallback_model:
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
+#   cooldown_seconds: 86400  # optional: persistently skip after rate limits
 """
 
 
@@ -3478,6 +3479,7 @@ _COMMENTED_SECTIONS = """
 # fallback_model:
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
+#   cooldown_seconds: 86400  # optional: persistently skip after rate limits
 """
 
 
