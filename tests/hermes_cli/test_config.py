@@ -433,6 +433,8 @@ class TestSanitizeEnvLines:
 
 
     def test_migrate_reports_normalized_line_formatting(self, capsys):
+        from hermes_cli.config import migrate_config as _migrate
+
         latest_version = DEFAULT_CONFIG["_config_version"]
         with (
             patch("hermes_cli.config.sanitize_env_file", return_value=2),
@@ -445,7 +447,7 @@ class TestSanitizeEnvLines:
             patch("hermes_cli.config.get_missing_config_fields", return_value=[]),
             patch("hermes_cli.config.get_missing_skill_config_vars", return_value=[]),
         ):
-            migrate_config(interactive=False)
+            _migrate(interactive=False)
 
         assert capsys.readouterr().out == (
             "  ✓ Normalized .env line formatting (2 line(s) changed)\n"
