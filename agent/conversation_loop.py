@@ -194,6 +194,19 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     agent._stream_needs_break = True
 
 
+def _output_limit_result_with_pending_steer(agent: Any, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve a late /steer when an output-limit exit bypasses finalization.
+
+    ``finalize_turn`` normally drains this queue after a completed loop. These
+    terminal branches return before it runs, so callers would otherwise replay
+    or drop a steer that arrived while the provider request was in flight.
+    """
+    leftover_steer = agent._drain_pending_steer()
+    if leftover_steer:
+        result["pending_steer"] = leftover_steer
+    return result
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -2832,14 +2845,14 @@ def run_conversation(
                         )
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        return _output_limit_result_with_pending_steer(agent, {
                             "final_response": _exhaust_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
                             "error": _exhaust_error,
-                        }
+                        })
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
@@ -2960,7 +2973,7 @@ def run_conversation(
                             partial_response = agent._strip_think_blocks("".join(truncated_response_parts)).strip()
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
-                            return {
+                            result = {
                                 "final_response": partial_response or None,
                                 "messages": messages,
                                 "api_calls": api_call_count,
@@ -2968,6 +2981,7 @@ def run_conversation(
                                 "partial": True,
                                 "error": "Response remained truncated after 4 continuation attempts",
                             }
+                            return _output_limit_result_with_pending_steer(agent, result)
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
@@ -3030,14 +3044,14 @@ def run_conversation(
                             # never reaches finalize_turn (#48879 class).
                             close_interrupted_tool_sequence(messages, _final_response)
                             agent._persist_session(messages, conversation_history)
-                            return {
+                            return _output_limit_result_with_pending_steer(agent, {
                                 "final_response": _final_response,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
                                 "error": _final_response,
-                            }
+                            })
 
                     # If we have prior messages, roll back to last complete state
                     if len(messages) > 1:
@@ -3047,27 +3061,27 @@ def run_conversation(
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
 
-                        return {
+                        return _output_limit_result_with_pending_steer(agent, {
                             "final_response": "Response truncated due to output length limit",
                             "messages": rolled_back_messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
                             "error": "Response truncated due to output length limit"
-                        }
+                        })
                     else:
                         # First message was truncated - mark as failed
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True)
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        return _output_limit_result_with_pending_steer(agent, {
                             "final_response": "First response truncated due to output length limit",
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
                             "error": "First response truncated due to output length limit"
-                        }
+                        })
                 
                 # Track actual token usage from response for context management
                 if hasattr(response, 'usage') and response.usage:
@@ -4606,7 +4620,7 @@ def run_conversation(
                             logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
                             agent._persist_session(messages, conversation_history)
                             _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
-                            return {
+                            return _output_limit_result_with_pending_steer(agent, {
                                 "final_response": _final_response,
                                 "messages": messages,
                                 "completed": False,
@@ -4615,7 +4629,7 @@ def run_conversation(
                                 "partial": True,
                                 "failed": True,
                                 "compression_exhausted": True,
-                            }
+                            })
                         _retry.restart_with_compressed_messages = True
                         break
 
@@ -4650,7 +4664,7 @@ def run_conversation(
                             "max_tokens exceeds the provider's output cap for this model. "
                             "Lower model.max_tokens in config.yaml."
                         )
-                        return {
+                        return _output_limit_result_with_pending_steer(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "completed": False,
@@ -4658,7 +4672,7 @@ def run_conversation(
                             "error": _final_response,
                             "partial": True,
                             "failed": True,
-                        }
+                        })
 
                     # Error is about the INPUT being too large.  Only reduce
                     # context_length when the provider explicitly reports the
@@ -5561,14 +5575,14 @@ def run_conversation(
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
                     
-                    return {
+                    return _output_limit_result_with_pending_steer(agent, {
                         "final_response": "Incomplete REASONING_SCRATCHPAD after 2 retries",
                         "messages": rolled_back_messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "partial": True,
                         "error": "Incomplete REASONING_SCRATCHPAD after 2 retries"
-                    }
+                    })
             
             # Reset incomplete scratchpad counter on clean response
             agent._incomplete_scratchpad_retries = 0
@@ -5690,14 +5704,14 @@ def run_conversation(
 
                 agent._codex_incomplete_retries = 0
                 agent._persist_session(messages, conversation_history)
-                return {
+                return _output_limit_result_with_pending_steer(agent, {
                     "final_response": "Codex response remained incomplete after 3 continuation attempts",
                     "messages": messages,
                     "api_calls": api_call_count,
                     "completed": False,
                     "partial": True,
                     "error": "Codex response remained incomplete after 3 continuation attempts",
-                }
+                })
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
             
@@ -5863,14 +5877,14 @@ def run_conversation(
                         # exhaustion — this path never reaches finalize_turn.
                         close_interrupted_tool_sequence(messages, _final_response)
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        return _output_limit_result_with_pending_steer(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
                             "error": _final_response,
-                        }
+                        })
 
                     # Track retries for invalid JSON arguments
                     agent._invalid_json_retries += 1
