@@ -31,7 +31,7 @@ class SessionPortabilityMixin:
     @classmethod
     def _compact_session_cols(cls) -> str:
         """SELECT list for compact_rows: every ``sessions`` column declared in
-        SCHEMA_SQL except the ``system_prompt`` blob, aliased with the ``s``
+        SCHEMA_SQL except prompt storage internals, aliased with the ``s``
         prefix used by list_sessions_rich/_get_session_rich_row queries."""
         if cls._session_compact_cols_sql is None:
             declared = cls._parse_schema_columns(SCHEMA_SQL)["sessions"]
@@ -101,6 +101,7 @@ class SessionPortabilityMixin:
 
         query = f"""
             SELECT s.*,
+                COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved,
                 COALESCE(
                     (SELECT {_PREVIEW_RAW_SELECT}
                      FROM messages m
@@ -113,6 +114,7 @@ class SessionPortabilityMixin:
                     s.started_at
                 ) AS last_active
             FROM sessions s
+            LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
             WHERE s.source = 'cron' AND s.id >= ? AND s.id < ?
             ORDER BY s.started_at DESC, s.id DESC
             LIMIT ? OFFSET ?
@@ -123,7 +125,7 @@ class SessionPortabilityMixin:
 
         runs: List[Dict[str, Any]] = []
         for row in rows:
-            s = dict(row)
+            s = self._session_row_dict(row)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
             runs.append(s)
         return runs
@@ -139,8 +141,16 @@ class SessionPortabilityMixin:
         # Same read-your-writes guarantee as list_sessions_rich.
         self.flush_token_counts()
         _sel = self._compact_session_cols() if compact_rows else "s.*"
+        prompt_select = (
+            "" if compact_rows
+            else ", COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved"
+        )
+        prompt_join = (
+            "" if compact_rows
+            else "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash"
+        )
         query = f"""
-            SELECT {_sel},
+            SELECT {_sel}{prompt_select},
                 COALESCE(
                     (SELECT {_PREVIEW_RAW_SELECT}
                      FROM messages m
@@ -153,6 +163,7 @@ class SessionPortabilityMixin:
                     s.started_at
                 ) AS last_active
             FROM sessions s
+            {prompt_join}
             WHERE s.id = ?
         """
         with self._lock:
@@ -160,7 +171,7 @@ class SessionPortabilityMixin:
             row = cursor.fetchone()
         if not row:
             return None
-        s = dict(row)
+        s = self._session_row_dict(row)
         s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
         return s
 
