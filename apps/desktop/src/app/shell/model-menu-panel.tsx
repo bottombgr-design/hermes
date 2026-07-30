@@ -449,6 +449,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
                       <DropdownMenuSub key={`${group.provider.slug}:${family.id}`}>
                         <DropdownMenuSubTrigger
                           hideChevron
+                          inset
                           onClick={activate}
                           onKeyDown={event => {
                             if (event.key === 'Enter' || event.key === ' ') {
