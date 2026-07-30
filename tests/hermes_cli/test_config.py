@@ -1440,3 +1440,121 @@ def test_default_config_has_no_duplicate_top_level_keys():
             if "model" in keys and "kanban" in keys:  # the DEFAULT_CONFIG literal
                 dupes = {k for k in keys if keys.count(k) > 1}
                 assert not dupes, f"duplicate DEFAULT_CONFIG keys: {sorted(dupes)}"
+
+
+# ---------------------------------------------------------------------------
+# model.key_env resolution (#74561)
+# ---------------------------------------------------------------------------
+
+class TestModelKeyEnvResolution:
+    """model.key_env / model.api_key_env must resolve into model.api_key at
+    config load time so custom providers get a non-empty API key (#74561)."""
+
+    def test_key_env_resolves_to_api_key(self, tmp_path, monkeypatch):
+        """When model.key_env names a set env var, load_config()
+        populates model.api_key."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("TEST_CUSTOM_KEY", "sk-test-key-12345")
+        # Bust in-process caches
+        import hermes_cli.config as cfg_mod
+        cfg_mod._LOAD_CONFIG_CACHE.clear()
+        cfg_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+
+        cfg = {
+            "model": {
+                "default": "my-model",
+                "provider": "custom",
+                "base_url": "https://api.example.com/v1",
+                "key_env": "TEST_CUSTOM_KEY",
+            },
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(cfg))
+        config = cfg_mod.load_config()
+        assert config["model"].get("api_key") == "sk-test-key-12345"
+
+    def test_key_env_missing_var_leaves_api_key_empty(self, tmp_path, monkeypatch):
+        """When the env var named by key_env is not set, api_key stays
+        empty/unset (no crash, no sentinel value)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("MISSING_KEY", raising=False)
+        import hermes_cli.config as cfg_mod
+        cfg_mod._LOAD_CONFIG_CACHE.clear()
+        cfg_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+
+        cfg = {
+            "model": {
+                "default": "my-model",
+                "provider": "custom",
+                "base_url": "https://api.example.com/v1",
+                "key_env": "MISSING_KEY",
+            },
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(cfg))
+        config = cfg_mod.load_config()
+        assert not config["model"].get("api_key", "").strip()
+
+    def test_inline_api_key_takes_precedence_over_key_env(self, tmp_path, monkeypatch):
+        """When both api_key and key_env are set, the explicit inline
+        api_key wins — we never overwrite a user-supplied key."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("TEST_CUSTOM_KEY", "sk-from-env")
+        import hermes_cli.config as cfg_mod
+        cfg_mod._LOAD_CONFIG_CACHE.clear()
+        cfg_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+
+        cfg = {
+            "model": {
+                "default": "my-model",
+                "provider": "custom",
+                "base_url": "https://api.example.com/v1",
+                "api_key": "sk-inline-explicit",
+                "key_env": "TEST_CUSTOM_KEY",
+            },
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(cfg))
+        config = cfg_mod.load_config()
+        assert config["model"].get("api_key") == "sk-inline-explicit"
+
+    def test_api_key_env_alias_resolves(self, tmp_path, monkeypatch):
+        """The api_key_env alias (snake_case, documented variant) is
+        normalized to key_env, so it also resolves."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("MY_PROVIDER_KEY", "sk-alias-key")
+        import hermes_cli.config as cfg_mod
+        cfg_mod._LOAD_CONFIG_CACHE.clear()
+        cfg_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+
+        cfg = {
+            "model": {
+                "default": "my-model",
+                "provider": "custom",
+                "base_url": "https://api.example.com/v1",
+                "api_key_env": "MY_PROVIDER_KEY",
+            },
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(cfg))
+        config = cfg_mod.load_config()
+        assert config["model"].get("api_key") == "sk-alias-key"
+
+    def test_no_key_env_does_not_affect_normal_load(self, tmp_path, monkeypatch):
+        """When no key_env is set, load_config() behaves identically to
+        before — no false api_key injected."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import hermes_cli.config as cfg_mod
+        cfg_mod._LOAD_CONFIG_CACHE.clear()
+        cfg_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+
+        cfg = {
+            "model": {
+                "default": "claude-sonnet-4-6",
+                "provider": "openai-codex",
+            },
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(cfg))
+        config = cfg_mod.load_config()
+        assert "api_key" not in config["model"] or not config["model"].get("api_key", "").strip()
