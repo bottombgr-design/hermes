@@ -757,12 +757,18 @@ class GatewaySlashCommandsMixin:
         orig_thread = str(getattr(origin, "thread_id", "") or "")
         chat_type = (getattr(current, "chat_type", "") or "").lower()
         caller_is_dm = chat_type in {"dm", "direct", "private", ""}
-        # DM sessions are scoped by chat_id + user_id, not thread_id, so
-        # legacy sessions without thread_id should match even when the
-        # caller carries one.  Non-DM (group/channel/forum) sessions still
-        # require thread equality — a threaded origin must not match a
-        # non-threaded caller (and vice versa).
-        if not caller_is_dm and cur_thread != orig_thread:
+        # Non-DM (group/channel/forum) always require strict thread equality.
+        # DM sessions are scoped by chat_id + user_id; thread_id in DMs is
+        # platform-specific — Telegram uses DM topic lanes as independent
+        # sessions, while Feishu/Signal DMs have no thread_id at all.  Skip
+        # the comparison only when at least one side has no thread_id (legacy
+        # sessions, or a caller on a threadless DM platform).
+        if caller_is_dm:
+            if cur_thread and orig_thread and cur_thread != orig_thread:
+                # Both sides carry a thread_id and they differ (Telegram DM
+                # topic lanes are independent sessions).
+                return False
+        elif cur_thread != orig_thread:
             return False
         # DM-like chats are always per-user.
         if chat_type in {"dm", "direct", "private", ""}:
@@ -901,7 +907,13 @@ class GatewaySlashCommandsMixin:
             origin_ok = (
                 bool(row_src) and bool(caller_src)
                 and str(row_src) == str(caller_src)
-                and (caller_is_dm or not row_thread or not caller_thread or row_thread == caller_thread)
+                and (
+                    (
+                        caller_is_dm
+                        and (not row_thread or not caller_thread or row_thread == caller_thread)
+                    )
+                    or (not caller_is_dm and row_thread == caller_thread)
+                )
             )
             if not origin_ok:
                 return False
