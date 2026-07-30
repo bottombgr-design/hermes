@@ -1343,6 +1343,7 @@ export const zh: Translations = {
     branches: '分支',
     projects: '项目',
     openFolder: '打开文件夹为项目…',
+    newSessionInProject: project => `在 ${project} 中新建会话`,
     commands: '命令',
     startInBranch: branch => `在 ${branch} 中开始新对话`,
     commandCenter: '命令中心',

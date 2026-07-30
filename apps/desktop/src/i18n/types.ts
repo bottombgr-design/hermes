@@ -1008,6 +1008,7 @@ export interface Translations {
     branches: string
     projects: string
     openFolder: string
+    newSessionInProject: (project: string) => string
     commands: string
     startInBranch: (branch: string) => string
     commandCenter: string

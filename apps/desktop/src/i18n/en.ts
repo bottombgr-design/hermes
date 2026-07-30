@@ -1146,6 +1146,7 @@ export const en: Translations = {
     branches: 'Branches',
     projects: 'Projects',
     openFolder: 'Open folder as project…',
+    newSessionInProject: project => `New session in ${project}`,
     commands: 'Commands',
     startInBranch: branch => `New conversation in ${branch}`,
     commandCenter: 'Command Center',

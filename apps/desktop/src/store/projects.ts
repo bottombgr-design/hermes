@@ -161,15 +161,19 @@ export function exitProjectScope(): void {
   $projectScope.set(ALL_PROJECTS)
 }
 
-// ⌘K "go to project": flip the sidebar into grouped mode, enter the project,
-// and land on a fresh session draft anchored at its root — the keyboard
-// version of clicking the project row and then "+". A path-less project (the
-// Home bucket) still enters, with a plain detached draft. Palette opens are
-// opens-from-nowhere, so the draft stacks as a tab when main already holds a
-// chat (openTab → mainChatOccupied) instead of spending it.
-export function goToProject(id: string): void {
+// ⌘K "go to project": flip the sidebar into grouped mode and enter the project
+// — a pure scope switch, same as clicking the overview row (never spends main).
+// With `newSession` (⌘-select / ⌘-Enter) it also lands on a fresh session draft
+// anchored at the project root — stacked as a tab when main already holds a
+// chat (palette opens are opens-from-nowhere). A path-less project (the Home
+// bucket) gets a plain detached draft.
+export function goToProject(id: string, options?: { newSession?: boolean }): void {
   setSidebarAgentsGrouped(true)
   enterProject(id)
+
+  if (!options?.newSession) {
+    return
+  }
 
   const project = $projectTree.get().find(node => node.id === id)
   const cwd = (project?.path || project?.repos.find(repo => repo.path)?.path || '').trim()
