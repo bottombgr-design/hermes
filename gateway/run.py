@@ -1259,6 +1259,14 @@ def _build_gateway_agent_history(
     return agent_history, observed_context
 
 
+def _user_turn_count(history: List[Dict[str, Any]]) -> int:
+    """Count ``user`` turns — the loss-proof yardstick for the #50502 guard
+    (in-memory repairs merge only assistant/tool shapes)."""
+    return sum(
+        1 for m in history if isinstance(m, dict) and m.get("role") == "user"
+    )
+
+
 def _select_cached_agent_history(
     persisted_history: List[Dict[str, Any]],
     live_history: Any,
@@ -1274,10 +1282,23 @@ def _select_cached_agent_history(
     amnesia. When the live transcript is strictly longer, keep it.
 
     Returns ``persisted_history`` unchanged unless the live copy is a longer
-    list, in which case a copy of the live transcript is returned.
+    list AND is missing user turns from the persisted view, in which case a
+    copy of the live transcript is returned.
+
+    Raw length alone cannot distinguish real write loss from the
+    restore-time alternation repair: split assistant tool-call pairs arrive
+    MERGED in the persisted view but stay split in the live list (see
+    ``repair_message_sequence``), shrinking the disk-side count on every
+    tool-use turn with zero data lost. User turns are never merged by any
+    repair shape, so only a live user turn absent from the persisted view
+    marks genuine persistence loss. Assistant/tool-only loss with user-turn
+    parity intact is intentionally out of this guard's scope — raw length is
+    unusable under the repair, and user turns are the only merge-proof
+    yardstick.
     """
     if isinstance(live_history, list) and len(live_history) > len(persisted_history):
-        return list(live_history)
+        if _user_turn_count(live_history) > _user_turn_count(persisted_history):
+            return list(live_history)
     return persisted_history
 
 
