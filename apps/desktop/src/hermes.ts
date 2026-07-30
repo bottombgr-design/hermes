@@ -26,6 +26,7 @@ import type {
   HermesConfigRecord,
   LogsResponse,
   McpCatalogResponse,
+  McpDiscoveredTool,
   McpServerSummary,
   MemoryProviderConfig,
   MemoryProviderOAuthStatus,
@@ -163,8 +164,10 @@ export type {
   LogsResponse,
   McpCatalogEntry,
   McpCatalogResponse,
+  McpDiscoveredTool,
   McpServerSummary,
   McpServerTestResponse,
+  McpToolAnnotations,
   MemoryProviderConfig,
   MemoryProviderOAuthStatus,
   MemoryStatusResponse,
@@ -972,7 +975,7 @@ export function toggleSkill(name: string, enabled: boolean): Promise<{ ok: boole
 export interface McpTestResult {
   ok: boolean
   error?: string
-  tools: { name: string; description: string }[]
+  tools: McpDiscoveredTool[]
   /** Capability counts (absent on older backends / failed probes). */
   prompts?: number
   resources?: number
@@ -984,7 +987,7 @@ export interface McpOAuthFlow {
   status: 'starting' | 'authorization_required' | 'approved' | 'error'
   authorization_url: string | null
   error: string | null
-  tools?: { name: string; description: string }[]
+  tools?: McpDiscoveredTool[]
 }
 
 /** Connect to the server, list its tools, disconnect. Slow (spawns/handshakes
