@@ -370,11 +370,19 @@ def _apply_managed_env() -> None:
         return
     if managed_dir is None:
         return
-    managed_env = managed_dir / ".env"
-    if not managed_env.exists():
+    try:
+        managed_env = managed_dir / ".env"
+        if not managed_env.exists():
+            return
+        _sanitize_env_file_if_needed(managed_env)
+        _load_dotenv_with_fallback(managed_env, override=True)
+    except Exception:  # noqa: BLE001 — fail-open: PermissionError on
+        # unreadable managed dirs must not crash startup. The outer
+        # docstring contract is "any error here is swallowed so managed
+        # scope can never block startup" and Path.exists() raises
+        # PermissionError (not OSError) when the parent directory is
+        # mode 0700 root-owned but the process runs as a non-root user.
         return
-    _sanitize_env_file_if_needed(managed_env)
-    _load_dotenv_with_fallback(managed_env, override=True)
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:
