@@ -31,6 +31,7 @@ const FRAMES_BY_NAME: Record<SpinnerName, NormalisedSpinner> = (() => {
 interface GlyphSpinnerProps {
   ariaLabel?: string
   className?: string
+  decorative?: boolean
   spinner?: SpinnerName
 }
 
@@ -41,7 +42,12 @@ interface GlyphSpinnerProps {
  * an `inline-flex` cell with `leading-none` and `items-center` so it sits
  * vertically centred inside its parent's line-box.
  */
-export function GlyphSpinner({ ariaLabel = 'Loading', className, spinner = 'braille' }: GlyphSpinnerProps) {
+export function GlyphSpinner({
+  ariaLabel = 'Loading',
+  className,
+  decorative = false,
+  spinner = 'braille'
+}: GlyphSpinnerProps) {
   const spin = FRAMES_BY_NAME[spinner] ?? FRAMES_BY_NAME.braille!
   const [frame, setFrame] = useState(0)
   // Pause when this surface is a hidden (kept-alive) tab: N mounted tabs each
@@ -61,9 +67,10 @@ export function GlyphSpinner({ ariaLabel = 'Loading', className, spinner = 'brai
 
   return (
     <span
-      aria-label={ariaLabel}
+      aria-hidden={decorative ? true : undefined}
+      aria-label={decorative ? undefined : ariaLabel}
       className={cn('inline-flex items-center justify-center font-mono leading-none tabular-nums', className)}
-      role="status"
+      role={decorative ? undefined : 'status'}
     >
       {spin.frames[frame]}
     </span>

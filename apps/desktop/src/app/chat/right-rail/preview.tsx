@@ -1,4 +1,5 @@
 import { useStore } from '@nanostores/react'
+import type { KeyboardEvent } from 'react'
 import { useEffect, useMemo } from 'react'
 
 import type { SetTitlebarToolGroup } from '@/app/shell/titlebar-controls'
@@ -15,7 +16,7 @@ import { Tip } from '@/components/ui/tooltip'
 import { translateNow, useI18n } from '@/i18n'
 import { formatCombo } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
-import { $panesFlipped, $rightRailActiveTabId, selectRightRailTab } from '@/store/layout'
+import { $panesFlipped, $rightRailActiveTabId, type RightRailTabId, selectRightRailTab } from '@/store/layout'
 import {
   $previewReloadRequest,
   $previewTabs,
@@ -69,6 +70,49 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
 
   const activeTab = tabs.find(tab => tab.id === activeTabId) ?? tabs[0]
 
+  const selectAndFocusTab = (tabId: RightRailTabId) => {
+    selectRightRailTab(tabId)
+    window.requestAnimationFrame(() => {
+      document.getElementById(`preview-tab-${tabId}`)?.focus()
+    })
+  }
+
+  const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex: number | null = null
+
+    switch (event.key) {
+      case 'ArrowLeft':
+        nextIndex = index === 0 ? tabs.length - 1 : index - 1
+
+        break
+
+      case 'ArrowRight':
+        nextIndex = index === tabs.length - 1 ? 0 : index + 1
+
+        break
+
+      case 'Home':
+        nextIndex = 0
+
+        break
+
+      case 'End':
+        nextIndex = tabs.length - 1
+
+        break
+
+      default:
+        return
+    }
+
+    event.preventDefault()
+    const nextTab = tabs[nextIndex]
+
+    if (nextTab) {
+      selectAndFocusTab(nextTab.id)
+    }
+  }
+
   useEffect(() => {
     if (activeTab && activeTab.id !== activeTabId) {
       selectRightRailTab(activeTab.id)
@@ -96,6 +140,7 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
     >
       <div className="group/rail-tabs flex h-(--titlebar-height) shrink-0 bg-(--ui-sidebar-surface-background)">
         <div
+          aria-label={t.preview.tab}
           className="flex min-w-0 flex-1 overflow-x-auto overflow-y-hidden overscroll-x-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           role="tablist"
         >
@@ -103,7 +148,9 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
             const active = tab.id === activeTab.id
             const hasOthers = tabs.length > 1
             const hasTabsToRight = index < tabs.length - 1
-            const dirty = Boolean(dirtyPreviewUrls[tab.target.url])
+            const dirty = tab.target.kind !== 'artifact' && Boolean(dirtyPreviewUrls[tab.target.url])
+            const tabButtonId = `preview-tab-${tab.id}`
+            const tabPanelId = `preview-panel-${tab.id}`
 
             return (
               <ContextMenu key={tab.id}>
@@ -111,11 +158,15 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
                   <PaneTab active={active} dirty={dirty} onClose={() => closeRightRailTab(tab.id)}>
                     <Tip label={tab.tooltip}>
                       <PaneTabLabel
+                        aria-controls={tabPanelId}
                         aria-selected={active}
                         as="button"
                         className="normal-case tracking-normal"
+                        id={tabButtonId}
                         onClick={() => selectRightRailTab(tab.id)}
+                        onKeyDown={event => handleTabKeyDown(event, index)}
                         role="tab"
+                        tabIndex={active ? 0 : -1}
                         type="button"
                       >
                         {tab.target.kind === 'artifact' && (
@@ -154,7 +205,12 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
         </button>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-hidden">
+      <div
+        aria-labelledby={`preview-tab-${activeTab.id}`}
+        className="min-h-0 flex-1 overflow-hidden"
+        id={`preview-panel-${activeTab.id}`}
+        role="tabpanel"
+      >
         <PreviewPane
           embedded
           onRestartServer={isPreview ? onRestartServer : undefined}
