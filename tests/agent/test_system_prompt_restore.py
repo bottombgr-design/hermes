@@ -36,6 +36,12 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
     agent._use_prompt_caching = False
+    # Memory/profile defaults — None/False so block-validity checks
+    # in _stored_prompt_matches_runtime are skipped unless a test
+    # explicitly enables them.
+    agent._memory_store = None
+    agent._memory_enabled = False
+    agent._user_profile_enabled = False
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 
@@ -377,6 +383,145 @@ class TestReconstructStaticPrefixMemoization:
         assert build.call_count == 1
         assert agent._cached_system_prompt_static == stable
         assert getattr(agent, "_static_rebuild_failed_for", None) is None
+
+
+# ---------------------------------------------------------------------------
+# Built-in MEMORY / USER PROFILE block validity (issue #74102)
+# ---------------------------------------------------------------------------
+
+
+def _make_agent_with_memory(
+    session_db=None,
+    user_block=None,
+    mem_block=None,
+    user_profile_enabled=True,
+    memory_enabled=True,
+    prebuilt_prompt: str = "BUILT_PROMPT",
+):
+    """Agent with a mock MemoryStore for block-validity tests."""
+    agent = _make_agent(session_db=session_db, prebuilt_prompt=prebuilt_prompt)
+
+    mem_store = MagicMock()
+
+    def _fmt(target):
+        if target == "user":
+            return user_block
+        if target == "memory":
+            return mem_block
+        return None
+
+    mem_store.format_for_system_prompt.side_effect = _fmt
+    agent._memory_store = mem_store
+    agent._memory_enabled = memory_enabled
+    agent._user_profile_enabled = user_profile_enabled
+    return agent
+
+
+_USER_HEADER = "USER PROFILE (who the user is)"
+_MEM_HEADER = "MEMORY (your personal notes)"
+
+
+class TestBlockValidityCheck:
+    """Issue #74102 — stored prompts missing enabled MEMORY/USER blocks
+    must be rebuilt, not restored verbatim."""
+
+    # ── Layer 1: USER PROFILE block ──────────────────────────────────
+
+    def test_missing_user_profile_block_triggers_rebuild(self):
+        """User-profile injection enabled, current USER.md has content, but
+        the stored prompt lacks the USER PROFILE marker → stale, rebuild."""
+        stored = "You are Hermes Agent.\n\nModel: test-model\nProvider: openrouter"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent_with_memory(
+            session_db=db,
+            user_block=_USER_HEADER + " [5% — 50/1375 chars]\n" + ("\u2550" * 46)
+            + "\nSome user fact",
+            user_profile_enabled=True,
+            memory_enabled=False,
+        )
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        agent._build_system_prompt.assert_called_once()
+        db.update_system_prompt.assert_called_once()
+
+    # ── Layer 2: MEMORY block ────────────────────────────────────────
+
+    def test_missing_memory_block_triggers_rebuild(self):
+        """Memory injection enabled, current MEMORY.md has content, but
+        the stored prompt lacks the MEMORY marker → stale, rebuild."""
+        stored = "You are Hermes Agent.\n\nModel: test-model\nProvider: openrouter"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent_with_memory(
+            session_db=db,
+            mem_block=_MEM_HEADER + " [5% — 50/2200 chars]\n" + ("\u2550" * 46)
+            + "\nSome memory fact",
+            user_profile_enabled=False,
+            memory_enabled=True,
+        )
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        agent._build_system_prompt.assert_called_once()
+        db.update_system_prompt.assert_called_once()
+
+    # ── Layer 3: byte-stable reuse when all enabled blocks present ────
+
+    def test_all_blocks_present_is_reused_verbatim(self):
+        """Both blocks enabled AND present in the stored prompt → reuse
+        byte-for-byte, no rebuild."""
+        sep = "\u2550" * 46
+        stored = (
+            "You are Hermes Agent.\n\n"
+            + sep + "\n" + _USER_HEADER + " [5% — 50/1375 chars]\n" + sep + "\n"
+            "Some user fact\n\n"
+            + sep + "\n" + _MEM_HEADER + " [5% — 50/2200 chars]\n" + sep + "\n"
+            "Some memory fact\n\n"
+            "Model: test-model\n"
+            "Provider: openrouter"
+        )
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent_with_memory(
+            session_db=db,
+            user_block=_USER_HEADER + " [5% — 50/1375 chars]\n" + sep + "\nSome user fact",
+            mem_block=_MEM_HEADER + " [5% — 50/2200 chars]\n" + sep + "\nSome memory fact",
+            user_profile_enabled=True,
+            memory_enabled=True,
+        )
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+
+    # ── Layer 3 edge: enabled but empty disk → not stale ─────────────
+
+    def test_enabled_but_empty_disk_content_is_reused(self):
+        """Block enabled but disk is empty (format returns None) → the
+        marker's absence in the stored prompt is legitimate, not stale."""
+        stored = "You are Hermes Agent.\n\nModel: test-model\nProvider: openrouter"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent_with_memory(
+            session_db=db,
+            user_block=None,
+            mem_block=None,
+            user_profile_enabled=True,
+            memory_enabled=True,
+        )
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+
+    # ── Layer 4: no memory store → skip (existing behaviour) ─────────
+
+    def test_no_memory_store_preserves_existing_reuse(self):
+        """Agent with _memory_store=None → block check is skipped entirely;
+        a prompt without blocks is reused as before."""
+        stored = "Stored prompt from turn 1 — no blocks"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)  # _memory_store=None, both disabled
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -629,6 +629,26 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_platform and current_platform and stored_platform != current_platform:
         return False
 
+    # Built-in MEMORY / USER PROFILE block validity (issue #74102).
+    #
+    # A continuing gateway session can restore a stored prompt that predates
+    # a profile/memory write (or was built while USER.md was empty).  If a
+    # built-in block is enabled and the current on-disk content is non-empty
+    # but the block marker is absent from the stored prompt, the prompt is
+    # stale and must be rebuilt so the missing block is injected.  When the
+    # block is enabled but the disk content is empty, the absence is
+    # legitimate and the prompt is not considered stale.
+    _memory_store = getattr(agent, "_memory_store", None)
+    if _memory_store is not None:
+        if getattr(agent, "_user_profile_enabled", False):
+            _user_block = _memory_store.format_for_system_prompt("user")
+            if _user_block and "USER PROFILE" not in prompt:
+                return False
+        if getattr(agent, "_memory_enabled", False):
+            _mem_block = _memory_store.format_for_system_prompt("memory")
+            if _mem_block and "MEMORY (your personal notes)" not in prompt:
+                return False
+
     return True
 
 
