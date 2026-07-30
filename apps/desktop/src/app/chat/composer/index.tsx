@@ -1189,7 +1189,7 @@ export function ChatBar({
                       </Button>
                       <Button
                         className="h-6 rounded-md px-2 text-[0.68rem]"
-                        onClick={() => exitQueuedEdit('save')}
+                        onClick={() => { flushEditorToDraft(editorRef.current!); exitQueuedEdit('save'); }}
                         type="button"
                       >
                         {t.common.save}
