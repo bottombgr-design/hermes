@@ -4166,7 +4166,10 @@ class TelegramAdapter(BasePlatformAdapter):
         collect(getattr(self, "_polling_progress_verifier_task", None))
 
         for task in pending_tasks:
-            task.cancel()
+            try:
+                task.cancel()
+            except RuntimeError:
+                pass
         if awaitable_tasks:
             await asyncio.gather(*awaitable_tasks, return_exceptions=True)
 
@@ -4209,7 +4212,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if marker in lifecycle_seen:
                 continue
             lifecycle_seen.add(marker)
-            task.cancel()
+            try:
+                task.cancel()
+            except RuntimeError:
+                pass
             if asyncio.isfuture(task) or asyncio.iscoroutine(task):
                 lifecycle_tasks.append(task)
         if lifecycle_tasks:
