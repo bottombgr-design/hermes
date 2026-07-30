@@ -328,6 +328,27 @@ async def handle_ws(ws: Any) -> None:
             _log.error("ws ready frame send failed peer=%s", peer)
             return
 
+        # The desktop app and dashboard chat reach the agent through this WS
+        # sidecar, NOT through tui_gateway.entry.main() (the stdio TUI path that
+        # spawns the background MCP discovery thread). Without starting it here,
+        # discovery never runs in this process: _make_agent only *waits* on the
+        # thread (wait_for_mcp_discovery), which no-ops when it was never
+        # created, so the agent snapshots an MCP-less tool list and the only way
+        # to surface MCP tools is a manual /reload-mcp. Start it once per
+        # process here (idempotent, config-gated). (#38945)
+        # Started AFTER the gateway.ready frame is on the wire: discovery's
+        # import/connect work holds the GIL hard enough to starve this event
+        # loop for 10s+ on MCP-heavy configs, and the desktop client times out
+        # waiting for gateway.ready and drops the socket ("ws ready frame send
+        # failed" / boot-failure overlay). _make_agent still waits on the
+        # thread, so tool pickup is unaffected by the later start.
+        from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+        start_background_mcp_discovery(
+            logger=_log,
+            thread_name="tui-ws-mcp-discovery",
+        )
+
         while True:
             try:
                 raw = await ws.receive_text()
