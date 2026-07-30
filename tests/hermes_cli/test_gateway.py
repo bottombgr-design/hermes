@@ -2,7 +2,6 @@
 
 import argparse
 import os
-import pty
 import signal
 import subprocess
 import sys
@@ -111,6 +110,12 @@ def test_gateway_run_subprocess_preserves_daemon_exit_codes(
     master_fd = slave_fd = None
     try:
         if stdin_is_tty:
+            # Imported here, not at module scope: pty pulls in termios via tty,
+            # which does not exist on Windows. A module-level import raises at
+            # collection time — before the skipif above can be evaluated — and
+            # that aborts the whole suite, not just this file.
+            import pty
+
             master_fd, slave_fd = pty.openpty()
             stdin = slave_fd
         else:
