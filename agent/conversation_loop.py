@@ -1191,6 +1191,10 @@ def run_conversation(
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
 
+    # Reset the deterministic stream-timeout tracker at the start of each
+    # turn, so only timeouts within the SAME turn count toward skip-retry.
+    agent._last_stream_timeout_no_deltas = False
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
@@ -5275,6 +5279,35 @@ def run_conversation(
                         # Present only for billing walls: structured recovery
                         # descriptor (provider, billing_url, is_nous, message).
                         "billing_block": _billing_block,
+                    }
+
+                # Skip retries when the stream timed out without delivering
+                # any data — the failure is deterministic (server-side
+                # processing timeout) and retrying with the same payload
+                # will just burn the retry budget.
+                if getattr(agent, "_last_stream_timeout_no_deltas", False):
+                    agent._flush_status_buffer()
+                    _provider = getattr(agent, "provider", "unknown")
+                    agent._vprint(
+                        f"{agent.log_prefix}❌ Provider timed out before sending any response. "
+                        f"The request payload may be too large for this provider. "
+                        f"Try setting `providers.{_provider}.request_timeout_seconds` in "
+                        f"~/.hermes/config.yaml to give the provider more time, or "
+                        f"switch to a different provider.",
+                        force=True,
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    _final_response = (
+                        "Provider timed out before delivering any response — "
+                        "the request payload may be too large."
+                    )
+                    return {
+                        "final_response": _final_response,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _final_response,
                     }
 
                 # For rate limits, respect the Retry-After header if present
