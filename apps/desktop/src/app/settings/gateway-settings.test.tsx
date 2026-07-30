@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ProfileInfo } from '@/types/hermes'
 
+const cloudDiscover = vi.fn()
+const cloudStatus = vi.fn()
 const getConnectionConfig = vi.fn()
 const profiles = atom<ProfileInfo[]>([])
 
@@ -45,9 +47,17 @@ beforeEach(() => {
     }
   ])
   getConnectionConfig.mockResolvedValue(localConnection)
+  cloudStatus.mockResolvedValue({ portalBaseUrl: 'https://portal.nousresearch.com', signedIn: true })
+  cloudDiscover.mockResolvedValue({ agents: [], org: null })
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
-    value: { getConnectionConfig }
+    value: {
+      cloud: {
+        discover: cloudDiscover,
+        status: cloudStatus
+      },
+      getConnectionConfig
+    }
   })
 })
 
@@ -74,5 +84,48 @@ describe('GatewaySettings', () => {
     expect(
       screen.queryByText('Start a private Hermes backend on localhost. This is the default and works offline.')
     ).toBeNull()
+  })
+
+  it('hides an unknown cloud agent gateway status', async () => {
+    cloudDiscover.mockResolvedValue({
+      agents: [
+        {
+          dashboardGatewayState: 'unknown',
+          dashboardUrl: 'https://agent.example.com',
+          id: 'agent-1',
+          name: 'Cloud Agent',
+          status: 'active'
+        }
+      ],
+      org: null
+    })
+    const { GatewaySettings } = await import('./gateway-settings')
+
+    render(<GatewaySettings />)
+    fireEvent.click(await screen.findByRole('button', { name: /Hermes Cloud/ }))
+
+    expect(await screen.findByText('Cloud Agent')).toBeTruthy()
+    expect(screen.queryByText('Status: unknown')).toBeNull()
+  })
+
+  it('shows a known cloud agent gateway status', async () => {
+    cloudDiscover.mockResolvedValue({
+      agents: [
+        {
+          dashboardGatewayState: 'active',
+          dashboardUrl: 'https://agent.example.com',
+          id: 'agent-1',
+          name: 'Cloud Agent',
+          status: 'active'
+        }
+      ],
+      org: null
+    })
+    const { GatewaySettings } = await import('./gateway-settings')
+
+    render(<GatewaySettings />)
+    fireEvent.click(await screen.findByRole('button', { name: /Hermes Cloud/ }))
+
+    expect(await screen.findByText('Status: active')).toBeTruthy()
   })
 })
